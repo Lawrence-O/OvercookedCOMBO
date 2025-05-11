@@ -248,7 +248,6 @@ class OvercookedSampleRenderer:
             file_path = os.path.join(output_dir, f"viz_frame_{i:04d}.png")
             self.save_obs_image(obs, grid, file_path)
             img_paths.append(file_path)
-        self.visualize_all_channels(obs[-1], os.path.join(output_dir, "raw_frame_channels.png"))
         return img_paths
     
     def extract_grid_from_obs(self, obs, eps=1e-4):
@@ -417,7 +416,6 @@ class OvercookedSampleRenderer:
             return
         # Create a figure with subplots for each channel
 
-        obs = self.normalize_obs(obs)
         cols = math.ceil(math.sqrt(C))
         rows = math.ceil(C / cols)
         fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3), squeeze=False) # Adjust figsize as needed
