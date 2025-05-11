@@ -1407,9 +1407,6 @@ class OvercookedEnvTrainer(Trainer):
         return x_batch, x_cond_single_frame_batch, task_emb_id_batch
     def train_one_step(self):
         total_loss = 0
-
-        self.valid_one_step()
-        exit()
         
         for _ in range(self.gradient_accumulate_every):
             x, x_cond, policy_id = next(self.dl)
