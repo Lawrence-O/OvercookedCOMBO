@@ -1322,3 +1322,191 @@ class SuperResTrainer(Trainer):
         utils.save_image(all_xs, str(self.results_folder / f'imgs/outputs/sample-{milestone}.png'), nrow=2)
         
         return valid_loss
+    
+from overcooked_sample_renderer import OvercookedSampleRenderer
+class OvercookedEnvTrainer(Trainer):
+    def __init__(self,
+                 diffusion_model,
+                 train_set,
+                 valid_set,
+                 channels,
+                 *,
+                 train_batch_size=1,
+                 valid_batch_size=1,
+                 gradient_accumulate_every=1,
+                 train_lr=0.0001,
+                 train_num_steps=100000,
+                 ema_update_every=10,
+                 ema_decay=0.995,
+                 adam_betas=(0.9, 0.99),
+                 save_and_sample_every=1000,
+                 num_samples=3,
+                 results_folder='./results',
+                 amp=True,
+                 fp16=True,
+                 split_batches=True,
+                 cond_drop_chance=0.1,
+                 save_milestone=True,
+                ):
+        
+        super().__init__(diffusion_model,
+                         None,
+                         None,
+                         train_set=train_set,
+                         valid_set=valid_set,
+                         channels=channels,
+                         train_batch_size=train_batch_size,
+                         valid_batch_size=valid_batch_size,
+                         gradient_accumulate_every=gradient_accumulate_every,
+                         train_lr=train_lr,
+                         train_num_steps=train_num_steps,
+                         ema_update_every=ema_update_every,
+                         ema_decay=ema_decay,
+                         adam_betas=adam_betas,
+                         save_and_sample_every=save_and_sample_every,
+                         num_samples=num_samples,
+                         results_folder=results_folder,
+                         amp=amp,
+                         fp16=fp16,
+                         split_batches=split_batches,
+                         calculate_fid=False,
+                         cond_drop_chance=cond_drop_chance,
+                         save_milestone=save_milestone,
+                         embed_preprocessed=True)
+        dl = DataLoader(self.ds, batch_size = self.batch_size, shuffle = True, pin_memory = True, num_workers = 4, collate_fn=self.overcooked_collate_fn)
+        dl = self.accelerator.prepare(dl)
+        self.dl = cycle(dl)
+
+        if self.valid_ds:
+            valid_dl = DataLoader(self.valid_ds, batch_size=self.valid_batch_size, shuffle=True, pin_memory=True, num_workers=4, collate_fn=self.overcooked_collate_fn)
+            self.valid_dl = self.accelerator.prepare(valid_dl)
+        else:
+            self.valid_dl = None
+        self.renderer = OvercookedSampleRenderer()
+    @staticmethod
+    def overcooked_collate_fn(samples):
+        # samples is a list of (x_item, x_cond_item, task_emb_id_item, sample_id_str_item)
+        # x_item, x_cond_item are expected to be (Horizon, H, W, C)
+        # task_emb_id_item is an int
+        
+        x_list = [s[0] for s in samples]
+        x_cond_list = [s[1] for s in samples] # This is (Horizon, H, W, C)
+        task_emb_id_list = [s[2] for s in samples]
+
+        x_batch = torch.stack(x_list) # (B, Horizon, H, W, C)
+        
+
+        # Assuming UnetOvercooked expects a single frame condition from x_cond_batch's last frame.
+        # x_cond_batch is (B, Horizon_cond, H, W, C)
+        # We take the last frame of the conditioning sequence from the dataset.
+        x_cond_single_frame_batch = torch.stack([s[1][-1] for s in samples]) # (B, H, W, C)
+
+        task_emb_id_batch = torch.tensor(task_emb_id_list, dtype=torch.long)
+        
+        # Return structure: x, x_cond, goal (policy_ids), *remaining_data (sample_ids)
+        return x_batch, x_cond_single_frame_batch, task_emb_id_batch
+    def train_one_step(self):
+        total_loss = 0
+
+        self.valid_one_step()
+        exit()
+        
+        for _ in range(self.gradient_accumulate_every):
+            x, x_cond, policy_id = next(self.dl)
+            x, x_cond, policy_id = x.to(self.device), x_cond.to(self.device), policy_id.to(self.device)
+
+            x = rearrange(x, "b f h w c -> b (f c) h w")
+            x_cond = rearrange(x_cond, "b h w c -> b c h w")
+
+            # if self.cond_drop_chance > 0: # TODO: UNcomment later
+            #     import random
+            #     if random.random() < self.cond_drop_chance:
+            #         policy_id = 0
+
+
+            with self.accelerator.autocast():
+                loss = self.model(x, x_cond, task_embed=policy_id)
+                loss = loss / self.gradient_accumulate_every
+                total_loss += loss.item()
+
+                self.accelerator.backward(loss)
+        
+        return total_loss
+    @torch.no_grad()
+    def valid_one_step(self):
+        if not self.valid_dl:
+            return 0.0
+
+        total_valid_loss = []
+        viz_output_dir = os.path.join(self.results_folder, "viz")
+        os.makedirs(viz_output_dir, exist_ok=True)
+        ch_output_dir = os.path.join(self.results_folder, "channels")
+        os.makedirs(ch_output_dir, exist_ok=True)
+        for x_org, x_cond, policy_id in self.valid_dl:
+            B, *_ = x_org.shape
+            x = rearrange(x_org, "b f h w c -> b (f c) h w")
+            x_cond = rearrange(x_cond, "b h w c -> b c h w")
+            loss = self.model(x, x_cond, task_embed=policy_id)
+            total_valid_loss.append(loss)
+            horizon = self.model.model.horizon
+            C = self.model.model.C           
+            
+            pred_traj = self.ema.ema_model.sample(
+                x_cond=x_cond,
+                task_embed = policy_id,
+                batch_size=B,
+            )
+
+            pred_traj = rearrange(pred_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
+            pred_traj = pred_traj.cpu().numpy()
+            argmax_pred = self.renderer.arg_max(pred_traj[..., :2])
+            argmax_traj = np.concatenate([argmax_pred, pred_traj[..., 2:]], axis=-1)
+            grid = self.renderer.extract_grid_from_obs(x_org.cpu().numpy()[0, 0])
+            for i in range(B):
+                pred_traj_path = os.path.join(viz_output_dir, f"pred_traj_step_{self.step}_batch_{i}.mp4")
+                self.renderer.render_trajectory_video(
+                    pred_traj[i],
+                    grid=grid,
+                    output_dir=viz_output_dir,
+                    video_path=pred_traj_path,
+                    fps=1,
+                )
+
+                
+
+                arg_pred_traj_path = os.path.join(viz_output_dir, f"argmax_pred_traj_step_{self.step}_batch_{i}.mp4")
+                self.renderer.render_trajectory_video(
+                    argmax_traj[i],
+                    grid=grid,
+                    output_dir=viz_output_dir,
+                    video_path=arg_pred_traj_path,
+                    fps=1,
+                )
+                ref_traj_path = os.path.join(viz_output_dir, f"reference_traj_step_{self.step}_batch_{i}.mp4")
+                self.renderer.render_trajectory_video(
+                        x_org.cpu().numpy()[i], 
+                        grid=grid, 
+                        output_dir=viz_output_dir, 
+                        video_path=ref_traj_path,
+                        fps=1
+                )
+
+                if i + 1 == B:
+                    ch_max = min(26, B)
+                    for j in range(ch_max):
+                        ch_path = os.path.join(ch_output_dir, f"pred_channels_step_{self.step}_batch_{i}_frame_{j}.png")
+                        self.renderer.visualize_all_channels(
+                            obs=pred_traj[i, j],
+                            output_dir=ch_path
+                        )
+                        argmax_ch_path = os.path.join(ch_output_dir, f"arg_max_pred_channels_step_{self.step}_batch_{i}_frame_{j}.png")
+                        self.renderer.visualize_all_channels(
+                            obs=argmax_traj[i, j],
+                            output_dir=argmax_ch_path
+                        )
+
+
+            
+        return sum(total_valid_loss) / len(total_valid_loss) 
+
+        
