@@ -94,17 +94,18 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
     
     
     def __getitem__(self, idx, condition_single_input=True):
-        path_idx, start, end = self.indices[idx]
-        obs = self.observations[path_idx]
-        policy_id = self.policy_id[path_idx]
+        # path_idx, start, end = self.indices[idx]
+        # obs = self.observations[path_idx]
+        # policy_id = self.policy_id[path_idx]
 
+        obs, _, policy_id = self.dataset.__getitem__(idx)
 
         # obs, actions, policy_id = self.dataset.__getitem__(idx)
         # obs: horizon x agent_num (2) x H x W x C
         # actions: horizon x 2 x action dim (1) 
         # policy : 2 (tuple)
         
-        obs = self.actual_norm(obs)
+        obs = self.actual_norm(obs.numpy())
 
         # player_loc_orietnations = obs[:, :, :, :, :10]
         # dish_onions = obs[:, :, :, :, 22:24]

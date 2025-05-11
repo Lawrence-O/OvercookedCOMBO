@@ -344,7 +344,7 @@ class OvercookedSampleRenderer:
         pass
     
     
-    def normalize_obs(self, obs, threshold_value=0.1):
+    def normalize_obs(self, obs, threshold_value=-0.05):
         """Normalizes each channel to [0,1] and scales object channels to their max values."""
         normalized = np.zeros_like(obs)
         max_values = {
@@ -371,6 +371,7 @@ class OvercookedSampleRenderer:
             #     normalized_channel = channel_data / max_val
             # else:
                 # Generic channel: normalize from its own [min, max] to [0,1]
+            channel_data = np.clip(channel_data, threshold_value, None)
             input_min = channel_data.min()
             input_max = channel_data.max()
             input_range = input_max - input_min
@@ -386,7 +387,7 @@ class OvercookedSampleRenderer:
         # Scale object channels back to [0, max_val] using threshold
         for ch_idx, max_val in idx_to_max.items():
             ch_values = normalized[:, :, ch_idx].copy()
-            non_zero_mask = ch_values > threshold_value
+            non_zero_mask = ch_values > 0.0
             if np.any(non_zero_mask):
                 scaled_values = ch_values[non_zero_mask] * max_val
                 ch_values[non_zero_mask] = np.round(scaled_values)
