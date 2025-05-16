@@ -30,6 +30,7 @@ from pytorch_fid.fid_score import calculate_frechet_distance
 import matplotlib.pyplot as plt
 import numpy as np
 import json
+import wandb
 
 __version__ = "0.0"
 
@@ -1347,6 +1348,7 @@ class OvercookedEnvTrainer(Trainer):
                  split_batches=True,
                  cond_drop_chance=0.1,
                  save_milestone=True,
+                 debug=False,
                 ):
         
         super().__init__(diffusion_model,
@@ -1383,6 +1385,49 @@ class OvercookedEnvTrainer(Trainer):
         else:
             self.valid_dl = None
         self.renderer = OvercookedSampleRenderer()
+
+        config_to_log = {
+            # Trainer parameters
+            "learning_rate": train_lr,
+            "train_batch_size": train_batch_size,
+            "valid_batch_size": valid_batch_size,
+            "gradient_accumulate_every": gradient_accumulate_every,
+            "train_num_steps": train_num_steps,
+            "ema_update_every": ema_update_every,
+            "ema_decay": ema_decay,
+            "adam_beta1": adam_betas[0],
+            "adam_beta2": adam_betas[1],
+            "save_and_sample_every": save_and_sample_every,
+            "num_validation_samples": num_samples,
+            "amp_enabled": amp,
+            "fp16_enabled": fp16,
+            "accelerator_split_batches": split_batches,
+            "cond_drop_chance": cond_drop_chance,
+            "save_milestone_checkpoints": save_milestone,
+            
+            # Dataset parameters
+            "dataset_type": train_set.__class__.__name__,
+            "dataset_horizon": train_set.horizon if hasattr(train_set, 'horizon') else 'N/A',
+            "dataset_max_path_length": train_set.max_path_length if hasattr(train_set, 'max_path_length') else 'N/A',
+            "dataset_use_padding": train_set.use_padding if hasattr(train_set, 'use_padding') else 'N/A',
+
+            # Diffusion model (GoalGaussianDiffusion) parameters
+            "diffusion_model_type": diffusion_model.__class__.__name__,
+            "diffusion_total_input_channels": diffusion_model.channels, # Total channels for the diffusion model
+            "diffusion_image_height": diffusion_model.image_size[0],
+            "diffusion_image_width": diffusion_model.image_size[1],
+            "diffusion_objective": diffusion_model.objective,
+            "diffusion_loss_type": diffusion_model.loss_type,
+            "diffusion_timesteps_total": diffusion_model.num_timesteps,
+            "diffusion_sampling_timesteps": diffusion_model.sampling_timesteps,
+            "diffusion_guidance_weight": diffusion_model.guidance_weight,
+            "diffusion_ddim_sampling_eta": diffusion_model.ddim_sampling_eta,
+        }
+        self.debug = debug
+
+        if not self.debug:
+            wandb.init(project="combo_overcooked_diffuser", entity="social-rl", name=f"run_5")
+            wandb.config.update(config_to_log)
     @staticmethod
     def overcooked_collate_fn(samples):
         # samples is a list of (x_item, x_cond_item, task_emb_id_item, sample_id_str_item)
@@ -1415,10 +1460,19 @@ class OvercookedEnvTrainer(Trainer):
             x = rearrange(x, "b f h w c -> b (f c) h w")
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
 
-            # if self.cond_drop_chance > 0: # TODO: UNcomment later
-            #     import random
-            #     if random.random() < self.cond_drop_chance:
-            #         policy_id = 0
+            # if self.cond_drop_chance > 0: 
+            #     batch_size = policy_id.shape[0]
+            #     mask = torch.rand(batch_size, device=self.device) < self.cond_drop_chance
+            #     policy_id = torch.where(mask, torch.zeros_like(policy_id), policy_id)
+            #     cond_mask = mask.view(batch_size, 1, 1, 1)
+            #     x_cond = torch.where(cond_mask, torch.zeros_like(x_cond), x_cond)
+
+                # if self.accelerator.is_local_main_process and not self.debug:
+                #     dropout_percentage = mask.float().mean().item() * 100
+                #     wandb.log({
+                #         "train/condition_dropout_percentage": dropout_percentage,
+                #         "train/step": self.step
+                #     }, commit=False)
 
 
             with self.accelerator.autocast():
@@ -1427,6 +1481,12 @@ class OvercookedEnvTrainer(Trainer):
                 total_loss += loss.item()
 
                 self.accelerator.backward(loss)
+        
+        if self.accelerator.is_local_main_process and not self.debug:
+            wandb.log({
+                "train/loss": total_loss,
+                "train/step": self.step
+            })
         
         return total_loss
     @torch.no_grad()
@@ -1439,6 +1499,12 @@ class OvercookedEnvTrainer(Trainer):
         os.makedirs(viz_output_dir, exist_ok=True)
         ch_output_dir = os.path.join(self.results_folder, "channels")
         os.makedirs(ch_output_dir, exist_ok=True)
+
+        wandb_videos = {
+            "predicted": None,
+            "argmax": None,
+            "reference": None
+        }
         for x_org, x_cond, policy_id in self.valid_dl:
             B, *_ = x_org.shape
             x = rearrange(x_org, "b f h w c -> b (f c) h w")
@@ -1469,8 +1535,6 @@ class OvercookedEnvTrainer(Trainer):
                     fps=1,
                 )
 
-                
-
                 arg_pred_traj_path = os.path.join(viz_output_dir, f"argmax_pred_traj_step_{self.step}_batch_{i}.mp4")
                 self.renderer.render_trajectory_video(
                     argmax_traj[i],
@@ -1488,6 +1552,11 @@ class OvercookedEnvTrainer(Trainer):
                         fps=1
                 )
 
+                if i == 0:
+                    wandb_videos["predicted"] = pred_traj_path
+                    wandb_videos["argmax"] = arg_pred_traj_path
+                    wandb_videos["reference"] = ref_traj_path
+
                 if i + 1 == B:
                     ch_max = min(26, B)
                     for j in range(ch_max):
@@ -1501,9 +1570,21 @@ class OvercookedEnvTrainer(Trainer):
                             obs=argmax_traj[i, j],
                             output_dir=argmax_ch_path
                         )
-
-
-            
-        return sum(total_valid_loss) / len(total_valid_loss) 
+        valid_loss = sum(total_valid_loss) / len(total_valid_loss)
+        if self.accelerator.is_local_main_process and not self.debug:
+            wandb_log_dict = {
+                "evaluation/loss": valid_loss,
+                "evaluation/step": self.step
+            }
+            for video_type, video_path in wandb_videos.items():
+                if video_path and os.path.exists(video_path):
+                    wandb_log_dict[f"evaluation/{video_type}_trajectory"] = wandb.Video(
+                        video_path, 
+                        fps=2, 
+                        format="mp4",
+                        caption=f"{video_type.capitalize()} trajectory at step {self.step}"
+                    )
+            wandb.log(wandb_log_dict)
+        return valid_loss 
 
         

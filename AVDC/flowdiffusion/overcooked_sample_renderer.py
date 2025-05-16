@@ -230,7 +230,7 @@ class OvercookedSampleRenderer:
         surface.fill((155,101,0))
 
         if un_normalize:
-            obs = self.normalize_obs(obs) 
+            obs = self.unnormalize(obs) 
         
         self._render_grid(surface, grid)
         self._render_objects(surface, obs, grid, eps)
@@ -344,7 +344,7 @@ class OvercookedSampleRenderer:
         pass
     
     
-    def normalize_obs(self, obs, threshold_value=-0.05):
+    def _normalize_obs(self, obs, threshold_value=-0.05):
         """Normalizes each channel to [0,1] and scales object channels to their max values."""
         normalized = np.zeros_like(obs)
         max_values = {
@@ -371,6 +371,7 @@ class OvercookedSampleRenderer:
             #     normalized_channel = channel_data / max_val
             # else:
                 # Generic channel: normalize from its own [min, max] to [0,1]
+            # if ch_idx not in idx_to_max:
             channel_data = np.clip(channel_data, threshold_value, None)
             input_min = channel_data.min()
             input_max = channel_data.max()
@@ -399,6 +400,37 @@ class OvercookedSampleRenderer:
         
         return normalized
     
+    def unnormalize(self, obs):
+        # Assume obs is in range [-1, 1]; just directly un-normalize back
+
+        obs = np.clip(obs, -1.0, 1.0)
+        unnorm_obs = np.zeros_like(obs, dtype=np.float32)
+        max_values = {
+            "onions_in_pot": 3.0,
+            "tomatoes_in_pot": 3.0,
+            "onions_in_soup": 3.0,
+            "tomatoes_in_soup": 3.0,
+            "soup_cook_time_remaining": 20.0
+        }
+
+        idx_to_max = {}
+        for ch_name, max_val in max_values.items():
+            if ch_name in self.CHANNEL_FEATURE_MAP:
+                ch_idx = self.CHANNEL_FEATURE_MAP[ch_name]
+                idx_to_max[ch_idx] = max_val
+
+        for ch_idx in range(obs.shape[-1]):
+            channel_data = obs[:, :, ch_idx]
+            if ch_idx in idx_to_max:
+                max_val = idx_to_max[ch_idx]
+                # Rescale [-1, 1] to [0, 1];  Rescale [0, 1] to [0, max_val]
+                channel_data = ((channel_data + 1.0) / 2.0 )* max_val
+            else:
+                # Rescale from [-1, 1] to [0, 1]
+                channel_data = (channel_data + 1.0) / 2.0
+            unnorm_obs[...,ch_idx] = channel_data
+        
+        return unnorm_obs
 
     def save_obs_image(self, obs, grid, file_path, scale=4):
         surface = self.render_frame(obs, grid)

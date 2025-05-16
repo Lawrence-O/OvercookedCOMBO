@@ -1,6 +1,8 @@
 import torch
+from torch.utils.data import Subset
 from pathlib import Path
 import argparse
+import numpy as np
 
 # Workspace imports
 from AVDC.flowdiffusion.goal_diffusion import GoalGaussianDiffusion, OvercookedEnvTrainer
@@ -32,13 +34,29 @@ class OvercookedTrainer:
             use_padding=getattr(args, 'use_padding', True),
         )
 
-        self.train_dataset = OvercookedSequenceDataset(args=dataset_args)
-        self.observation_dim = self.train_dataset.observation_dim
+        self.dataset = OvercookedSequenceDataset(args=dataset_args)
+
+        # Create train/validation split
+        dataset_size = len(self.dataset)
+        indices = list(range(dataset_size))
+        np.random.shuffle(indices)
+        
+        split_idx = int(np.floor(args.valid_ratio * dataset_size))
+        train_indices, valid_indices = indices[split_idx:], indices[:split_idx]
+        
+        self.train_dataset = Subset(self.dataset, train_indices)
+        self.valid_dataset = Subset(self.dataset, valid_indices)
+
+
+        self.observation_dim = self.dataset.observation_dim
         self.diffusion = None
         self.trainer = None
         self.unet = None
 
         self.init_diffusion_trainer()
+    
+    def split_dataset(self, dataset):
+        raise NotImplementedError()
         
     def init_diffusion_trainer(self):
         H,W,C = self.observation_dim
@@ -48,7 +66,7 @@ class OvercookedTrainer:
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
             model=self.unet,
-            channels=C * 32, #TODO: Look into this
+            channels=C * 32, #TODO: Look into this Channels * Batch Size
             image_size=(H,W),
             timesteps=1 if self.args.debug else 400,
             sampling_timesteps=1 if self.args.debug else 10,
@@ -61,7 +79,7 @@ class OvercookedTrainer:
                 diffusion_model=self.diffusion,
                 channels=C,
                 train_set=self.train_dataset,
-                valid_set=self.train_dataset,
+                valid_set=self.valid_dataset,
                 train_lr=1e-4,
                 train_num_steps = 200000,
                 save_and_sample_every = 2 if self.args.debug else 1000,
@@ -75,8 +93,9 @@ class OvercookedTrainer:
                 fp16 =True,
                 amp=True,
                 save_milestone=self.args.save_milestone,
-                cond_drop_chance=getattr(self.args, 'cond_drop_prob', 0.1),
-                split_batches=getattr(self.args, 'split_batches', True)
+                cond_drop_chance=getattr(self.args, 'cond_drop_prob', 0),
+                split_batches=getattr(self.args, 'split_batches', True),
+                debug=self.args.debug,
             )
     def train(self):
         self.trainer.train()
@@ -84,7 +103,7 @@ class OvercookedTrainer:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train Overcooked Diffusion Model")
 
-    # --- Arguments that ARE used or configurable based on your OvercookedTrainer snippet ---
+    parser.add_argument('--valid_ratio', type=float, default=0.1, help='Fraction of data to use for validation (default: 0.1)')
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU ID to use (-1 for CPU)')
     parser.add_argument('--results_dir', type=str, default='./overcooked_results', help='Directory to save results and checkpoints')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode (smaller dataset, faster training)')
@@ -99,7 +118,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_padding', type=bool, default=True, help='Whether to use padding for shorter sequences in dataset')
 
 
-    # For GoalGaussianDiffusion (configurable ones)
+    # For GoalGaussianDiffusion
     parser.add_argument('--timesteps', type=int, default=400, help='Number of diffusion timesteps for training (if not debug)')
     parser.add_argument('--sampling_timesteps', type=int, default=10, help='Number of timesteps for DDIM sampling (if not debug)')
 
