@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-PLAYER_OBS_CHANNELS = list(range(10)) # Channels for player observations, you can change it
+PLAYER_OBS_CHANNELS = list(range(10)) + [22, 23, 24] # Channels for player observations, you can change it
 INPUT_CHANNELS = len(PLAYER_OBS_CHANNELS) * 2 # Number of input channels for the model
 
 def get_player_locations(obs):

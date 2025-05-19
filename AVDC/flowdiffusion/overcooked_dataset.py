@@ -12,7 +12,7 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
 
         if dataset_path.endswith("hdf5"):
             
-            self.dataset = HDF5Dataset(args, "test") # TODO: change to train later
+            self.dataset = HDF5Dataset(args, "train") # TODO: change to train later
             self.observations = np.array(self.dataset.dset["obs"]) # path_num * (path_length + 1) * num_agent * height * width * channels
             self.actions = np.array(self.dataset.dset["actions"]) # path_num * path_length * num_agent * action_dim (1)
             self.dones = np.array(self.dataset.dset["dones"]) # path_num * path_length * num_agent
@@ -130,7 +130,7 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         # actions: horizon x 2 x action dim (1) 
         # policy : 2 (tuple)
         
-        obs = self.consistent_norm(obs.numpy())
+        obs = self.actual_norm(obs.numpy())
 
         # player_loc_orietnations = obs[:, :, :, :, :10]
         # dish_onions = obs[:, :, :, :, 22:24]

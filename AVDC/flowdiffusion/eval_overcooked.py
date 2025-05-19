@@ -33,7 +33,6 @@ def parse_args(args, parser):
 
     # For OvercookedSequenceDataset / HDF5Dataset
     parser.add_argument('--max_path_length', type=int, default=401, help='Maximum path length in episodes (for dataset indexing)')
-    # parser.add_argument('--episode_length', type=int, default=401, help='Full episode length (for HDF5Dataset if used directly)')
     parser.add_argument('--chunk_length', type=int, default=None, help='Chunk length for HDF5Dataset (defaults to horizon if None, set via dataset_constructor_args)')
     parser.add_argument('--use_padding', type=bool, default=True, help='Whether to use padding for shorter sequences in dataset')
 
@@ -89,7 +88,7 @@ def parse_args(args, parser):
     parser.add_argument("--store_traj", default=False, action='store_true')
     # population
     parser.add_argument("--population_yaml_path", type=str, help="Path to yaml file that stores the population info.")
-
+    parser.add_argument('--valid_ratio', type=float, default=0.1, help='Fraction of data to use for validation (default: 0.1)')
     all_args = parser.parse_known_args(args)[0]
 
     return all_args
@@ -100,6 +99,9 @@ def get_idm_action(current_obs, next_obs, idm_model):
     # render = OvercookedSampleRenderer()
     # render.visualize_all_channels(to_np(current_obs[0]), "./curr_obs.png")
     # render.visualize_all_channels(to_np(next_obs[0]), "./next_obs.png")
+
+    assert th.all((current_obs == -1) | (current_obs == 1)), "obs contains values other than -1 or 1"
+    assert th.all((next_obs == -1) | (next_obs == 1)), "obs contains values other than -1 or 1"
 
     with th.no_grad():
         logits = idm_model(current_obs, next_obs)
@@ -172,15 +174,16 @@ def normalize_obs(obs):
 def preprocess_for_idm(obs):
     if isinstance(obs, np.ndarray):
         # For numpy arrays
-        preprocessed_obs = np.where(obs < 0, -1, 1)
+        preprocessed_obs = np.where(obs < 0, -1.0, 1.0)
     elif isinstance(obs, th.Tensor):
         # For PyTorch tensors
-        preprocessed_obs = th.where(obs < 0, -1, 1)
-    return obs
+        preprocessed_obs = th.where(obs < 0, -1.0, 1.0)
+        
+    return preprocessed_obs
 
 
 @th.no_grad()
-def full_horizon_eval(args, diffusion, idm, policy, device, show_samples=False, eval_episodes=3, basedir="./eval_folder"):
+def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, show_samples=False, eval_episodes=3, basedir="./eval_folder"):
     print(f"Starting Overcooked Evaluation; BaseDir {basedir}")
     video_dir = osp.join(basedir, "videos")
     frames_dir = osp.join(basedir, "frames")
@@ -266,7 +269,10 @@ def full_horizon_eval(args, diffusion, idm, policy, device, show_samples=False, 
 
             
             # Now step through the environment using the 32-step plan
-            plan_horizon = min(F, max_steps - steps)
+            if max_horizon:
+                plan_horizon = min(max_steps - steps, max_horizon)
+            else:
+                plan_horizon = min(F, max_steps - steps)
 
             # We begin with the first ego obs (first obs of the environment)
             obs_t = to_torch(obs_stack) # 3,8,5,26
@@ -325,7 +331,9 @@ def full_horizon_eval(args, diffusion, idm, policy, device, show_samples=False, 
                 # Check for early termination
                 done = np.all(done)
                 steps += 1
-                if done or steps >= max_steps:
+                if steps >= max_steps:
+                    print("here")
+                    print(done, steps)
                     break
         mean_episode_reward = episode_reward.mean(axis=0)
         print(f"Episode {episode+1} complete: steps={steps}, reward={mean_episode_reward}")
@@ -342,6 +350,7 @@ def full_horizon_eval(args, diffusion, idm, policy, device, show_samples=False, 
             pickle.dump(metrics, f)
         
         for e in range(n_envs):
+            frames[e] = rearrange(frames[e], "f w h c -> f h w c")
             grid = renderer.extract_grid_from_obs(frames[e][0])
             env_dir = osp.join(video_dir, f"episode_{episode+1}_env_{e+1}")
             os.makedirs(env_dir, exist_ok=True)
@@ -397,15 +406,15 @@ def full_horizon_eval(args, diffusion, idm, policy, device, show_samples=False, 
     envs.close()
     return summary
 
-def load_diffusion_model(args):
+def load_diffusion_model(args, device):
     
-    trainer = OvercookedTrainer(args)
+    trainer = OvercookedTrainer(args, device)
     # Load checkpoint
     checkpoint_path = osp.join(args.diffusion_loadpath, f"modl-{args.diffusion_milestone}.pt")
     print(f"Loading diffusion model from {checkpoint_path}")
     trainer_actual = trainer.trainer
     trainer_actual.load(checkpoint_path)
-    return trainer_actual.ema.ema_model
+    return trainer_actual.ema.ema_model.to(device)
 
                 
 
@@ -414,9 +423,13 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     args = parse_args(args, parser)
     device = th.device('cpu' if not th.cuda.is_available() else 'cuda')
+    # device = th.device("cpu")
 
     # load diffusion model function from disk
-    diffusion = load_diffusion_model(args)
+    diffusion = load_diffusion_model(args, device)
+
+    #overrde episode len
+    args.episode_length = 400
     
     # MAPT Setup
     os.environ["layout"] = args.layout_name
@@ -444,4 +457,4 @@ if __name__ == "__main__":
         policy=policy,
         device=device,
         show_samples=True,
-        eval_episodes=1)
+        eval_episodes=10)

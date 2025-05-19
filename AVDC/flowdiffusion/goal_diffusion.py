@@ -1452,7 +1452,6 @@ class OvercookedEnvTrainer(Trainer):
         return x_batch, x_cond_single_frame_batch, task_emb_id_batch
     def train_one_step(self):
         total_loss = 0
-        
         for _ in range(self.gradient_accumulate_every):
             x, x_cond, policy_id = next(self.dl)
             x, x_cond, policy_id = x.to(self.device), x_cond.to(self.device), policy_id.to(self.device)
@@ -1574,7 +1573,6 @@ class OvercookedEnvTrainer(Trainer):
         if self.accelerator.is_local_main_process and not self.debug:
             wandb_log_dict = {
                 "evaluation/loss": valid_loss,
-                "evaluation/step": self.step
             }
             for video_type, video_path in wandb_videos.items():
                 if video_path and os.path.exists(video_path):
@@ -1584,7 +1582,101 @@ class OvercookedEnvTrainer(Trainer):
                         format="mp4",
                         caption=f"{video_type.capitalize()} trajectory at step {self.step}"
                     )
-            wandb.log(wandb_log_dict)
+            wandb.log(wandb_log_dict, step=self.step)
         return valid_loss 
+
+class ConceptTrainer(OvercookedEnvTrainer):
+    def __init__(
+            self,
+            diffusion_model,
+            train_set,
+            valid_set,
+            channels,
+            **kwargs
+    ):
+        super().__init__(
+            diffusion_model=diffusion_model,
+            train_set=train_set,
+            valid_set=valid_set,
+            channels=channels,
+        )
+
+        self.freeze_all_parameters()
+        self.unfreeze_policy_embedding()
+
+        
+    def freeze_all_parameters(self):
+        for param in self.model.parameters():
+            param.requires_grad = False
+        for param in self.ema.ema_model.parameters():
+            param.requires_grad = False
+    
+    def unfreeze_policy_embedding(self):
+        unet, ema = self.model.model, self.ema.ema_model.model
+        unet.label_emb.weight.requires_grad = True
+        ema.label_emb.weight.requires_grad = True  
+    
+
+    def train_one_step(self):
+        total_loss = 0.0
+
+        for _ in range(self.gradient_accumulate_every):
+            x, x_cond, policy_id = next(self.dl)
+            x, x_cond, policy_id = x.to(self.device), x_cond.to(self.device), policy_id.to(self.device)
+
+            dummy_cond = torch.zeros_like(policy_id)
+            # print(f"------Dummy Cond Set to {dummy_cond} -----------")
+
+            with self.accelerator.autocast():
+                loss = self._loss(x, x_cond, policy_id, dummy_cond)
+                loss = loss / self.gradient_accumulate_every
+                total_loss += loss.item()
+
+                self.accelerator.backward(loss)
+        
+        return total_loss
+    
+    def _loss(self, x_start, x_cond, policy_id, dummy_cond):
+        # Reshaping
+        x_start = rearrange(x_start, "b f h w c -> b (f c) h w")
+        x_cond = rearrange(x_cond, "b h w c -> b c h w")
+
+        # Normalize
+        x_start = self.model.normalize(x_start)
+        x_cond = self.model.normalize(x_cond)
+
+        # Noise       
+        noise = torch.rand_like(x_start)
+        t = torch.randint(0, self.model.num_timesteps, (x_start.shape[0],), device=x_start.device).long()
+        x_noisy = self.q_sample(x_start=x_start, t=t)
+
+        # Get Conditional and Unconditional Outputs
+        cond_output = self.model(x_noisy, x_cond, task_embed=policy_id)
+        uncond_output = self.model(x_noisy, x_cond, task_embed=dummy_cond)
+        epsilon_diff = cond_output - uncond_output
+
+        # Compute Final Output
+        final_output = uncond_output + (self.model.condition_guidance_w * epsilon_diff)
+
+        # Compute loss against target
+        if self.model.objective == 'pred_noise':
+            target = noise
+        elif self.model.objective == 'pred_x0':
+            target = x_start
+        elif self.model.objective == 'pred_v':
+            target = self.model.predict_v(x_start, t, noise)
+        else:
+            raise ValueError(f'unknown objective {self.objective}')
+            
+
+        if self.model.composed:
+            raise NotImplementedError()
+        
+        loss = self.model.loss_fn(final_output, target, reduction='none')
+        loss = reduce(loss, 'b ... -> b (...)', 'mean')
+        loss = (loss * extract(self.model.loss_weight, t, loss.shape)).mean()
+        return loss
+             
+
 
         

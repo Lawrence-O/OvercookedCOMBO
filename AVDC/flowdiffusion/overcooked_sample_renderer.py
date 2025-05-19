@@ -221,7 +221,7 @@ class OvercookedSampleRenderer:
                 except KeyError:
                     pass  # Skip hat if frame not found
 
-    def render_frame(self, obs, grid, un_normalize=True, eps=1e-4):
+    def render_frame(self, obs, grid, un_normalize=False, eps=1e-4):
 
         height = len(grid)
         width = len(grid[0])
@@ -230,7 +230,10 @@ class OvercookedSampleRenderer:
         surface.fill((155,101,0))
 
         if un_normalize:
-            obs = self.unnormalize(obs) 
+            obs = self.normalize_obs(obs)
+        else:
+            # assert np.all(obs % 255 == 0)
+            obs = obs.astype(np.float32) / 255.0
         
         self._render_grid(surface, grid)
         self._render_objects(surface, obs, grid, eps)
@@ -344,7 +347,7 @@ class OvercookedSampleRenderer:
         pass
     
     
-    def _normalize_obs(self, obs, threshold_value=-0.05):
+    def normalize_obs(self, obs, threshold_value=-0.05):
         """Normalizes each channel to [0,1] and scales object channels to their max values."""
         normalized = np.zeros_like(obs)
         max_values = {

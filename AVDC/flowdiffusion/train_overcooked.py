@@ -11,9 +11,12 @@ from AVDC.flowdiffusion.overcooked_dataset import OvercookedSequenceDataset
 
 
 class OvercookedTrainer:
-    def __init__(self, args):
+    def __init__(self, args, device=None):
         self.args = args
-        self.device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu")
+        if device is None:
+            self.device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu")
+        else:
+            self.device=device
         print(f"Using device: {self.device}")
 
         self.results_folder = Path(args.results_dir)
@@ -68,8 +71,8 @@ class OvercookedTrainer:
             model=self.unet,
             channels=C * 32, #TODO: Look into this Channels * Batch Size
             image_size=(H,W),
-            timesteps=1 if self.args.debug else 400,
-            sampling_timesteps=1 if self.args.debug else 10,
+            timesteps=1 if self.args.debug else 1000,
+            sampling_timesteps=1 if self.args.debug else 100,
             loss_type="l2",
             objective="pred_v",
             beta_schedule="cosine",
