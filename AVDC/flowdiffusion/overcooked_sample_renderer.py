@@ -221,7 +221,7 @@ class OvercookedSampleRenderer:
                 except KeyError:
                     pass  # Skip hat if frame not found
 
-    def render_frame(self, obs, grid, un_normalize=False, eps=1e-4):
+    def render_frame(self, obs, grid, un_normalize=True, eps=1e-4):
 
         height = len(grid)
         width = len(grid[0])

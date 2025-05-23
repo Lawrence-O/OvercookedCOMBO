@@ -6,7 +6,7 @@ import numpy as np
 import os
 
 # Workspace imports
-from goal_diffusion import GoalGaussianDiffusion, OvercookedEnvTrainer
+from goal_diffusion import GoalGaussianDiffusion, ConceptTrainer
 from unet import UnetOvercooked 
 from overcooked_dataset import OvercookedSequenceDataset
 
@@ -40,18 +40,6 @@ class OvercookedTrainer:
 
         self.dataset = OvercookedSequenceDataset(args=dataset_args)
 
-        # Create train/validation split
-        dataset_size = len(self.dataset)
-        indices = list(range(dataset_size))
-        np.random.shuffle(indices)
-        
-        split_idx = int(np.floor(args.valid_ratio * dataset_size))
-        train_indices, valid_indices = indices[split_idx:], indices[:split_idx]
-        
-        self.train_dataset = Subset(self.dataset, train_indices)
-        self.valid_dataset = Subset(self.dataset, valid_indices)
-
-
         self.observation_dim = self.dataset.observation_dim
         self.diffusion = None
         self.trainer = None
@@ -59,15 +47,15 @@ class OvercookedTrainer:
 
         self.init_diffusion_trainer()
 
-        if args.resume_checkpoint_path:
-            if os.path.isfile(args.resume_checkpoint_path):
-                print(f"Resuming training from checkpoint: {args.resume_checkpoint_path}")
-                self.trainer.load(milestone=args.resume_checkpoint_path)
-            else:
-                print(f"Warning: Checkpoint path {args.resume_checkpoint_path} not found. Starting training from scratch.")
     
         
     def init_diffusion_trainer(self):
+        if not self.args.pretrained_model_path:
+            raise ValueError("Must provide pretrained_model_path for fine-tuning concepts")
+        
+        print(f"\n=== LOADING PRE-TRAINED MODEL ===")
+        print(f"Pre-trained model path: {self.args.pretrained_model_path}")
+        
         H,W,C = self.observation_dim
         self.unet = UnetOvercooked(
             horizon=self.horizon,
@@ -83,15 +71,14 @@ class OvercookedTrainer:
             objective="pred_v",
             beta_schedule="cosine",
             min_snr_loss_weight=True,
-            guidance_weight=1.0, # Recently set 10:35PM 5/22
         ).to(self.device)
-        self.trainer = OvercookedEnvTrainer(
+        self.trainer = ConceptTrainer(
                 diffusion_model=self.diffusion,
                 channels=C,
-                train_set=self.train_dataset,
-                valid_set=self.valid_dataset,
+                train_set=self.dataset,
+                valid_set=self.dataset,
                 train_lr=1e-4,
-                train_num_steps = 200000,
+                train_num_steps = self.args.max_train_steps if not self.args.debug else 1,
                 save_and_sample_every = 2 if self.args.debug else 1000,
                 ema_update_every = 10,
                 ema_decay = 0.999,
@@ -106,23 +93,36 @@ class OvercookedTrainer:
                 cond_drop_chance=getattr(self.args, 'cond_drop_prob', 0),
                 split_batches=getattr(self.args, 'split_batches', True),
                 debug=self.args.debug,
-                dummy_policy_id=9 #TODO
+                dummy_policy_id=self.args.dummy_policy_id,
+                new_policy_id=self.args.new_policy_id
             )
+        self.trainer.load(milestone=self.args.pretrained_model_path)
+        print(f"✓ Successfully loaded pre-trained model")
+        print(f"Concept Learning will run for up to {self.args.max_train_steps} steps")
+    
     def train(self):
+        self.trainer.step = 0
         self.trainer.train()
+        print(f"Saving final model checkpoint...")
+        self.trainer.save(milestone="concept_learned_model")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train Overcooked Diffusion Model")
 
     parser.add_argument('--valid_ratio', type=float, default=0.1, help='Fraction of data to use for validation (default: 0.1)')
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU ID to use (-1 for CPU)')
-    parser.add_argument('--results_dir', type=str, default='./overcooked_results', help='Directory to save results and checkpoints')
+    parser.add_argument('--results_dir', type=str, default='./concept_learning_overcooked_results', help='Directory to save results and checkpoints')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode (smaller dataset, faster training)')
     parser.add_argument('--dataset_path', type=str, required=True, help='Path to the Overcooked HDF5 dataset')
     parser.add_argument('--horizon', type=int, default=32, help='Sequence horizon for trajectories')
     parser.add_argument('--save_milestone', type=bool, default=True, help='Save milestones with step number in filename') 
     
-    parser.add_argument('--resume_checkpoint_path', type=str, required=False, default=None, help='Path to a .pt checkpoint file to resume training from.')
+    parser.add_argument('--pretrained_model_path', type=str, required=True, help='Path to a .pt checkpoint file to train from.')
+    parser.add_argument('--max_train_steps', type=int, required=True, help='The maximum number of training steps to run')
+    parser.add_argument('--dummy_policy_id', type=int, required=True, help='Policy ID to use for unconditional generation (default: 10)')
+    parser.add_argument('--new_policy_id', type=int, required=True, help='Policy ID to be learned ')
+    parser.add_argument('--guidance_weight', type=int, default=0.2, required=True, help='Policy ID to be learned ')
+
 
     # For OvercookedSequenceDataset / HDF5Dataset
     parser.add_argument('--max_path_length', type=int, default=401, help='Maximum path length in episodes (for dataset indexing)')
@@ -139,7 +139,7 @@ if __name__ == '__main__':
     parser.add_argument('--train_batch_size', type=int, default=32, help='Training batch size (if not debug)')
     parser.add_argument('--num_validation_samples', type=int, default=4, help='Number of samples to generate during validation step')
     parser.add_argument('--save_and_sample_every', type=int, default=5000, help='Frequency to save checkpoints and generate samples (if not debug)')
-    parser.add_argument('--cond_drop_prob', type=float, default=0.1, help='Probability of dropping condition for CFG during training')
+    parser.add_argument('--cond_drop_prob', type=float, default=0, help='Probability of dropping condition for CFG during training')
     parser.add_argument('--split_batches', type=bool, default=True, help='Whether to split batches for Accelerator')
 
     config = parser.parse_args()

@@ -1077,7 +1077,7 @@ class Trainer(object):
                 shutil.rmtree(tensorboard_folder)
             tensorboard_folder.mkdir(exist_ok=True)
             tensorboard_sw = SummaryWriter(tensorboard_folder)
-
+        print(self.step, self.train_num_steps)
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
@@ -1349,6 +1349,7 @@ class OvercookedEnvTrainer(Trainer):
                  cond_drop_chance=0.1,
                  save_milestone=True,
                  debug=False,
+                 dummy_policy_id=None
                 ):
         
         super().__init__(diffusion_model,
@@ -1424,10 +1425,14 @@ class OvercookedEnvTrainer(Trainer):
             "diffusion_ddim_sampling_eta": diffusion_model.ddim_sampling_eta,
         }
         self.debug = debug
+        if cond_drop_chance > 0 and dummy_policy_id is None:
+            raise ValueError("Must provide dummy_policy_id when cond_drop_chance > 0")
+        
+        self.dummy_id = dummy_policy_id
 
-        if not self.debug:
-            wandb.init(project="combo_overcooked_diffuser", entity="social-rl", name=f"run_5")
-            wandb.config.update(config_to_log)
+        # if not self.debug:
+        #     wandb.init(project="combo_overcooked_diffuser", entity="social-rl", name=f"sp_vs_best_r_sp_dataset")
+        #     wandb.config.update(config_to_log)
     @staticmethod
     def overcooked_collate_fn(samples):
         # samples is a list of (x_item, x_cond_item, task_emb_id_item, sample_id_str_item)
@@ -1459,20 +1464,12 @@ class OvercookedEnvTrainer(Trainer):
             x = rearrange(x, "b f h w c -> b (f c) h w")
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
 
-            # if self.cond_drop_chance > 0: 
-            #     batch_size = policy_id.shape[0]
-            #     mask = torch.rand(batch_size, device=self.device) < self.cond_drop_chance
-            #     policy_id = torch.where(mask, torch.zeros_like(policy_id), policy_id)
-            #     cond_mask = mask.view(batch_size, 1, 1, 1)
-            #     x_cond = torch.where(cond_mask, torch.zeros_like(x_cond), x_cond)
-
-                # if self.accelerator.is_local_main_process and not self.debug:
-                #     dropout_percentage = mask.float().mean().item() * 100
-                #     wandb.log({
-                #         "train/condition_dropout_percentage": dropout_percentage,
-                #         "train/step": self.step
-                #     }, commit=False)
-
+            
+            if self.cond_drop_chance > 0: 
+                batch_size = policy_id.shape[0]
+                mask = torch.rand(batch_size, device=self.device) < self.cond_drop_chance
+                policy_id = torch.where(mask, self.dummy_id*(torch.ones_like(policy_id)), policy_id)
+                
 
             with self.accelerator.autocast():
                 loss = self.model(x, x_cond, task_embed=policy_id)
@@ -1494,6 +1491,7 @@ class OvercookedEnvTrainer(Trainer):
             return 0.0
 
         total_valid_loss = []
+        total_unconditional_loss = []
         viz_output_dir = os.path.join(self.results_folder, "viz")
         os.makedirs(viz_output_dir, exist_ok=True)
         ch_output_dir = os.path.join(self.results_folder, "channels")
@@ -1502,14 +1500,21 @@ class OvercookedEnvTrainer(Trainer):
         wandb_videos = {
             "predicted": None,
             "argmax": None,
-            "reference": None
+            "reference": None,
+            "unconditional": None
         }
         for x_org, x_cond, policy_id in self.valid_dl:
             B, *_ = x_org.shape
             x = rearrange(x_org, "b f h w c -> b (f c) h w")
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
             loss = self.model(x, x_cond, task_embed=policy_id)
+
+            dummy_cond = torch.ones_like(policy_id)*self.dummy_id
+            uncond_loss = self.model(x, x_cond, task_embed=dummy_cond)
+
             total_valid_loss.append(loss)
+            total_unconditional_loss.append(uncond_loss)
+
             horizon = self.model.model.horizon
             C = self.model.model.C           
             
@@ -1519,10 +1524,21 @@ class OvercookedEnvTrainer(Trainer):
                 batch_size=B,
             )
 
+            uncond_pred_traj = self.ema.ema_model.sample(
+                x_cond=x_cond,
+                task_embed=dummy_cond,
+                batch_size=B,
+            )
+            # Process conditional trajectory
             pred_traj = rearrange(pred_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
             pred_traj = pred_traj.cpu().numpy()
             argmax_pred = self.renderer.arg_max(pred_traj[..., :2])
             argmax_traj = np.concatenate([argmax_pred, pred_traj[..., 2:]], axis=-1)
+
+            # Process unconditional trajectory
+            uncond_pred_traj = rearrange(uncond_pred_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
+            uncond_pred_traj = uncond_pred_traj.cpu().numpy()
+
             grid = self.renderer.extract_grid_from_obs(x_org.cpu().numpy()[0, 0])
             for i in range(B):
                 pred_traj_path = os.path.join(viz_output_dir, f"pred_traj_step_{self.step}_batch_{i}.mp4")
@@ -1551,10 +1567,20 @@ class OvercookedEnvTrainer(Trainer):
                         fps=1
                 )
 
+                uncond_traj_path = os.path.join(viz_output_dir, f"uncond_traj_step_{self.step}_batch_{i}.mp4")
+                self.renderer.render_trajectory_video(
+                    uncond_pred_traj[i],
+                    grid=grid,
+                    output_dir=viz_output_dir,
+                    video_path=uncond_traj_path,
+                    fps=1,
+                )
+
                 if i == 0:
                     wandb_videos["predicted"] = pred_traj_path
                     wandb_videos["argmax"] = arg_pred_traj_path
                     wandb_videos["reference"] = ref_traj_path
+                    wandb_videos["unconditional"] = uncond_traj_path
 
                 if i + 1 == B:
                     ch_max = min(26, B)
@@ -1570,9 +1596,12 @@ class OvercookedEnvTrainer(Trainer):
                             output_dir=argmax_ch_path
                         )
         valid_loss = sum(total_valid_loss) / len(total_valid_loss)
+        uncond_loss = sum(total_unconditional_loss) / len(total_unconditional_loss)
+
         if self.accelerator.is_local_main_process and not self.debug:
             wandb_log_dict = {
                 "evaluation/loss": valid_loss,
+                "evaluation/unconditional_loss": uncond_loss,
             }
             for video_type, video_path in wandb_videos.items():
                 if video_path and os.path.exists(video_path):
@@ -1592,6 +1621,8 @@ class ConceptTrainer(OvercookedEnvTrainer):
             train_set,
             valid_set,
             channels,
+            dummy_policy_id,
+            new_policy_id,
             **kwargs
     ):
         super().__init__(
@@ -1599,22 +1630,37 @@ class ConceptTrainer(OvercookedEnvTrainer):
             train_set=train_set,
             valid_set=valid_set,
             channels=channels,
+            **kwargs
         )
+
+        self.dummy_id = dummy_policy_id
+        self.new_policy_id = new_policy_id
+        self.step = 0
 
         self.freeze_all_parameters()
         self.unfreeze_policy_embedding()
 
         
     def freeze_all_parameters(self):
-        for param in self.model.parameters():
+        for param in self.model.model.unet.parameters():
             param.requires_grad = False
-        for param in self.ema.ema_model.parameters():
+        for param in self.ema.ema_model.model.unet.parameters():
             param.requires_grad = False
     
     def unfreeze_policy_embedding(self):
-        unet, ema = self.model.model, self.ema.ema_model.model
+        unet, ema = self.model.model.unet, self.ema.ema_model.model.unet
         unet.label_emb.weight.requires_grad = True
-        ema.label_emb.weight.requires_grad = True  
+        ema.label_emb.weight.requires_grad = True 
+
+        # Count trainable parameters and verify only label_emb is active
+        total_trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        embedding_params = unet.label_emb.weight.numel()
+
+        assert total_trainable_params == embedding_params, \
+            f"Expected only {embedding_params} trainable parameters (label_emb), but found {total_trainable_params}"
+
+        print(f"Successfully unfroze policy embedding with shape: {unet.label_emb.weight.shape}")
+        self.step = 0
     
 
     def train_one_step(self):
@@ -1622,56 +1668,60 @@ class ConceptTrainer(OvercookedEnvTrainer):
 
         for _ in range(self.gradient_accumulate_every):
             x, x_cond, policy_id = next(self.dl)
-            x, x_cond, policy_id = x.to(self.device), x_cond.to(self.device), policy_id.to(self.device)
+            # Assuming policy_id is not the correct one, we use the one passed via arguments
+            x, x_cond, _ = x.to(self.device), x_cond.to(self.device), policy_id.to(self.device)
 
-            dummy_cond = torch.zeros_like(policy_id)
-            # print(f"------Dummy Cond Set to {dummy_cond} -----------")
 
             with self.accelerator.autocast():
-                loss = self._loss(x, x_cond, policy_id, dummy_cond)
+                loss = self._loss(x, x_cond)
                 loss = loss / self.gradient_accumulate_every
                 total_loss += loss.item()
-
                 self.accelerator.backward(loss)
         
         return total_loss
+
     
-    def _loss(self, x_start, x_cond, policy_id, dummy_cond):
+    
+    def _loss(self, x_start, x_cond):
+        # Create Policy IDs
+        batch_size = x_start.shape[0]
+        policy_id = torch.full((batch_size,), self.new_policy_id, device=self.device, dtype=torch.long)
+        dummy_cond = torch.full((batch_size,), self.dummy_id, device=self.device, dtype=torch.long)
+        
         # Reshaping
         x_start = rearrange(x_start, "b f h w c -> b (f c) h w")
         x_cond = rearrange(x_cond, "b h w c -> b c h w")
 
-        # Normalize
+        # Normalize Theoretically shouldn't be needed
         x_start = self.model.normalize(x_start)
         x_cond = self.model.normalize(x_cond)
 
         # Noise       
         noise = torch.rand_like(x_start)
         t = torch.randint(0, self.model.num_timesteps, (x_start.shape[0],), device=x_start.device).long()
-        x_noisy = self.q_sample(x_start=x_start, t=t)
+        x_noisy = self.model.q_sample(x_start=x_start, t=t)
 
         # Get Conditional and Unconditional Outputs
-        cond_output = self.model(x_noisy, x_cond, task_embed=policy_id)
-        uncond_output = self.model(x_noisy, x_cond, task_embed=dummy_cond)
+        cond_output = self.model.model(x_noisy, x_cond, t, task_embed=policy_id)
+        uncond_output = self.model.model(x_noisy,x_cond, t, task_embed=dummy_cond)
+        
         epsilon_diff = cond_output - uncond_output
 
         # Compute Final Output
-        final_output = uncond_output + (self.model.condition_guidance_w * epsilon_diff)
+        final_output = uncond_output + (self.model.guidance_weight * epsilon_diff)
 
         # Compute loss against target
         if self.model.objective == 'pred_noise':
             target = noise
         elif self.model.objective == 'pred_x0':
             target = x_start
+            cond_output, uncond_output = cond_output.noise, uncond_output.noise
         elif self.model.objective == 'pred_v':
             target = self.model.predict_v(x_start, t, noise)
         else:
             raise ValueError(f'unknown objective {self.objective}')
-            
-
-        if self.model.composed:
-            raise NotImplementedError()
         
+
         loss = self.model.loss_fn(final_output, target, reduction='none')
         loss = reduce(loss, 'b ... -> b (...)', 'mean')
         loss = (loss * extract(self.model.loss_weight, t, loss.shape)).mean()

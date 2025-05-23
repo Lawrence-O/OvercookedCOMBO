@@ -135,8 +135,9 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         # player_loc_orietnations = obs[:, :, :, :, :10]
         # dish_onions = obs[:, :, :, :, 22:24]
         # obs = np.concatenate([player_loc_orietnations, dish_onions], axis=-1)
+        if obs.ndim == 4:
+            obs = np.expand_dims(obs, axis=1)            
         T, _, H, W, C = obs.shape # Time, Agent, Height, Width, Channel 
-
 
         # Get Ego Agent Observation (Agent ID  = 0)
         start = random.randint(1, T - self.horizon)

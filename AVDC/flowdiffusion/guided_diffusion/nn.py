@@ -218,7 +218,7 @@ class CheckpointFunction(th.autograd.Function):
         return output_tensors
 
     @staticmethod
-    def backward(ctx, *output_grads):
+    def _backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
         with th.enable_grad():
             # Fixes a bug where the first op in run_function modifies the
@@ -236,3 +236,37 @@ class CheckpointFunction(th.autograd.Function):
         del ctx.input_params
         del output_tensors
         return (None, None) + input_grads
+    
+    def backward(ctx, *output_grads):
+        ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
+        with th.enable_grad():
+            # Fixes a bug where the first op in run_function modifies the
+            # Tensor storage in place, which is not allowed for detach()'d
+            # Tensors.
+            shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
+            output_tensors = ctx.run_function(*shallow_copies)
+        params_with_grad = [p for p in ctx.input_params if p.requires_grad]
+
+        grads_for_some_params = th.autograd.grad(
+            output_tensors,
+            ctx.input_tensors + params_with_grad,
+            output_grads,
+            allow_unused=True,
+        )
+
+        # grads_for_some_params is a tuple for ctx.input_tensors + params_with_grad
+        input_tensors_grads = grads_for_some_params[:len(ctx.input_tensors)]
+        params_grads_some = grads_for_some_params[len(ctx.input_tensors):]
+
+        # Now create full grads for all params with None placeholders for non-grad params
+        params_grads_full = []
+        idx = 0
+        for p in ctx.input_params:
+            if p.requires_grad:
+                params_grads_full.append(params_grads_some[idx])
+                idx += 1
+            else:
+                params_grads_full.append(None)
+
+        # Return gradients in order of inputs: run_function (None), length (None), all input_tensors grads, all params grads
+        return (None, None) + tuple(input_tensors_grads) + tuple(params_grads_full)

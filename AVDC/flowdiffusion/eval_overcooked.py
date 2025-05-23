@@ -19,9 +19,9 @@ from mapbt_package.mapbt.algorithms.population.policy_pool import PolicyPool as 
 from mapbt_package.mapbt.config import get_config
 from overcooked_sample_renderer import OvercookedSampleRenderer
 from einops.einops import rearrange
-from AVDC.flowdiffusion.goal_diffusion import GoalGaussianDiffusion, OvercookedEnvTrainer
-from AVDC.flowdiffusion.unet import UnetOvercooked 
-from AVDC.flowdiffusion.train_overcooked import OvercookedTrainer
+from goal_diffusion import GoalGaussianDiffusion, OvercookedEnvTrainer
+from unet import UnetOvercooked 
+from train_overcooked import OvercookedTrainer
 
 def parse_args(args, parser):
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU ID to use (-1 for CPU)')
@@ -52,7 +52,7 @@ def parse_args(args, parser):
     parser.add_argument("--agent0_policy_name", type=str, help="policy name of agent 0")
     parser.add_argument("--agent1_policy_name", type=str, help="policy name of agent 1")
 
-    parser.add_argument("--diffusion_loadpath", type=str, required=True, 
+    parser.add_argument("--diffusion_model_path", type=str, required=True, 
                       help="Path to the diffusion model directory")
     parser.add_argument("--loadbase", type=str, default="logs",
                       help="Base directory for loading models")
@@ -68,8 +68,8 @@ def parse_args(args, parser):
                       help="Directory for evaluation run")
     parser.add_argument("--idm_loadpath", type=str, required=True, 
                       help="Path to the diffusion model directory")
-    parser.add_argument("--diffusion_milestone", type=str, required=True,
-                        help="Diffusion Milestone")
+    parser.add_argument('--resume_checkpoint_path', type=str, required=False, default=None, help='Path to a .pt checkpoint file to resume training from.')
+    
     # From Eval    
     parser.add_argument("--old_dynamics", default=False, action='store_true', help="old_dynamics in mdp")
     parser.add_argument("--layout_name", type=str, default='counter_circuit_o_1order', help="Name of Submap, 40+ in choice. See /src/data/layouts/.")
@@ -200,7 +200,8 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
     all_metrics = []
     episode_rewards = []
     # agent_id = args.agent_id if hasattr(args, 'agent_id') else 5
-    agent_id = 0
+    agent_id = 10
+    print(f"Using Agent ID: {agent_id}")
     F,H,W,C = 32,8,5,26
     for episode in range(eval_episodes):
         print(f"Starting episode {episode+1}/{eval_episodes}")
@@ -236,9 +237,6 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
             assert condition_obs.shape[-1] == 26 # Double Check
 
             condition_obs = rearrange(condition_obs, "b h w c -> b c h w")
-            print(condition_obs.shape)
-            print(cond.shape)
-            print(n_envs)
             with th.no_grad():
                 samples = diffusion.sample(
                 x_cond=condition_obs,
@@ -249,8 +247,6 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
             samples = rearrange(samples, "b (f c) h w -> b f h w c", c=C, f=F)
              
             # Render out Samples
-            # samples_player_loc = samples[:, :, :, :, :10]
-            # samples_dish_onions = samples[:, :, :, :, 10:12]
             # if show_samples:
             #     _ = [renderer.visualize_all_channels(
             #         obs=to_np(samples[0, i]), 
@@ -317,9 +313,7 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
                     deterministic=True,
                 )
 
-                step_actions[:, 1] = partner_action  # Fill partner action for step t
-
-                print(step_actions)
+                step_actions[:, 1] = partner_action  # Fill partner action for step tWz
 
                 obs, shared_obs, reward, done, info, aval_actions = envs.step(step_actions)
                 episode_reward += to_np(reward).squeeze(axis=2)
@@ -332,8 +326,6 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
                 done = np.all(done)
                 steps += 1
                 if steps >= max_steps:
-                    print("here")
-                    print(done, steps)
                     break
         mean_episode_reward = episode_reward.mean(axis=0)
         print(f"Episode {episode+1} complete: steps={steps}, reward={mean_episode_reward}")
@@ -379,7 +371,7 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
         mean_reward = std_reward = coop_mean_reward = coop_std_reward = total_mean = 0.0
 
     print(f"Evaluation complete!")
-    print(f"Agent 0 (Diffusion+IDM) mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
+    print(f"Agent 0 (Diffusion+IDM; Agent_ID : {agent_id}) mean reward: {mean_reward:.2f} ± {std_reward:.2f}")
     print(f"Agent 1 (Partner) mean reward: {coop_mean_reward:.2f} ± {coop_std_reward:.2f}")
     print(f"Team total mean reward: {total_mean:.2f}")
     
@@ -410,10 +402,9 @@ def load_diffusion_model(args, device):
     
     trainer = OvercookedTrainer(args, device)
     # Load checkpoint
-    checkpoint_path = osp.join(args.diffusion_loadpath, f"modl-{args.diffusion_milestone}.pt")
-    print(f"Loading diffusion model from {checkpoint_path}")
+    print(f"Loading diffusion model from {args.diffusion_model_path}")
     trainer_actual = trainer.trainer
-    trainer_actual.load(checkpoint_path)
+    trainer_actual.load(args.diffusion_model_path)
     return trainer_actual.ema.ema_model.to(device)
 
                 
@@ -457,4 +448,5 @@ if __name__ == "__main__":
         policy=policy,
         device=device,
         show_samples=True,
-        eval_episodes=10)
+        eval_episodes=5,
+        basedir="./concept_attempt_1")
