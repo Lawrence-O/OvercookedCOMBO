@@ -91,6 +91,12 @@ def parse_args(args, parser):
     parser.add_argument('--valid_ratio', type=float, default=0.1, help='Fraction of data to use for validation (default: 0.1)')
     all_args = parser.parse_known_args(args)[0]
 
+    all_args.wandb = False
+    all_args.debug = False
+    all_args.wandb_project = None
+    all_args.wandb_run_name = None
+    all_args.wandb_entity = None
+    all_args.wandb_group = None
     return all_args
 
 def get_idm_action(current_obs, next_obs, idm_model):
@@ -123,6 +129,7 @@ def get_agent(population_yaml_path, policy_name, device):
     featurize_type = policy.load_population(population_yaml_path, evaluation=True)
     policy = policy.policy_pool[policy_name]
     feat_type = featurize_type.get(policy_name, 'ppo')
+    print(f"Loaded policy: {policy_name} with featurize type: {feat_type}")
     return policy, feat_type
 
 def to_np(x):
@@ -196,13 +203,15 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
 
     n_envs = args.n_envs if hasattr(args, 'n_envs') else 3
     envs = make_eval_env(args, run_dir=args.run_dir, nenvs=n_envs)
-    
+    print("Post env creation")
+    envs.reset_featurize_type([("ppo", "bc") for _ in range(n_envs)])
     all_metrics = []
     episode_rewards = []
     # agent_id = args.agent_id if hasattr(args, 'agent_id') else 5
-    agent_id = 10
+    agent_id = 10 #10
     print(f"Using Agent ID: {agent_id}")
     F,H,W,C = 32,8,5,26
+
     for episode in range(eval_episodes):
         print(f"Starting episode {episode+1}/{eval_episodes}")
 
@@ -253,16 +262,7 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
             #         output_dir=os.path.join(frames_dir, f"samples_channels_steps_{steps}_horizon_{i}_env_{0}.png")
             #     ) for i in range(F)]
             
-            # I don't think we need to arg_max, the channels should be pretty deterministics
-            # samples_player_loc = arg_max(samples_player_loc)
-            # samples_12_final = th.cat([samples_player_loc, samples_dish_onions],dim=-1)
-
-            # if show_samples:
-            #     _ = [renderer.visualize_all_channels(
-            #         obs=to_np(samples_12_final[0, i]), 
-            #         output_dir=os.path.join(frames_dir, f"argmax_samples_channels_steps_{steps}_horizon_{i}_env_{0}.png")
-            #     ) for i in range(dataset.horizon)]
-
+            
             
             # Now step through the environment using the 32-step plan
             if max_horizon:
@@ -273,23 +273,6 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
             # We begin with the first ego obs (first obs of the environment)
             obs_t = to_torch(obs_stack) # 3,8,5,26
             for t in range(plan_horizon): 
-                
-                # Unpack Samples_12_final
-                # samples_final_player_loc = samples_12_final[:, t, :, :, :10]
-                # samples_final_dishes_onions = samples_12_final[:, t, :, :, 10:12]
-
-                # Build (obs_t+1) from the samples_12_final
-                # current_obs = np.stack([normalize_obs(obs[e][0]) for e in range(n_envs)], axis=0)
-                # curr_obs_11_22 = to_torch(current_obs[..., 10:22])
-                # curr_obs_24_26 = to_torch(current_obs[..., 24:])
-
-                # obs_tp1 = th.cat([
-                #     samples_final_player_loc,
-                #     curr_obs_11_22,
-                #     samples_final_dishes_onions,
-                #     curr_obs_24_26
-                # ], dim=-1)
-
                 obs_tp1 = samples[:,t,...]
 
                 for e in range(n_envs):
@@ -351,13 +334,15 @@ def full_horizon_eval(args, diffusion, idm, policy, device, max_horizon=None, sh
                 grid, 
                 output_dir=env_dir,
                 video_path=osp.join(env_dir, f"actual_trajectory.mp4"),
-                fps=1)
+                fps=1,
+                normalize=False)
             _ = renderer.render_trajectory_video(
                 samples_frames[e],
                 grid,
                 output_dir=env_dir,
                 video_path=osp.join(env_dir, f"samples_trajectory.mp4"),
-                fps=1
+                fps=1,
+                normalize=True,
             )
             print(f"Video saved to {saved_video}")
     
@@ -426,8 +411,7 @@ if __name__ == "__main__":
     os.environ["layout"] = args.layout_name
     args.env_name = "Overcooked"
     population_yaml_path = args.population_yaml_path
-    policy, featurize_type = get_agent(population_yaml_path, "sp10_final", "cpu")
-    print("featurize_type: ", featurize_type)
+    policy, featurize_type = get_agent(population_yaml_path, "bc_train", "cpu")
 
     idm_path = args.idm_loadpath
     if os.path.exists(idm_path):
@@ -448,5 +432,5 @@ if __name__ == "__main__":
         policy=policy,
         device=device,
         show_samples=True,
-        eval_episodes=5,
+        eval_episodes=1,
         basedir="./concept_attempt_1")

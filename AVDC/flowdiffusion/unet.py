@@ -76,22 +76,22 @@ class UnetMW(nn.Module):
         return rearrange(out, 'b c f h w -> b (f c) h w')
 
 class UnetOvercooked(nn.Module):
-    def __init__(self, horizon, obs_dim):
+    def __init__(self, horizon, obs_dim, num_classes):
         super(UnetOvercooked, self).__init__()
         self.horizon = horizon
         self.H, self.W, self.C  = obs_dim
         self.unet = UNetModel(
             image_size=(8, 6),
-            in_channels=26*2,
+            in_channels=self.C * 2,
             model_channels=128,
-            out_channels=26,
+            out_channels=self.C,
             num_res_blocks=2,
             attention_resolutions=(8, 16),
             dropout=0,
             channel_mult=(1, 2),
             conv_resample=True,
             dims=3,
-            num_classes=25,
+            num_classes=num_classes,
             task_tokens=False,
             task_token_channels=512,
             use_checkpoint=False,

@@ -1,3 +1,4 @@
+import datetime
 import torch
 from torch.utils.data import Subset
 from pathlib import Path
@@ -12,7 +13,7 @@ from overcooked_dataset import OvercookedSequenceDataset
 
 
 class OvercookedTrainer:
-    def __init__(self, args, device=None):
+    def __init__(self, args, device=None, seed=42):
         self.args = args
         if device is None:
             self.device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu")
@@ -22,10 +23,6 @@ class OvercookedTrainer:
 
         self.results_folder = Path(args.results_dir)
         self.results_folder.mkdir(exist_ok=True, parents=True)
-
-        self.tokenizer = None
-        self.text_encoder = None
-        self.text_embed_dim = None
 
         self.horizon  = args.horizon
         
@@ -38,11 +35,14 @@ class OvercookedTrainer:
             use_padding=getattr(args, 'use_padding', True),
         )
 
-        self.dataset = OvercookedSequenceDataset(args=dataset_args)
+        dataset_split = getattr(args, 'dataset_split', "train")
+        print(f"Loading Overcooked dataset from {dataset_args.dataset_path} with split: {dataset_split}")
+        self.dataset = OvercookedSequenceDataset(args=dataset_args, split=dataset_split)        
 
         # Create train/validation split
         dataset_size = len(self.dataset)
         indices = list(range(dataset_size))
+        np.random.seed(seed)
         np.random.shuffle(indices)
         
         split_idx = int(np.floor(args.valid_ratio * dataset_size))
@@ -65,13 +65,13 @@ class OvercookedTrainer:
                 self.trainer.load(milestone=args.resume_checkpoint_path)
             else:
                 print(f"Warning: Checkpoint path {args.resume_checkpoint_path} not found. Starting training from scratch.")
-    
         
     def init_diffusion_trainer(self):
         H,W,C = self.observation_dim
         self.unet = UnetOvercooked(
             horizon=self.horizon,
             obs_dim=self.observation_dim,
+            num_classes=self.dataset.num_partner_policies,
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
             model=self.unet,
@@ -83,7 +83,7 @@ class OvercookedTrainer:
             objective="pred_v",
             beta_schedule="cosine",
             min_snr_loss_weight=True,
-            guidance_weight=1.0, # Recently set 10:35PM 5/22
+            guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
         ).to(self.device)
         self.trainer = OvercookedEnvTrainer(
                 diffusion_model=self.diffusion,
@@ -92,7 +92,7 @@ class OvercookedTrainer:
                 valid_set=self.valid_dataset,
                 train_lr=1e-4,
                 train_num_steps = 200000,
-                save_and_sample_every = 2 if self.args.debug else 1000,
+                save_and_sample_every = 2 if self.args.debug else self.args.save_and_sample_every,
                 ema_update_every = 10,
                 ema_decay = 0.999,
                 train_batch_size = 1 if self.args.debug else self.args.train_batch_size,
@@ -103,10 +103,15 @@ class OvercookedTrainer:
                 fp16 =True,
                 amp=True,
                 save_milestone=self.args.save_milestone,
-                cond_drop_chance=getattr(self.args, 'cond_drop_prob', 0),
+                cond_drop_chance=getattr(self.args, 'cond_drop_prob', 0.1),
                 split_batches=getattr(self.args, 'split_batches', True),
                 debug=self.args.debug,
-                dummy_policy_id=9 #TODO
+                dummy_policy_id=self.dataset.dummy_id,
+                # Wandb arguments
+                wandb_enabled=self.args.wandb,
+                wandb_project=self.args.wandb_project,
+                wandb_entity=self.args.wandb_entity,
+                wandb_run_name=self.args.wandb_run_name if self.args.wandb_run_name else f"{Path(self.args.dataset_path).stem}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
             )
     def train(self):
         self.trainer.train()
@@ -130,7 +135,6 @@ if __name__ == '__main__':
     parser.add_argument('--chunk_length', type=int, default=None, help='Chunk length for HDF5Dataset (defaults to horizon if None, set via dataset_constructor_args)')
     parser.add_argument('--use_padding', type=bool, default=True, help='Whether to use padding for shorter sequences in dataset')
 
-
     # For GoalGaussianDiffusion
     parser.add_argument('--timesteps', type=int, default=1000, help='Number of diffusion timesteps for training (if not debug)')
     parser.add_argument('--sampling_timesteps', type=int, default=100, help='Number of timesteps for DDIM sampling (if not debug)')
@@ -138,10 +142,15 @@ if __name__ == '__main__':
     # For OvercookedEnvTrainer 
     parser.add_argument('--train_batch_size', type=int, default=32, help='Training batch size (if not debug)')
     parser.add_argument('--num_validation_samples', type=int, default=4, help='Number of samples to generate during validation step')
-    parser.add_argument('--save_and_sample_every', type=int, default=5000, help='Frequency to save checkpoints and generate samples (if not debug)')
+    parser.add_argument('--save_and_sample_every', type=int, default=2000, help='Frequency to save checkpoints and generate samples (if not debug)')
     parser.add_argument('--cond_drop_prob', type=float, default=0.1, help='Probability of dropping condition for CFG during training')
     parser.add_argument('--split_batches', type=bool, default=True, help='Whether to split batches for Accelerator')
 
+    # Wandb arguments
+    parser.add_argument('--wandb', action='store_true', default=False, help='Enable Weights & Biases logging.')
+    parser.add_argument('--wandb_project', type=str, default="combo_overcooked_diffuser", help='Wandb project name.')
+    parser.add_argument('--wandb_entity', type=str, default="social-rl", help='Wandb entity (username or team).')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='Wandb run name. Defaults to dataset_datetime.')
     config = parser.parse_args()
 
     if config.debug:

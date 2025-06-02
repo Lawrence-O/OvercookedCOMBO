@@ -11,7 +11,7 @@ from unet import UnetOvercooked
 from overcooked_dataset import OvercookedSequenceDataset
 
 
-class OvercookedTrainer:
+class ConceptLearnOvercookedTrainer:
     def __init__(self, args, device=None):
         self.args = args
         if device is None:
@@ -45,9 +45,7 @@ class OvercookedTrainer:
         self.trainer = None
         self.unet = None
 
-        self.init_diffusion_trainer()
-
-    
+        self.init_diffusion_trainer()   
         
     def init_diffusion_trainer(self):
         if not self.args.pretrained_model_path:
@@ -60,6 +58,7 @@ class OvercookedTrainer:
         self.unet = UnetOvercooked(
             horizon=self.horizon,
             obs_dim=self.observation_dim,
+            num_classes=self.dataset.num_partner_policies,
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
             model=self.unet,
@@ -70,7 +69,8 @@ class OvercookedTrainer:
             loss_type="l2",
             objective="pred_v",
             beta_schedule="cosine",
-            min_snr_loss_weight=True,
+            min_snr_loss_weight=True, 
+            guidance_weight= self.args.guidance_weight if self.args.guidance_weight else 1.0
         ).to(self.device)
         self.trainer = ConceptTrainer(
                 diffusion_model=self.diffusion,
@@ -83,7 +83,7 @@ class OvercookedTrainer:
                 ema_update_every = 10,
                 ema_decay = 0.999,
                 train_batch_size = 1 if self.args.debug else self.args.train_batch_size,
-                valid_batch_size = 32,
+                valid_batch_size = 1 if self.args.debug else self.args.train_batch_size,
                 gradient_accumulate_every = 1,
                 num_samples=self.args.num_validation_samples, 
                 results_folder = str(self.results_folder),
@@ -101,10 +101,12 @@ class OvercookedTrainer:
         print(f"Concept Learning will run for up to {self.args.max_train_steps} steps")
     
     def train(self):
+        print(f"\n=== STARTING CONCEPT LEARNING TRAINING ===")
+        print(f"Previous Model Step: {self.trainer.step}")
         self.trainer.step = 0
         self.trainer.train()
-        print(f"Saving final model checkpoint...")
-        self.trainer.save(milestone="concept_learned_model")
+        print(f"Saving final model as modl-{self.args.milestone_name}")
+        self.trainer.save(milestone=self.args.milestone_name)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train Overcooked Diffusion Model")
@@ -121,7 +123,8 @@ if __name__ == '__main__':
     parser.add_argument('--max_train_steps', type=int, required=True, help='The maximum number of training steps to run')
     parser.add_argument('--dummy_policy_id', type=int, required=True, help='Policy ID to use for unconditional generation (default: 10)')
     parser.add_argument('--new_policy_id', type=int, required=True, help='Policy ID to be learned ')
-    parser.add_argument('--guidance_weight', type=int, default=0.2, required=True, help='Policy ID to be learned ')
+    parser.add_argument('--guidance_weight', type=int, default=1.0, required=True, help='Policy ID to be learned ')
+    parser.add_argument('--milestone_name', type=str, default="concept-learned", required=True, help='The name of the model milestone to save.' )
 
 
     # For OvercookedSequenceDataset / HDF5Dataset
@@ -146,5 +149,5 @@ if __name__ == '__main__':
 
     if config.debug:
         print("--- RUNNING IN DEBUG MODE ---")
-    overcooked_trainer_main = OvercookedTrainer(args=config)
+    overcooked_trainer_main = ConceptLearnOvercookedTrainer(args=config)
     overcooked_trainer_main.train()

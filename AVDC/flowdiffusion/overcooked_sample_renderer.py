@@ -221,7 +221,7 @@ class OvercookedSampleRenderer:
                 except KeyError:
                     pass  # Skip hat if frame not found
 
-    def render_frame(self, obs, grid, un_normalize=True, eps=1e-4):
+    def render_frame(self, obs, grid, normalize=False, eps=1e-4):
 
         height = len(grid)
         width = len(grid[0])
@@ -229,10 +229,9 @@ class OvercookedSampleRenderer:
         surface = pygame.Surface((width * self.UNSCALED_TILE_SIZE, height * self.UNSCALED_TILE_SIZE))
         surface.fill((155,101,0))
 
-        if un_normalize:
+        if normalize:
             obs = self.normalize_obs(obs)
         else:
-            # assert np.all(obs % 255 == 0)
             obs = obs.astype(np.float32) / 255.0
         
         self._render_grid(surface, grid)
@@ -242,14 +241,14 @@ class OvercookedSampleRenderer:
 
         return surface
     
-    def render_trajectory_frames(self, trajectory, grid, output_dir=None):
+    def render_trajectory_frames(self, trajectory, grid, output_dir=None, normalize=False):
         if output_dir is None:
             output_dir = os.path.join(os.getcwd(), "trajectory_viz_output")
         os.makedirs(output_dir, exist_ok=True)
         img_paths = []
         for i, obs in enumerate(trajectory):
             file_path = os.path.join(output_dir, f"viz_frame_{i:04d}.png")
-            self.save_obs_image(obs, grid, file_path)
+            self.save_obs_image(obs, grid, file_path, normalize=normalize)
             img_paths.append(file_path)
         return img_paths
     
@@ -286,9 +285,8 @@ class OvercookedSampleRenderer:
                 grid[grid_height-1][x] = 'X'
         return grid
     
-    def render_trajectory_video(self, trajectory, grid, output_dir=None, video_path=None, fps=30, scale=4):
-        img_paths = self.render_trajectory_frames(trajectory, grid, output_dir)
-        
+    def render_trajectory_video(self, trajectory, grid, output_dir=None, video_path=None, fps=30, scale=4, normalize=False):
+        img_paths = self.render_trajectory_frames(trajectory, grid, output_dir, normalize=normalize)
         if video_path is None:
             video_path = os.path.join(output_dir, "trajectory_viz_video.mp4")
         clip = ImageSequenceClip(img_paths, fps=fps)
@@ -435,8 +433,8 @@ class OvercookedSampleRenderer:
         
         return unnorm_obs
 
-    def save_obs_image(self, obs, grid, file_path, scale=4):
-        surface = self.render_frame(obs, grid)
+    def save_obs_image(self, obs, grid, file_path, scale=4, normalize=False):
+        surface = self.render_frame(obs, grid, normalize=normalize)
         if scale != 1:
             surface = scale_surface_by_factor(surface, scale)
         pygame.image.save(surface, file_path)

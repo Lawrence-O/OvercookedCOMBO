@@ -1,3 +1,4 @@
+import datetime
 import math
 import copy
 from pathlib import Path
@@ -924,6 +925,20 @@ class Trainer(object):
             shutil.move(str(self.results_folder / save_name), str(self.results_folder / f'model_last_recent.pt'))
         torch.save(data, str(self.results_folder / save_name))
 
+        wandb_is_enabled = getattr(self, 'wandb_enabled', False)
+        is_debug_mode = getattr(self, 'debug', False)
+
+        if wandb_is_enabled and not is_debug_mode:
+            if wandb.run is not None: # Check if wandb run is active
+                try:
+                    save_path = self.results_folder / save_name
+                    wandb.save(str(save_path), base_path=str(self.results_folder.parent), policy="live")
+                    print(f"Saved {save_path} to wandb.")
+                except Exception as e:
+                    print(f"Warning: Failed to save {save_path} to wandb: {e}")
+            else:
+                print(f"Warning: Wandb run is not active. Cannot save {save_path} to wandb.")
+
     def load(self, milestone):
         accelerator = self.accelerator
         device = accelerator.device
@@ -1077,7 +1092,6 @@ class Trainer(object):
                 shutil.rmtree(tensorboard_folder)
             tensorboard_folder.mkdir(exist_ok=True)
             tensorboard_sw = SummaryWriter(tensorboard_folder)
-        print(self.step, self.train_num_steps)
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
             while self.step < self.train_num_steps:
@@ -1340,7 +1354,7 @@ class OvercookedEnvTrainer(Trainer):
                  ema_update_every=10,
                  ema_decay=0.995,
                  adam_betas=(0.9, 0.99),
-                 save_and_sample_every=1000,
+                 save_and_sample_every=5000,
                  num_samples=3,
                  results_folder='./results',
                  amp=True,
@@ -1349,7 +1363,11 @@ class OvercookedEnvTrainer(Trainer):
                  cond_drop_chance=0.1,
                  save_milestone=True,
                  debug=False,
-                 dummy_policy_id=None
+                 dummy_policy_id=None,
+                 wandb_enabled=False,
+                 wandb_project="combo_overcooked_diffuser",
+                 wandb_entity="social-rl",
+                 wandb_run_name=None
                 ):
         
         super().__init__(diffusion_model,
@@ -1376,6 +1394,8 @@ class OvercookedEnvTrainer(Trainer):
                          cond_drop_chance=cond_drop_chance,
                          save_milestone=save_milestone,
                          embed_preprocessed=True)
+        
+        # Dataset Setup
         dl = DataLoader(self.ds, batch_size = self.batch_size, shuffle = True, pin_memory = True, num_workers = 4, collate_fn=self.overcooked_collate_fn)
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -1385,8 +1405,12 @@ class OvercookedEnvTrainer(Trainer):
             self.valid_dl = self.accelerator.prepare(valid_dl)
         else:
             self.valid_dl = None
+        
+        self.debug = debug
         self.renderer = OvercookedSampleRenderer()
-
+        self.dummy_id = dummy_policy_id
+        self.wandb_enabled = wandb_enabled
+        
         config_to_log = {
             # Trainer parameters
             "learning_rate": train_lr,
@@ -1405,6 +1429,8 @@ class OvercookedEnvTrainer(Trainer):
             "accelerator_split_batches": split_batches,
             "cond_drop_chance": cond_drop_chance,
             "save_milestone_checkpoints": save_milestone,
+            "debug_mode": self.debug,
+            "dummy_policy_id_used": self.dummy_id,
             
             # Dataset parameters
             "dataset_type": train_set.__class__.__name__,
@@ -1423,16 +1449,52 @@ class OvercookedEnvTrainer(Trainer):
             "diffusion_sampling_timesteps": diffusion_model.sampling_timesteps,
             "diffusion_guidance_weight": diffusion_model.guidance_weight,
             "diffusion_ddim_sampling_eta": diffusion_model.ddim_sampling_eta,
+
+            # Unet parameters
+            "unet_model_channels": diffusion_model.model.unet.model_channels if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_res_blocks": diffusion_model.model.unet.num_res_blocks if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_attention_resolutions": str(diffusion_model.model.unet.attention_resolutions) if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_channel_mult": str(diffusion_model.model.unet.channel_mult) if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_classes": diffusion_model.model.unet.num_classes if hasattr(diffusion_model.model, 'unet') else 'N/A',
         }
-        self.debug = debug
+        
         if cond_drop_chance > 0 and dummy_policy_id is None:
             raise ValueError("Must provide dummy_policy_id when cond_drop_chance > 0")
         
-        self.dummy_id = dummy_policy_id
+        if not self.debug and self.wandb_enabled and self.accelerator.is_local_main_process:
+            final_wandb_run_name = wandb_run_name if wandb_run_name else f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            wandb.init(project=wandb_project, entity=wandb_entity, name=final_wandb_run_name, config=config_to_log)
+        
+        if self.accelerator.is_local_main_process:
+            underlying_dataset = self.ds.dataset if isinstance(self.ds, Subset) else self.ds
+            print("\n" + "="*30 + " TRAINING CONFIGURATION " + "="*30)
+            print(f"  Results Folder: {self.results_folder}")
+            print(f"  Device: {self.device}")
+            print(f"  Debug Mode: {self.debug}")
+            print("-" * (60 + len(" TRAINING CONFIGURATION ")))
+            print("  Dataset Information:")
+            print(f"    Full Dataset Size (from '{underlying_dataset.current_split}' split): {len(underlying_dataset)}")
+            print(f"    Train Subset Size: {len(self.ds)}")
+            if self.valid_ds:
+                print(f"    Validation Subset Size: {len(self.valid_ds)}")
+            else:
+                print(f"    Validation Subset Size: 0 (No validation set)")
+            print(f"    Observation Dimension (H, W, C): {underlying_dataset.observation_dim}")
+            print(f"    Horizon: {underlying_dataset.horizon}")
+            print(f"    Number of Unique Partner Policies (for UNet classes): {underlying_dataset.num_partner_policies}")
+            print(f"    Dummy Policy ID (for CFG): {underlying_dataset.dummy_id}")
+            if hasattr(underlying_dataset, 'train_partner_policies'):
+                print(f"    Train Partner Policies ({len(underlying_dataset.train_partner_policies)}):")
+                for name, id_val in underlying_dataset.train_partner_policies.items():
+                    print(f"      '{name}': {id_val}")
+            if hasattr(underlying_dataset, 'test_partner_policies'):
+                print(f"    Test Partner Policies (Offset) ({len(underlying_dataset.test_partner_policies)}):")
+                for name, id_val in underlying_dataset.test_partner_policies.items():
+                    print(f"      '{name}': {id_val}")
+            print("-" * (60 + len(" TRAINING CONFIGURATION ")))
+        
+            # print(f"Trainer config: {json.dumps(config_to_log, indent=2)}")
 
-        # if not self.debug:
-        #     wandb.init(project="combo_overcooked_diffuser", entity="social-rl", name=f"sp_vs_best_r_sp_dataset")
-        #     wandb.config.update(config_to_log)
     @staticmethod
     def overcooked_collate_fn(samples):
         # samples is a list of (x_item, x_cond_item, task_emb_id_item, sample_id_str_item)
@@ -1548,6 +1610,7 @@ class OvercookedEnvTrainer(Trainer):
                     output_dir=viz_output_dir,
                     video_path=pred_traj_path,
                     fps=1,
+                    normalize=True,
                 )
 
                 arg_pred_traj_path = os.path.join(viz_output_dir, f"argmax_pred_traj_step_{self.step}_batch_{i}.mp4")
@@ -1557,6 +1620,7 @@ class OvercookedEnvTrainer(Trainer):
                     output_dir=viz_output_dir,
                     video_path=arg_pred_traj_path,
                     fps=1,
+                    normalize=True,
                 )
                 ref_traj_path = os.path.join(viz_output_dir, f"reference_traj_step_{self.step}_batch_{i}.mp4")
                 self.renderer.render_trajectory_video(
@@ -1564,7 +1628,8 @@ class OvercookedEnvTrainer(Trainer):
                         grid=grid, 
                         output_dir=viz_output_dir, 
                         video_path=ref_traj_path,
-                        fps=1
+                        fps=1,
+                        normalize=False,
                 )
 
                 uncond_traj_path = os.path.join(viz_output_dir, f"uncond_traj_step_{self.step}_batch_{i}.mp4")
@@ -1574,6 +1639,7 @@ class OvercookedEnvTrainer(Trainer):
                     output_dir=viz_output_dir,
                     video_path=uncond_traj_path,
                     fps=1,
+                    normalize=True,
                 )
 
                 if i == 0:
@@ -1598,7 +1664,7 @@ class OvercookedEnvTrainer(Trainer):
         valid_loss = sum(total_valid_loss) / len(total_valid_loss)
         uncond_loss = sum(total_unconditional_loss) / len(total_unconditional_loss)
 
-        if self.accelerator.is_local_main_process and not self.debug:
+        if self.wandb_enabled and self.accelerator.is_local_main_process and not self.debug:
             wandb_log_dict = {
                 "evaluation/loss": valid_loss,
                 "evaluation/unconditional_loss": uncond_loss,
@@ -1630,6 +1696,7 @@ class ConceptTrainer(OvercookedEnvTrainer):
             train_set=train_set,
             valid_set=valid_set,
             channels=channels,
+            dummy_policy_id=dummy_policy_id,
             **kwargs
         )
 
@@ -1659,8 +1726,9 @@ class ConceptTrainer(OvercookedEnvTrainer):
         assert total_trainable_params == embedding_params, \
             f"Expected only {embedding_params} trainable parameters (label_emb), but found {total_trainable_params}"
 
-        print(f"Successfully unfroze policy embedding with shape: {unet.label_emb.weight.shape}")
+        print(f"Successfully unfroze policy embedding with shape: {unet.label_emb.weight.shape}") 
         self.step = 0
+
     
 
     def train_one_step(self):
@@ -1677,6 +1745,8 @@ class ConceptTrainer(OvercookedEnvTrainer):
                 loss = loss / self.gradient_accumulate_every
                 total_loss += loss.item()
                 self.accelerator.backward(loss)
+
+            # TODO: Add a check for sum emb
         
         return total_loss
 
