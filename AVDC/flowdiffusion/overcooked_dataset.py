@@ -4,16 +4,18 @@ import numpy as np
 import pickle
 from hdf5_dataset import HDF5Dataset
 class OvercookedSequenceDataset(torch.utils.data.Dataset):
-
-    def __init__(self, args, split="train"):
+    # policies = ["sp1_final", "sp2_final", "sp3_final", "sp4_final", "sp5_final", "sp9_final", "bc_train"]
+    policies = ["sp1_final"]
+    def __init__(self, args, split="train", allowed_policies=policies):
 
         self.args = args
         dataset_path = args.dataset_path
         self.current_split = split
+        self.allowed_policies = allowed_policies
     
         # Load dataset from HDF5
         if dataset_path.endswith("hdf5"):
-            self.dataset = HDF5Dataset(args, self.current_split) # TODO: change to train later
+            self.dataset = HDF5Dataset(args, self.current_split)
             self.observations = np.array(self.dataset.dset["obs"]) # path_num * (path_length + 1) * num_agent * height * width * channels
             self.actions = np.array(self.dataset.dset["actions"]) # path_num * path_length * num_agent * action_dim (1)
             self.dones = np.array(self.dataset.dset["dones"]) # path_num * path_length * num_agent
@@ -21,9 +23,7 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
             self.policy_id = np.array(self.dataset.dset["policy_id"]) # path_num * num_agent (agent1_policy_name, agent2_policy_name)
             self.rewards = np.array(self.dataset.dset["rewards"]) # path_num * path_length * num_agent * reward_dim (1)
         else:
-            with open(dataset_path, "rb") as input_file:
-                self.cond_init_mins, self.cond_init_maxs, self.cond_obs_imL_mean, self.cond_obs_imL_std, \
-                    self.conditions, self.dummy_cond = pickle.load(input_file) #ee_pose+gripper, left image
+            raise ValueError(f"Unsupported dataset format: {dataset_path}")
         
         self.horizon = args.horizon
         self.max_path_length = args.max_path_length
@@ -33,25 +33,48 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         self.observation_dim = self.obs_cond_dim = (H, W, C)
           
         self.n_episodes = len(self.observations)
-        self.train_partner_policies, self.org_test_partner_policies, self.test_partner_policies, unique_num_ids = self.get_num_policy_ids()
+        self.train_partner_policies, self.org_test_partner_policies, self.test_partner_policies, unique_num_ids = \
+            self.get_num_policy_ids(allowed_policies=self.allowed_policies)
         
         # unique_num_ids returns count of unique policy Ids (1, unique_policy_id) instead of (0, unique_policy_id)
         # dummy_id should just be the last one
-        self.dummy_id = unique_num_ids
-        self.num_partner_policies = unique_num_ids + 1 # +1 since num_classes is
+        # self.dummy_id = unique_num_ids
+        # self.num_partner_policies = unique_num_ids + 1 # +1 since num_classes is
+        self.num_partner_policies = len(allowed_policies) + 1 
 
-        self.path_lengths = [obs.shape[0] for obs in self.observations]
-        self.indices = self.make_indices(self.path_lengths, self.horizon)
+        self.allowed_indicies = None
+        if self.allowed_policies:
+            print(f"Dataset filtered to include only these policies: {self.allowed_policies}")
+            print(f"Train policies after filtering: {self.train_partner_policies}")
+            print(f"Test policies after filtering: {self.test_partner_policies}")
+
+            # self.dataset_average_rewards = {}
+            self.allowed_indicies = []
+            for idx in range(len(self.dataset)):
+                _, _, policy_id = self.dataset.__getitem__(idx)
+                partner_id = policy_id[1]
+                for pname, pid in self.train_partner_policies.items():
+                    if pid == partner_id and pname in self.allowed_policies:
+                        self.allowed_indicies.append(idx)
+                        # self.dataset_average_rewards.setdefault(pname, []).append(self.rewards[idx])
+                        break
+            # print(f"Filtered dataset contains {len(self.allowed_indicies)} samples with allowed policies")
+            # self.dataset_average_rewards = {k: np.mean(v) for k, v in self.dataset_average_rewards.items()}
+            # print(f"Average rewards for allowed policies: {self.dataset_average_rewards}")
+            # exit()
+
     
-    def get_num_policy_ids(self):
-        train_policies = dict()
-        test_policies = dict()
+    def get_num_policy_ids(self, allowed_policies=None):
+        train_policies_org = dict()
+        test_policies_org = dict()
         try:
             train_dataset = HDF5Dataset(self.args, "train")
             if "policy_id" in train_dataset.dset:
                 for key in train_dataset.dset['policy_id'].attrs.keys():
                     policy_name = key[key.find("[") + 1 : key.find("]")]
-                    train_policies[policy_name] = train_dataset.dset['policy_id'].attrs[key]
+                    if allowed_policies is not None and policy_name not in allowed_policies:
+                        continue
+                    train_policies_org[policy_name] = train_dataset.dset['policy_id'].attrs[key]
         except Exception as e:
             print(f"Error loading train dataset: {e}")
             return {}, {}, 0
@@ -60,29 +83,28 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
             if "policy_id" in test_dataset.dset:
                 for key in test_dataset.dset['policy_id'].attrs.keys():
                     policy_name = key[key.find("[") + 1 : key.find("]")]
-                    test_policies[policy_name] = test_dataset.dset['policy_id'].attrs[key]
+                    # if allowed_policies is not None and policy_name not in allowed_policies:
+                    #     continue
+                    test_policies_org[policy_name] = test_dataset.dset['policy_id'].attrs[key]
         except Exception as e:
             print(f"Error loading test dataset: {e}")
-            return train_policies, {}, {}, max(train_policies.values())
-
-        # Offset test policies by the maximum train policy ID
-        max_train_id = max(train_policies.values()) if train_policies else -1
-        offset = max_train_id + 1
+            return train_policies_org, {}, {}, max(train_policies_org.values())
+        
+        self.original_ids = {**train_policies_org, **train_policies_org}
+        all_policies = list(train_policies_org.keys()) + list(test_policies_org.keys())
+        train_policies = dict()
+        test_policies = dict()
         offset_test_policies = dict()
-        for name, original_id in test_policies.items():
-            offset_test_policies[name] = original_id + offset
-        
-        # Combine all unique policy names to count total unique policies
-        all_unique_policy_names = set(train_policies.keys()).union(set(test_policies.keys()))
-        num_total_unique_policies = len(all_unique_policy_names)
 
-        # TODO
-        # print("=== Policy IDs Summary ===")
-        # print(f"Final Train Policies ({len(train_policies)}): {train_policies}")
-        # print(f"Final Test Policies ({len(offset_test_policies)}): {offset_test_policies}")
-        # print(f"Total unique policy names found across train and test: {num_total_unique_policies}")
-        
-        return train_policies, test_policies, offset_test_policies, num_total_unique_policies
+        for i, name in enumerate(sorted(train_policies_org.keys())):
+            train_policies[name] = i
+        self.dummy_id = len(train_policies) # TODO: REMOVE
+        offset = len(train_policies) + 1 # TODO: REMOVE
+        for i, name in enumerate(sorted(test_policies_org.keys())):
+            test_policies[name] = test_policies_org[name]  
+            offset_test_policies[name] = i + offset  
+
+        return train_policies, test_policies, offset_test_policies, len(all_policies)
     
     def actual_norm(self, obs):
         obs_max = obs.max(axis=(0, 1, 2), keepdims=True)  # shape [1, 1, 1, C]
@@ -90,32 +112,6 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         obs_norm = 2 * (obs - obs_min) / (obs_max - obs_min + 1e-8) - 1
         return obs_norm.astype(np.float32)
     
-    def consistent_norm(self, obs):
-        # Scaled down by 255 since data is scaled by 255
-        assert np.all(obs % 255 == 0)
-        obs = obs.astype(np.float32) / 255.0
-
-        HARDCODED_INDEX_TO_MAX_VAL = {
-            16: 3.0,  # onions_in_pot
-            17: 3.0,  # tomatoes_in_pot
-            18: 3.0,  # onions_in_soup
-            19: 3.0,  # tomatoes_in_soup
-            20: 20.0, # soup_cook_time_remaining
-        } 
-
-        normalized_obs = np.zeros_like(obs, dtype=np.float32)
-
-        for ch_idx in range(obs.shape[-1]):
-            ch_data = obs[..., ch_idx]
-            if ch_idx in HARDCODED_INDEX_TO_MAX_VAL:
-                # Normalize from original game range [0, max_val] to [-1, 1]
-                max_ch_val = HARDCODED_INDEX_TO_MAX_VAL[ch_idx]
-                norm_ch = 2.0 * (ch_data / max_ch_val) - 1.0
-            else:
-                # Assume binary channel (original game values are 0 or 1).
-                norm_ch = 2.0 * ch_data - 1.0
-            normalized_obs[..., ch_idx] = norm_ch
-        return normalized_obs
 
     def make_indices(self, path_lengths, horizon):
         '''
@@ -135,6 +131,8 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
 
 
     def __len__(self):
+        if self.allowed_indicies is not None:
+            return len(self.allowed_indicies)
         return self.dataset.__len__()
     
     
@@ -143,14 +141,17 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         # obs = self.observations[path_idx]
         # policy_id = self.policy_id[path_idx]
 
-        obs, _, policy_id = self.dataset.__getitem__(idx)
+        if self.allowed_indicies is not None:
+            obs, policy_id = self.observations[self.allowed_indicies[idx]], \
+                self.policy_id[self.allowed_indicies[idx]]
+        else:
+            obs, _, policy_id = self.dataset.__getitem__(idx)
 
-        # obs, actions, policy_id = self.dataset.__getitem__(idx)
         # obs: horizon x agent_num (2) x H x W x C
         # actions: horizon x 2 x action dim (1) 
         # policy : 2 (tuple)
         
-        obs = self.actual_norm(obs.numpy())
+        obs = self.actual_norm(to_np(obs))
 
         # player_loc_orietnations = obs[:, :, :, :, :10]
         # dish_onions = obs[:, :, :, :, 22:24]
@@ -200,7 +201,6 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
             policy_id = self.org_test_partner_policies[policy_name]
         else:
             raise ValueError(f"Policy name '{policy_name}' not found in dataset")
-        
 
         matching_episodes = []
         for path_idx, policy_ids in enumerate(self.policy_id):
@@ -233,8 +233,7 @@ class SingleEpisodeOvercookedDataset(torch.utils.data.Dataset):
         self.horizon = self.base_dataset.horizon
         self.observation_dim = self.base_dataset.observation_dim
         self.dummy_id = self.base_dataset.dummy_id
-
-        print(f"Expected Reward: {self.base_dataset.rewards[self.path_idx].sum()}")
+        print(f"Matching Episodes : {len(self.matching_episodes)}, Expected Reward: {self.base_dataset.rewards[self.path_idx].sum()}, Dummy ID: {self.dummy_id}")
         
     def __len__(self):
         return len(self.observations)
@@ -262,7 +261,6 @@ class SingleEpisodeOvercookedDataset(torch.utils.data.Dataset):
         trajectory = obs[start:end, 0]
         conditions_obs = obs[start-1, 0]
 
-
         # Create a Mask for Valid Condition Observations
         valid_len = 1 if condition_single_input else start
         cond_inputs = np.zeros((self.horizon, H, W, C), dtype=np.float32)
@@ -286,6 +284,10 @@ class SingleEpisodeOvercookedDataset(torch.utils.data.Dataset):
 
 
 
+def to_np(x):
+	if torch.is_tensor(x):
+		x = x.detach().cpu().numpy()
+	return x
 
 
     

@@ -119,6 +119,8 @@ class UnetOvercooked(nn.Module):
         return x_padded
     def forward(self, x, x_cond, t, task_embed=None, vis=None, **kwargs):
         *_, H, W = x.shape
+        print(f"Input shape: {x.shape}, {x_cond.shape}, {t.shape}, {task_embed.shape if task_embed is not None else None}")
+        print(self.horizon, self.C)
         x = rearrange(x, "b (f c) h w -> b f h w c", f=self.horizon, c=self.C)
         x = self.pad_even(x)
         x = rearrange(x, 'b f h w c -> b c f h w')
@@ -126,8 +128,8 @@ class UnetOvercooked(nn.Module):
         x_cond = self.pad_even(x_cond)
         x_cond = rearrange(x_cond, 'b h w c -> b c 1 h w')
         x_cond = repeat(x_cond, 'b c 1 h w -> b c f h w', f=self.horizon)
-
         x = torch.cat([x, x_cond], dim=1)
+        print(f"Concatenated input shape: {x.shape}, {t.shape}, {task_embed.shape if task_embed is not None else None}")
         out = self.unet(x, t, task_embed, **kwargs)
         out = rearrange(out, 'b c f h w -> b f h w c')
         out = out[:, :, :H, :W, :]

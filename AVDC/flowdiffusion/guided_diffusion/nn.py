@@ -237,6 +237,7 @@ class CheckpointFunction(th.autograd.Function):
         del output_tensors
         return (None, None) + input_grads
     
+    @staticmethod
     def backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
         with th.enable_grad():

@@ -225,7 +225,7 @@ class ExperimentRunner:
             gc.collect()
             th.cuda.empty_cache()
         
-        random_embedding = th.randn(7 + 5 + 1 + 1, self.embedding_dim, device=self.device)
+        random_embedding = th.randn(self.num_concepts, self.embedding_dim, device=self.device)
         self.policy_embeddings[policy_id] = random_embedding
 
         print(f"Created new embedding for policy {policy_id} with shape {random_embedding.shape}")
@@ -773,7 +773,7 @@ class ExperimentRunner:
         # Get dataset to determine num_classes for model architecture
         # dataset = self._get_dataset(self.args.dataset_path, "train")
         # num_classes = dataset.num_partner_policies  # This should be the total number of policies the model can handle
-        num_classes = 7 + 5 + 1 + 1
+        num_classes = 7 + 5 + 2
         for exp_idx, exp_config in enumerate(experiment_configs):
             print(f"\n=== Processing experiment {exp_idx+1}/{len(experiment_configs)}: {exp_config['name']} ===")
             

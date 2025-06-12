@@ -12,7 +12,7 @@ from overcooked_dataset import OvercookedSequenceDataset
 
 
 class ConceptLearnOvercookedTrainer:
-    def __init__(self, args, device=None):
+    def __init__(self, args, device=None, dataset=None, train_dataset=None, valid_dataset=None):
         self.args = args
         if device is None:
             self.device = torch.device(f"cuda:{args.gpu_id}" if torch.cuda.is_available() and args.gpu_id >= 0 else "cpu")
@@ -28,19 +28,28 @@ class ConceptLearnOvercookedTrainer:
         self.text_embed_dim = None
 
         self.horizon  = args.horizon
+        if dataset is not None:
+            print (f"Using provided dataset instance")
+            self.dataset = dataset
+            self.observation_dim = self.dataset.observation_dim
+        elif hasattr(args, 'dataset_path') and args.dataset_path:
+            print (f"Loading dataset from {args.dataset_path}")
+            dataset_args = argparse.Namespace(
+                dataset_path = args.dataset_path,
+                horizon=self.horizon,
+                max_path_length=getattr(args, 'max_path_length', 401), 
+                episode_length=getattr(args, 'episode_length', 401), 
+                chunk_length=getattr(args, 'chunk_length', self.horizon), 
+                use_padding=getattr(args, 'use_padding', True),
+            )
+            self.dataset = OvercookedSequenceDataset(args=dataset_args)
+            self.observation_dim = self.dataset.observation_dim
+        else:
+            raise ValueError("Must provide either a dataset instance or dataset_path argument")
         
-        dataset_args = argparse.Namespace(
-            dataset_path = args.dataset_path,
-            horizon=self.horizon,
-            max_path_length=getattr(args, 'max_path_length', 401), 
-            episode_length=getattr(args, 'episode_length', 401), 
-            chunk_length=getattr(args, 'chunk_length', self.horizon), 
-            use_padding=getattr(args, 'use_padding', True),
-        )
+        self.train_dataset = train_dataset if train_dataset is not None else self.dataset
+        self.valid_dataset = valid_dataset if valid_dataset is not None else self.dataset
 
-        self.dataset = OvercookedSequenceDataset(args=dataset_args)
-
-        self.observation_dim = self.dataset.observation_dim
         self.diffusion = None
         self.trainer = None
         self.unet = None
@@ -53,7 +62,7 @@ class ConceptLearnOvercookedTrainer:
         
         print(f"\n=== LOADING PRE-TRAINED MODEL ===")
         print(f"Pre-trained model path: {self.args.pretrained_model_path}")
-        
+        print(self.dataset.num_partner_policies)
         H,W,C = self.observation_dim
         self.unet = UnetOvercooked(
             horizon=self.horizon,
@@ -75,8 +84,8 @@ class ConceptLearnOvercookedTrainer:
         self.trainer = ConceptTrainer(
                 diffusion_model=self.diffusion,
                 channels=C,
-                train_set=self.dataset,
-                valid_set=self.dataset,
+                train_set=self.train_dataset,
+                valid_set=self.valid_dataset,
                 train_lr=1e-4,
                 train_num_steps = self.args.max_train_steps if not self.args.debug else 1,
                 save_and_sample_every = 2 if self.args.debug else 1000,
@@ -99,6 +108,7 @@ class ConceptLearnOvercookedTrainer:
         self.trainer.load(milestone=self.args.pretrained_model_path)
         print(f"✓ Successfully loaded pre-trained model")
         print(f"Concept Learning will run for up to {self.args.max_train_steps} steps")
+        self.trainer.load_embedding(self.args)
     
     def train(self):
         print(f"\n=== STARTING CONCEPT LEARNING TRAINING ===")
@@ -107,6 +117,12 @@ class ConceptLearnOvercookedTrainer:
         self.trainer.train()
         print(f"Saving final model as modl-{self.args.milestone_name}")
         self.trainer.save(milestone=self.args.milestone_name)
+    
+    def get_embedding(self):
+        if not self.trainer:
+            raise ValueError("Trainer not initialized. Call train() first.")
+        return self.trainer.get_embedding()
+    
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train Overcooked Diffusion Model")

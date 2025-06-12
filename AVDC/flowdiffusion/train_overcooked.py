@@ -51,7 +51,6 @@ class OvercookedTrainer:
         self.train_dataset = Subset(self.dataset, train_indices)
         self.valid_dataset = Subset(self.dataset, valid_indices)
 
-
         self.observation_dim = self.dataset.observation_dim
         self.diffusion = None
         self.trainer = None
@@ -71,7 +70,7 @@ class OvercookedTrainer:
         self.unet = UnetOvercooked(
             horizon=self.horizon,
             obs_dim=self.observation_dim,
-            num_classes=self.dataset.num_partner_policies,
+            num_classes=self.dataset.num_partner_policies, 
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
             model=self.unet,
