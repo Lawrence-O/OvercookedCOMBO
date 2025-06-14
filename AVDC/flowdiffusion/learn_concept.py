@@ -67,7 +67,7 @@ class ConceptLearnOvercookedTrainer:
         self.unet = UnetOvercooked(
             horizon=self.horizon,
             obs_dim=self.observation_dim,
-            num_classes=self.dataset.num_partner_policies,
+            num_classes=8,
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
             model=self.unet,
@@ -105,15 +105,12 @@ class ConceptLearnOvercookedTrainer:
                 dummy_policy_id=self.args.dummy_policy_id,
                 new_policy_id=self.args.new_policy_id
             )
-        self.trainer.load(milestone=self.args.pretrained_model_path)
-        print(f"✓ Successfully loaded pre-trained model")
-        print(f"Concept Learning will run for up to {self.args.max_train_steps} steps")
-        self.trainer.load_embedding(self.args)
+        self.trainer.load_concept_checkpoint(self.args.pretrained_model_path,)
+        print(f"Loaded pre-trained model with {self.trainer.step} steps")
     
     def train(self):
         print(f"\n=== STARTING CONCEPT LEARNING TRAINING ===")
         print(f"Previous Model Step: {self.trainer.step}")
-        self.trainer.step = 0
         self.trainer.train()
         print(f"Saving final model as modl-{self.args.milestone_name}")
         self.trainer.save(milestone=self.args.milestone_name)

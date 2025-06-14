@@ -29,7 +29,7 @@ from einops.einops import rearrange
 from train_overcooked import OvercookedTrainer
 from mapbt_package.mapbt.config import get_config
 from learn_concept import ConceptLearnOvercookedTrainer
-from exp_util import *
+from AVDC.flowdiffusion.experiments_util import *
 
 
 

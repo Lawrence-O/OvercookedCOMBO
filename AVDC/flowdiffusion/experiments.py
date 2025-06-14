@@ -12,7 +12,7 @@ if overcooked_ai_py_src_path not in sys.path:
     sys.path.append(overcooked_ai_py_src_path)
 from matplotlib import pyplot as plt
 import pandas as pd
-from overcooked_dataset import OvercookedSequenceDataset, SingleEpisodeOvercookedDataset
+from overcooked_dataset import OvercookedSequenceDataset
 
 import numpy as np
 import torch as th
@@ -25,12 +25,12 @@ warnings.filterwarnings("ignore")
 from idm.inverse_dynamics import InverseDynamicsModel
 from mapbt_package.mapbt.algorithms.population.policy_pool import PolicyPool as Policy
 from overcooked_sample_renderer import OvercookedSampleRenderer
-from einops.einops import rearrange
-from train_overcooked import OvercookedTrainer
 from mapbt_package.mapbt.config import get_config
-from learn_concept import ConceptLearnOvercookedTrainer
-from exp_util import *
-
+from experiments_util import managed_model_loading, managed_concept_trainer
+from experiments_classes import EvaluationExperiment
+from goal_diffusion import GoalGaussianDiffusion
+from unet import UnetOvercooked
+from ema_pytorch import EMA
 
 
 
@@ -75,12 +75,17 @@ class ExperimentRunner:
 
         # Embeddings
         self.policy_embeddings = {}
-        self.embedding_dim = None
+        self.embedding_dim = 512 # Default embedding dimension
         self.num_concepts = num_concepts
         self.embedding_changes = []
         self.embedding_grad_norms = {}
         self.embedding_loss_history = {}
         self.embedding_history = {}
+
+        assert self.num_concepts > 1, "num_concepts must be greater than 1 for concept learning due to dummy policy embedding"
+
+        self.observation_dim = (8,5,26) #TODO: this should be set based on the dataset or model
+
 
         
     def _load_idm_model(self):
@@ -93,29 +98,39 @@ class ExperimentRunner:
         idm.eval()
         return idm
     
+    #TODO: REMOVE AUTO NORMALIZE FROM ALL DIFFUSION MODELS*****
 
     def load_diffusion_model(self, model_path, ema=True, num_classes=None):
-        """Load the diffusion model for generation, skipping optimizer load in eval."""
-        args_for_loading = deepcopy(self.current_args)
-        args_for_loading.diffusion_model_path = model_path
-        if num_classes is not None:
-            args_for_loading.num_classes = num_classes
-        trainer = OvercookedTrainer(args_for_loading, self.device)
-        trainer_actual = trainer.trainer
-
-        print(f"Loading diffusion model from {model_path}")
+        """Load the diffusion model for evaluation only."""
+        print(f"Loading diffusion model from {model_path}, ema={ema}, num_classes={num_classes}")
+        if not osp.exists(model_path):
+            raise FileNotFoundError(f"Model path {model_path} does not exist.")
         ckpt = th.load(model_path, map_location="cpu")
-        model_wrapped = trainer_actual.accelerator.unwrap_model(trainer_actual.model)
-        model_wrapped.load_state_dict(ckpt["model"])
-        trainer_actual.ema.load_state_dict(ckpt["ema"])
-        print("✓ Loaded model + EMA weights (optimizer state skipped)")
-
+        unet = UnetOvercooked(
+            horizon=self.args.horizon,
+            obs_dim=self.observation_dim,
+            num_classes=num_classes,
+        ).to(self.device)
+        H,W,C = self.observation_dim
+        diffusion = GoalGaussianDiffusion(
+            model=unet,
+            channels=C * 32,
+            image_size=(H,W),
+            timesteps=1 if self.args.debug else 1000,
+            sampling_timesteps=1 if self.args.debug else 100,
+            loss_type="l2",
+            objective="pred_v",
+            beta_schedule="cosine",
+            min_snr_loss_weight=True,
+            guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
+        ).to(self.device)
         if ema:
-            print("Using EMA model for evaluation")
-            return trainer_actual.ema.ema_model.to(self.device)
+            ema_wrap = EMA(diffusion,beta = 0.999,update_every=10)
+            ema_wrap.load_state_dict(ckpt['ema'])
+            return ema_wrap
         else:
-            print("Using actual model for evaluation")
-            return trainer_actual.model.to(self.device)
+            diffusion.load_state_dict(ckpt['model'])
+            return diffusion
     
     def _get_dataset(self, dataset_path, split="test"):
         """Get a dataset from cache or load it."""
@@ -134,80 +149,6 @@ class ExperimentRunner:
                 args=dataset_args, split=split
             )
         return self.dataset_cache[cache_key]
-    
-    def _calculate_evaluation_summary(self, episode_rewards_list, all_metrics, 
-                                 current_run_basedir, layout_name, agent_id):
-        """Calculate summary statistics from episode rewards."""
-        if episode_rewards_list:
-            all_ep_rewards_np = np.array(episode_rewards_list)
-
-            # Agent 0 statistics
-            agent0_mean_rewards_per_episode = all_ep_rewards_np[:, :, 0].mean(axis=1)
-            mean_reward_agent0 = agent0_mean_rewards_per_episode.mean()
-            std_reward_agent0 = agent0_mean_rewards_per_episode.std()
-            
-            # Agent 1 statistics
-            agent1_mean_rewards_per_episode = all_ep_rewards_np[:, :, 1].mean(axis=1)
-            mean_reward_agent1 = agent1_mean_rewards_per_episode.mean()
-            std_reward_agent1 = agent1_mean_rewards_per_episode.std()
-
-            # Team statistics
-            team_rewards_per_ep_env = all_ep_rewards_np.sum(axis=2)
-            mean_team_reward = team_rewards_per_ep_env.mean()
-            std_team_reward = team_rewards_per_ep_env.std()
-        else:
-            mean_reward_agent0 = std_reward_agent0 = mean_reward_agent1 = std_reward_agent1 = mean_team_reward = std_team_reward = 0.0
-
-        # Log results
-        print(f"Agent 0 (Diffusion) mean reward: {mean_reward_agent0:.2f} ± {std_reward_agent0:.2f}")
-        print(f"Agent 1 (Partner) mean reward: {mean_reward_agent1:.2f} ± {std_reward_agent1:.2f}")
-        print(f"Team mean reward: {mean_team_reward:.2f} ± {std_team_reward:.2f}")
-        
-        # Create summary dictionary
-        return {
-            'basedir': str(current_run_basedir),
-            'agent0_mean_reward': mean_reward_agent0,
-            'agent0_std_reward': std_reward_agent0,
-            'agent1_mean_reward': mean_reward_agent1,
-            'agent1_std_reward': std_reward_agent1,
-            'team_mean_reward': mean_team_reward,
-            'team_std_reward': std_team_reward,
-            'layout_name': layout_name,
-            'agent_id': agent_id,
-            'total_episodes_evaluated': self.args.exp_eval_episodes * self.args.n_envs,
-            'metrics_per_episode_reset': all_metrics,
-            'raw_episode_rewards': [arr.tolist() for arr in episode_rewards_list], 
-        }
-    
-    def _save_episode_videos(self, frames, samples_frames, grid, episode, video_dir):
-        """Save videos for a completed episode."""
-        print(f"Saving videos for episode {episode+1}...")
-        for e in range(len(frames)):
-            frames[e] = rearrange(frames[e], "f w h c -> f h w c")
-            env_dir = video_dir / f"episode_{episode+1}_env_{e+1}"
-            env_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Save actual trajectory
-            saved_video = self.renderer.render_trajectory_video(
-                frames[e], 
-                grid, 
-                output_dir=str(env_dir),
-                video_path=str(env_dir / "actual_trajectory.mp4"),
-                fps=1
-            )
-            
-            # Save samples trajectory if needed
-            if self.args.show_samples:
-                self.renderer.render_trajectory_video(
-                    samples_frames[e],
-                    grid,
-                    output_dir=str(env_dir),
-                    video_path=str(env_dir / "samples_trajectory.mp4"),
-                    fps=1,
-                    normalize=True,
-                )
-                
-        print(f"Videos saved to {video_dir}")
 
     def get_or_create_embedding(self, policy_id):
         """Get or create an embedding for a given policy ID."""
@@ -215,17 +156,7 @@ class ExperimentRunner:
             print(f"Using existing embedding for policy {policy_id} with shape {self.policy_embeddings[policy_id].shape}")
             return self.policy_embeddings[policy_id]
         
-        # if no embedding exists, need to extract from the model
-        if self.embedding_dim is None:
-            # Load model to extract embedding dimension
-            temp_model = self.load_diffusion_model(self.args.diffusion_model_path, ema=True)
-            self.embedding_dim = temp_model.model.unet.label_emb.weight.shape[1]
-            
-            del temp_model
-            gc.collect()
-            th.cuda.empty_cache()
-        
-        random_embedding = th.randn(7 + 5 + 1 + 1, self.embedding_dim, device=self.device)
+        random_embedding = th.randn(self.num_concepts, self.embedding_dim, device=self.device)
         self.policy_embeddings[policy_id] = random_embedding
 
         print(f"Created new embedding for policy {policy_id} with shape {random_embedding.shape}")
@@ -311,29 +242,11 @@ class ExperimentRunner:
         # Get or create initial embedding for this policy
         pid = cl_args.new_policy_id
 
-        with managed_concept_trainer(self, cl_args) as (concept_trainer, init_emb):
-            # Run training
-            concept_trainer.train()
-            train_embed, _ = concept_trainer.get_embedding()
-
-            self.policy_embeddings[pid] = train_embed
-
-            # Collect metrics with size limits
-            delta = (train_embed - init_emb).norm().item()
-            self.embedding_changes.append((pid, delta))
-            
-            # Limit history size to prevent memory growth
-            if len(self.embedding_changes) > 1000:
-                self.embedding_changes = self.embedding_changes[-500:]
-            
-            # Store only recent history (last 100 steps)
-            recent_grad_norms = concept_trainer.trainer.row_grad_norms[-100:] if concept_trainer.trainer.row_grad_norms else []
-            recent_loss_history = concept_trainer.trainer.loss_history[-100:] if concept_trainer.trainer.loss_history else []
-            
-            self.embedding_grad_norms[pid] = recent_grad_norms
-            self.embedding_loss_history[pid] = recent_loss_history
-
-            # Save embeddings after each training session
+        with managed_concept_trainer(self, cl_args) as (trained_embed, metrics):
+            self.policy_embeddings[pid] = trained_embed
+            if pid not in self.embedding_loss_history:
+                self.embedding_loss_history[pid] = []
+            self.embedding_loss_history[pid].extend(metrics.get('loss', []))
             self.save_embedding()
 
             # Get model path before cleanup
@@ -461,196 +374,31 @@ class ExperimentRunner:
         print(f"Generated {len(experiment_configs)} test concept learning experiments.")
         return experiment_configs
     
-    @th.no_grad()
-    def full_horizon_eval(self, diffusion_model, policy, config):
-        """
-        Run full horizon evaluation with the given model and configuration.
-        """
+    def evaluate(self, config, diffusion_model):
+        """Run evaluation based on the provided configuration."""
         agent_id = config["agent_id"]
         layout_name = config["layout_name"]
         horizon = config["horizon"]
         partner_policy_name = config["partner_policy_name"]
-        
+
         # Create a unique basedir for this experiment
         current_experiment_name = f"{layout_name}_agent_id_{agent_id}_horizon_{horizon}_partner_policy_{partner_policy_name}"
         current_run_basedir = self.exp_group_dir / "evaluation" / current_experiment_name
         current_run_basedir.mkdir(parents=True, exist_ok=True)
-        
-        print(f"Evaluating: Layout={layout_name}, Agent ID={agent_id}, Horizon={horizon}, Partner={partner_policy_name}")
-        
-        # Setup directories using pathlib consistently
-        video_dir = current_run_basedir / "videos"
-        frames_dir = current_run_basedir / "frames" 
-        metrics_dir = current_run_basedir / "metrics"
-        video_dir.mkdir(exist_ok=True)
-        frames_dir.mkdir(exist_ok=True)
-        metrics_dir.mkdir(exist_ok=True)
-
-        # Set environment variables
-        os.environ["layout"] = layout_name 
-        
-        # Create environments
-        is_bc = partner_policy_name in ["bc_train", "bc_test"]
-        if is_bc:
-            # Override old dynamics for bc evaluation specifically
-            self.args.old_dynamics = True
-            envs = make_eval_env(self.args, run_dir=self.args.run_dir, nenvs=self.args.n_envs)
-            envs.reset_featurize_type([("ppo", "bc") for _ in range(self.args.n_envs)])
-        else:
-            envs = make_eval_env(self.args, run_dir=self.args.run_dir, nenvs=self.args.n_envs)
-            
-        all_metrics = []
-        episode_rewards_list = []
-        
-        F = 32  # Number of frames in the diffusion horizon
-        cond = th.full((self.args.n_envs,), agent_id, dtype=th.int64, device=self.device)
-        for episode in range(self.args.exp_eval_episodes):
-            print(f"Starting episode {episode+1}/{self.args.exp_eval_episodes}")
-
-            # Reset the environment and policy
-            policy.reset(num_envs=self.args.n_envs, num_agents=2)
-            for e in range(self.args.n_envs):
-                policy.register_control_agent(e=e, a=1)
-
-            obs, _, _ = envs.reset([True] * self.args.n_envs)
-            
-            H, W, C = obs[0][0].shape[0], obs[0][0].shape[1], obs[0][0].shape[-1] 
-
-            # Initialize variables for the episode
-            steps = 0
-            done = False
-            episode_reward = np.zeros((self.args.n_envs, 2))
-
-
-            frames = [[obs[i][0]] for i in range(self.args.n_envs)]
-            samples_frames = [[] for _ in range(self.args.n_envs)]
-
-            if self.args.save_videos:
-                grid = np.transpose(obs[0][0], (1, 0, 2))  # "w h c" -> "h w c"
-                grid = self.renderer.extract_grid_from_obs(grid)
-
-            step_actions = np.zeros((self.args.n_envs, 2, 1), dtype=np.int64)
-            
-            while not done and steps <= self.args.max_steps:
-                # Setup Condition Obs Based on Obs
-                obs_stack = np.stack([normalize_obs(obs[e][0]) for e in range(self.args.n_envs)], axis=0) 
-                condition_obs = th.tensor(obs_stack, device=self.device, dtype=th.float32)
-                condition_obs = rearrange(condition_obs, "b h w c -> b c h w")
-
-                samples = diffusion_model.sample(
-                    x_cond=condition_obs,
-                    task_embed=cond,
-                    batch_size=self.args.n_envs,
-                )
-                    
-                samples = rearrange(samples, "b (f c) h w -> b f h w c", c=C, f=F)
-                 
-                # Render out Samples
-                if self.args.show_samples and episode == 0 and steps % 50 == 0:
-                    self.renderer.visualize_all_channels(
-                        obs=samples[0, 0].cpu().numpy(), 
-                        output_dir=str(frames_dir / f"samples_channels_steps_{steps}_horizon_0_env_0.png")
-                    )
-                     
-                # Now step through the environment using the plan
-                plan_horizon = min(self.args.max_steps - steps, horizon, 16)
-
-                # We begin with the first ego obs (first obs of the environment)
-                obs_t = to_torch(obs_stack, device=self.device)
-                for t in range(plan_horizon): 
-                    obs_tp1 = samples[:, t, ...]
-                    
-                    if self.args.save_videos:
-                        for e in range(self.args.n_envs):
-                            samples_frames[e].append(obs_tp1[e].cpu().numpy())
-
-                    for env_i in range(self.args.n_envs):
-                        # IDM takes in 26 channels
-                        ego_action = get_idm_action(
-                            to_torch(obs_t[env_i], device=self.device).unsqueeze(0), 
-                            to_torch(obs_tp1[env_i], device=self.device).unsqueeze(0), 
-                            self.idm_model
-                        )
-                        step_actions[env_i, 0, 0] = ego_action
-      
-                    partner_obs_lst = [obs[e][1] for e in range(self.args.n_envs)]
-                    partner_obs = np.stack(partner_obs_lst, axis=0)
-                    partner_action = policy.step(
-                        partner_obs,
-                        [(e, 1) for e in range(self.args.n_envs)],
-                        deterministic=False,
-                    )
-                    
-                    step_actions[:, 1] = partner_action
-
-                    # Take environment step
-                    obs, _, reward, done, _, _ = envs.step(step_actions)
-                    episode_reward += reward.squeeze(axis=2)
-                    obs_t = obs_tp1
-                    
-                    if self.args.save_videos:
-                        for e in range(min(self.args.n_envs, 3)):
-                            frames[e].append(obs[e][0])
-
-                    # Check for early termination
-                    done = np.all(done)
-                    steps += 1
-                    if steps >= self.args.max_steps:
-                        break
-
-            # Process episode results
-            mean_episode_reward_per_env = episode_reward.mean(axis=0)
-            print(f"Episode {episode+1} complete: steps={steps}, mean rewards per agent={mean_episode_reward_per_env}")
-            
-            metrics = {
-                'episode': episode,
-                'steps': steps,
-                'rewards_per_agent_total': episode_reward.tolist(), 
-                'mean_reward_across_envs': mean_episode_reward_per_env.tolist(),
-            }
-            all_metrics.append(metrics)
-            episode_rewards_list.append(episode_reward.copy()) # Store rewards for all envs for this episode
-            
-            # Save episode metrics
-            with open(metrics_dir / f"episode_{episode+1}_metrics.pkl", 'wb') as f:
-                pickle.dump(metrics, f)
-            
-            if self.args.save_videos:
-                self._save_episode_videos(
-                    frames, samples_frames, grid, episode, video_dir
-                )
-
-            # Clean temporary storage
-            del frames, samples_frames
-            th.cuda.empty_cache() 
-        
-        # Calculate final metrics
-        summary = self._calculate_evaluation_summary(
-            episode_rewards_list, all_metrics, current_run_basedir,
-            layout_name, agent_id
-        )
-        
-        # Save metrics
-        metrics_path = current_run_basedir / "eval_summary.pkl"
-        with open(metrics_path, 'wb') as f:
-            pickle.dump(summary, f)
-        print(f"Summary metrics saved to {metrics_path}")
-                        
-        envs.close()
-        return summary
-    
-    def evaluate(self, config, diffusion_model):
-        """Run evaluation based on the provided configuration."""
-        partner_policy_obj, _ = self.load_partner_policy(
-            config["partner_policy_name"],
-            device="cpu"
-        )
-        
-        summary = self.full_horizon_eval(
-            diffusion_model=diffusion_model,
-            policy=partner_policy_obj,
-            config=config
-        )
+        eval_experiment = EvaluationExperiment(
+            args=self.args,
+            diffusion=diffusion_model,
+            idm=self.idm_model,
+            policy_name=partner_policy_name,
+            policy_id=agent_id,
+            num_episodes=self.args.exp_eval_episodes,
+            results_dir=current_run_basedir,
+            n_envs=self.args.n_envs,
+            max_steps=self.args.max_steps,
+            planning_horizon=horizon,
+            device=self.device
+         )
+        summary = eval_experiment.run(save_videos=self.args.save_videos)
         
         # Add concept learning metadata if present
         if "concept_learning_params" in config and "target_episode_idx" in config["concept_learning_params"]:
@@ -664,103 +412,7 @@ class ExperimentRunner:
             
         return summary
     
-    
-    def run_experiments(self):
-        """Run all experiments."""
-        # Initialize experiment configs
-        experiment_configs = self.create_test_concept_learn_experiment(
-            num_concept_runs=self.args.num_concept_runs,
-            fine_tuning_steps=self.args.test_concept_train_steps,
-            test_policies_to_use=["sp9_final","sp10_final", "bc_train"],
-            target_episodes={}  # Start with empty, can be configured
-        )
-        
-        assert experiment_configs, "No experiment configurations generated"
-        
-        for exp_idx, exp_config in enumerate(experiment_configs):
-            # Clean up memory
-            gc.collect()
-            th.cuda.empty_cache()
-            
-            print(f"\n=== Running Experiment {exp_config['name']} ===")
-            
-            # Create experiment directory
-            exp_dir = self.exp_group_dir / exp_config["name"]
-            exp_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Initialize variables for this experiment
-            use_ema = "concept_learning_params" not in exp_config
-            model_path_for_eval = self.current_model_path
-            experiment_results = []
-            
-            # Conduct concept learning if needed
-            if "concept_learning_params" in exp_config:
-                cl_params = exp_config["concept_learning_params"]
-                
-                # Update model path for successive models
-                # if self.use_successive_models and exp_idx > 0:
-                #     cl_params['pretrained_model_path'] = self.current_model_path
-                #     print(f"Using model from previous step: {self.current_model_path}")
-                cl_params['pretrained_model_path'] = self.args.diffusion_model_path
-                
-                # Create args and set results dir
-                cl_args = self.create_concept_learning_args(cl_params)
-                cl_args.results_dir = str(exp_dir / "concept_learning_output")
-                
-                # Train concept model
-                print(f"Starting concept learning for {exp_config['name']}...")
-                concept_model_path = self.train_concept_learn(cl_args)
-                print(f"Concept learning complete. Model saved to {concept_model_path}")
-                
-                # # Update current model path for successive runs
-                # if self.use_successive_models:
-                #     self.current_model_path = concept_model_path
-                #     self.current_args = deepcopy(cl_args)
-                
-                model_path_for_eval = concept_model_path
-            
-            # Load diffusion model for evaluation
-            print(f"Loading model for evaluation: {model_path_for_eval}, use_ema={use_ema}, num_concepts={self.num_concepts}")
-            diffusion_model = self.load_diffusion_model(model_path_for_eval, 
-                                                        ema=use_ema, 
-                                                        num_concepts=self.num_concepts)
-            
-            # Run evaluations
-            eval_configs = exp_config.get("evaluation_configs", [])
-            if not isinstance(eval_configs, list):
-                eval_configs = [eval_configs] if eval_configs else []
-                
-            for eval_config in eval_configs:
-                if eval_config:
-                    result = self.evaluate(eval_config, diffusion_model)
-                    experiment_results.append(result)
-            
-            # Save results for this experiment
-            self.all_experiment_results.append({
-                "name": exp_config["name"],
-                "config": exp_config,
-                "results": experiment_results,
-                "model_path": model_path_for_eval
-            })
-            
-            # Clean up model to save memory
-            del diffusion_model
-            gc.collect()
-            th.cuda.empty_cache()
-            
-            # Save intermediate results
-            with open(self.exp_group_dir / f"results_through_exp_{exp_idx}.pkl", "wb") as f:
-                pickle.dump(self.all_experiment_results, f)
-        
-        # Save final results
-        results_file = self.exp_group_dir / "all_experiment_results.pkl"
-        with open(results_file, "wb") as f:
-            pickle.dump(self.all_experiment_results, f)
-            
-        print(f"\nAll experiments complete. Results saved to {results_file}")
-        return self.all_experiment_results
-    
-    def run_experiments_with_context_managers(self):
+    def run_cl_experiments_with_context_managers(self):
         experiment_configs = self.create_test_concept_learn_experiment(
             num_concept_runs=self.args.num_concept_runs,
             fine_tuning_steps=self.args.test_concept_train_steps,
@@ -773,7 +425,6 @@ class ExperimentRunner:
         # Get dataset to determine num_classes for model architecture
         # dataset = self._get_dataset(self.args.dataset_path, "train")
         # num_classes = dataset.num_partner_policies  # This should be the total number of policies the model can handle
-        num_classes = 7 + 5 + 1 + 1
         for exp_idx, exp_config in enumerate(experiment_configs):
             print(f"\n=== Processing experiment {exp_idx+1}/{len(experiment_configs)}: {exp_config['name']} ===")
             
@@ -796,23 +447,20 @@ class ExperimentRunner:
                 model_path_for_eval = self.train_concept_learn(cl_args)
                 print(f"Concept learning complete. Model saved to {model_path_for_eval}")
             
-            # Define is_bc function for the context manager
-            def is_bc_fn(policy_name):
-                return policy_name in ["bc_train", "bc_test"]
             
             # Run evaluations with context managers
-            with managed_model_loading(self, model_path_for_eval, use_ema, num_classes) as diffusion_model:
+            with managed_model_loading(self, model_path_for_eval, use_ema, self.num_concepts) as diffusion_model:
                 eval_configs = exp_config.get("evaluation_configs", [])
                 if not isinstance(eval_configs, list):
                     eval_configs = [eval_configs] if eval_configs else []
                     
                 for eval_config in eval_configs:
-                    if eval_config:
-                        with managed_environment(self, eval_config, is_bc_fn) as (envs, policy):
-                            result = self.full_horizon_eval(diffusion_model, policy, eval_config)
-                            experiment_results.append(result)
+                    if not eval_config:
+                        continue
+                    result = self.evaluate(eval_config, diffusion_model)
+                    experiment_results.append(result)
             
-            # Save results for this experiment (keeping existing logic)
+            # Save results for this experiment
             self.all_experiment_results.append({
                 "name": exp_config["name"],
                 "config": exp_config,
@@ -872,13 +520,16 @@ class ExperimentRunner:
             print("No policies found for evaluation")
             return []
         
-        # Load base diffusion model once for all evaluations
-        print(f"Loading base diffusion model from {self.args.diffusion_model_path}")
-        diffusion_model = self.load_diffusion_model(self.args.diffusion_model_path, ema=True)
-        
         # Create a subdirectory for base model evaluations
         base_model_dir = self.exp_group_dir / "base_model_evaluations"
         base_model_dir.mkdir(exist_ok=True)
+
+        # Get num_classes for model loading
+        # num_classes = dataset.num_partner_policies if hasattr(dataset, 'num_partner_policies') else None
+        num_classes = 8
+        print(f"Number of classes for model: {num_classes}")
+        if num_classes is None:
+            raise ValueError("Dataset does not have num_partner_policies attribute. Cannot determine num_classes for model.")
         
         # Run evaluations for each policy 
         for exp_idx, exp_config in enumerate(experiment_configs):
@@ -890,14 +541,18 @@ class ExperimentRunner:
             
             # Run evaluations
             experiment_results = []
-            eval_configs = exp_config.get("evaluation_configs", [])
-            
-            for eval_config in eval_configs:
-                if eval_config:
+
+            with managed_model_loading(self, self.args.diffusion_model_path, ema=True, num_classes=num_classes) as diffusion_model:
+                eval_configs = exp_config.get("evaluation_configs", [])
+                
+                for eval_config in eval_configs:
+                    if not eval_config:
+                        continue
                     result = self.evaluate(eval_config, diffusion_model)
                     # Mark as base model evaluation
                     result['is_base_model'] = True  
                     experiment_results.append(result)
+            
             
             # Save results for this experiment
             self.all_experiment_results.append({
@@ -911,12 +566,7 @@ class ExperimentRunner:
             # Save intermediate results
             with open(base_model_dir / f"results_through_exp_{exp_idx}.pkl", "wb") as f:
                 pickle.dump(self.all_experiment_results, f)
-        
-        # Clean up model
-        del diffusion_model
-        gc.collect()
-        th.cuda.empty_cache()
-        
+
         # Save overall results
         results_file = base_model_dir / "base_model_evaluation_results.pkl"
         with open(results_file, "wb") as f:
@@ -1344,16 +994,16 @@ if __name__ == "__main__":
 
     #overrde episode len
     args.episode_length = 400
-    runner = ExperimentRunner(args, num_concepts=2) #TODO
-    runner.run_experiments_with_context_managers()
+    runner = ExperimentRunner(args, num_concepts=2)
+    # runner.run_cl_experiments_with_context_managers()
 
-    # runner.run_base_model_evaluation(policies_to_evaluate={
-    #     "sp1_final",
-    #     # "sp2_final",
-    #     # "sp3_final",
-    #     # "sp4_final",
-    #     # "sp5_final",
-    # })
+    runner.run_base_model_evaluation(policies_to_evaluate={
+        "sp1_final",
+        # "sp2_final",
+        # "sp3_final",
+        # "sp4_final",
+        # "sp5_final",
+    })
     runner.plot_results()
     runner.plot_embedding_changes()
 

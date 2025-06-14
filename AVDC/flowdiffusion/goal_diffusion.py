@@ -721,6 +721,9 @@ class GoalGaussianDiffusion(nn.Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
+        assert img.min() >= -1 and img.max() <= 1, f'Image must be normalized to [-1, 1], got range [{img.min():.3f}, {img.max():.3f}]'
+        assert img_cond.min() >= -1 and img_cond.max() <= 1, f'Conditional Image must be normalized to [-1, 1], got range [{img_cond.min():.3f}, {img_cond.max():.3f}]'
+        
         return self.p_losses(img, t, img_cond, task_embed, mask, comp_mask, loss_scale)
 
 # trainer class
@@ -1466,33 +1469,33 @@ class OvercookedEnvTrainer(Trainer):
             final_wandb_run_name = wandb_run_name if wandb_run_name else f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
             wandb.init(project=wandb_project, entity=wandb_entity, name=final_wandb_run_name, config=config_to_log)
         
-        if self.accelerator.is_local_main_process:
-            underlying_dataset = self.ds.dataset if isinstance(self.ds, Subset) else self.ds
-            print("\n" + "="*30 + " TRAINING CONFIGURATION " + "="*30)
-            print(f"  Results Folder: {self.results_folder}")
-            print(f"  Device: {self.device}")
-            print(f"  Debug Mode: {self.debug}")
-            print("-" * (60 + len(" TRAINING CONFIGURATION ")))
-            print("  Dataset Information:")
-            print(f"    Full Dataset Size (from '{underlying_dataset.current_split}' split): {len(underlying_dataset)}")
-            print(f"    Train Subset Size: {len(self.ds)}")
-            if self.valid_ds:
-                print(f"    Validation Subset Size: {len(self.valid_ds)}")
-            else:
-                print(f"    Validation Subset Size: 0 (No validation set)")
-            print(f"    Observation Dimension (H, W, C): {underlying_dataset.observation_dim}")
-            print(f"    Horizon: {underlying_dataset.horizon}")
-            print(f"    Number of Unique Partner Policies (for UNet classes): {underlying_dataset.num_partner_policies}")
-            print(f"    Dummy Policy ID (for CFG): {underlying_dataset.dummy_id}")
-            if hasattr(underlying_dataset, 'train_partner_policies'):
-                print(f"    Train Partner Policies ({len(underlying_dataset.train_partner_policies)}):")
-                for name, id_val in underlying_dataset.train_partner_policies.items():
-                    print(f"      '{name}': {id_val}")
-            if hasattr(underlying_dataset, 'test_partner_policies'):
-                print(f"    Test Partner Policies (Offset) ({len(underlying_dataset.test_partner_policies)}):")
-                for name, id_val in underlying_dataset.test_partner_policies.items():
-                    print(f"      '{name}': {id_val}")
-            print("-" * (60 + len(" TRAINING CONFIGURATION ")))
+        # if self.accelerator.is_local_main_process:
+        #     underlying_dataset = self.ds.dataset if isinstance(self.ds, Subset) else self.ds
+        #     print("\n" + "="*30 + " TRAINING CONFIGURATION " + "="*30)
+        #     print(f"  Results Folder: {self.results_folder}")
+        #     print(f"  Device: {self.device}")
+        #     print(f"  Debug Mode: {self.debug}")
+        #     print("-" * (60 + len(" TRAINING CONFIGURATION ")))
+        #     print("  Dataset Information:")
+        #     print(f"    Full Dataset Size (from '{underlying_dataset.current_split}' split): {len(underlying_dataset)}")
+        #     print(f"    Train Subset Size: {len(self.ds)}")
+        #     if self.valid_ds:
+        #         print(f"    Validation Subset Size: {len(self.valid_ds)}")
+        #     else:
+        #         print(f"    Validation Subset Size: 0 (No validation set)")
+        #     print(f"    Observation Dimension (H, W, C): {underlying_dataset.observation_dim}")
+        #     print(f"    Horizon: {underlying_dataset.horizon}")
+        #     print(f"    Number of Unique Partner Policies (for UNet classes): {underlying_dataset.num_partner_policies}")
+        #     print(f"    Dummy Policy ID (for CFG): {underlying_dataset.dummy_id}")
+        #     if hasattr(underlying_dataset, 'train_partner_policies'):
+        #         print(f"    Train Partner Policies ({len(underlying_dataset.train_partner_policies)}):")
+        #         for name, id_val in underlying_dataset.train_partner_policies.items():
+        #             print(f"      '{name}': {id_val}")
+        #     if hasattr(underlying_dataset, 'test_partner_policies'):
+        #         print(f"    Test Partner Policies (Offset) ({len(underlying_dataset.test_partner_policies)}):")
+        #         for name, id_val in underlying_dataset.test_partner_policies.items():
+        #             print(f"      '{name}': {id_val}")
+        #     print("-" * (60 + len(" TRAINING CONFIGURATION ")))
         
             # print(f"Trainer config: {json.dumps(config_to_log, indent=2)}")
 
@@ -1689,6 +1692,7 @@ class ConceptTrainer(OvercookedEnvTrainer):
             channels,
             dummy_policy_id,
             new_policy_id,
+            embedding=None,
             **kwargs
     ):
         super().__init__(
@@ -1702,83 +1706,84 @@ class ConceptTrainer(OvercookedEnvTrainer):
 
         self.dummy_id = dummy_policy_id
         self.new_policy_id = new_policy_id
+        self.embedding = embedding
         self.step = 0
-        self.row_grad_norms = []
         self.loss_history = []
-        self.embedding_history = []
-        print(self.model.objective)
-        self.freeze_all_parameters()
 
         
     def freeze_all_parameters(self):
+        """Freeze all parameters in the model and EMA model."""
         for param in self.model.model.unet.parameters():
             param.requires_grad = False
         for param in self.ema.ema_model.model.unet.parameters():
             param.requires_grad = False
     
-    def unfreeze_policy_embedding(self):
-        unet, ema = self.model.model.unet, self.ema.ema_model.model.unet
-        unet.label_emb.weight.requires_grad = True
-        ema.label_emb.weight.requires_grad = True 
+    def load_concept_checkpoint(self, ckpt_path):
+        """
+        Wrapper that first loads base weights (sans embedding),
+        then replaces the embedding and rebuilds optimizer.
+        """
+        print(f"→ loading base weights from {ckpt_path}")
+        self.load_model_except_embedding(ckpt_path)
+        print("→ loading/reinitializing label_emb")
+        self.load_embedding()
+        print("✓ concept checkpoint loaded")
 
-        # Count trainable parameters and verify only label_emb is active
-        total_trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        embedding_params = unet.label_emb.weight.numel()
+    def load_model_except_embedding(self, milestone):
+        """Load model state except for the `label_emb` weights."""
+        accelerator = self.accelerator
+        device = accelerator.device
 
-        assert total_trainable_params == embedding_params, \
-            f"Expected only {embedding_params} trainable parameters (label_emb), but found {total_trainable_params}"
-
-        print(f"Successfully unfroze policy embedding with shape: {unet.label_emb.weight.shape}") 
-        self.step = 0
-
-    # @torch.no_grad()
-    # def load_embedding(self, args):
-    #     if hasattr(args, 'initial_embedding') and args.initial_embedding is not None:
-    #         print(f"Using provided initial embedding for policy ID {args.new_policy_id}")
-    #         unet, ema = self.model.model.unet, self.ema.ema_model.model.unet
-    #         current_embed = args.initial_embedding.clone().detach().to(self.device)
-    #         # Recreate the embedding layer with the same shape
-    #         unet.label_emb = torch.nn.Embedding.from_pretrained(current_embed, freeze=False).to(self.device)
-    #         ema.label_emb = torch.nn.Embedding.from_pretrained(current_embed, freeze=False).to(self.device)
-    #     else:
-    #         print(f"Using a random initial embedding for policy ID {args.new_policy_id}")
-    #         unet, ema = self.model.model.unet, self.ema.ema_model.model.unet
-    #         unet.label_emb = torch.nn.Embedding(unet.label_emb.weight.shape[0], unet.label_emb.weight.shape[1], device=self.device)
-    #         ema.label_emb = torch.nn.Embedding(ema.label_emb.weight.shape[0], ema.label_emb.weight.shape[1], device=self.device)
-        
-    #     self.unfreeze_policy_embedding()
-    #     params = [p for p in self.model.parameters() if p.requires_grad] 
-    #     print(f"Number of trainable parameters: {len(params)}")
-    #     self.opt = Adam(params, 
-    #                     lr=self.train_lr, 
-    #                     betas=self.adam_betas)
-    #     self.model, self.opt, self.text_encoder = \
-    #         self.accelerator.prepare(self.model, self.opt, self.text_encoder)
-        
-        
-    #     print(f"Initial embedding loaded for policy ID {args.new_policy_id} with shape: {unet.label_emb.weight.shape}")
-    @torch.no_grad()
-    def load_embedding(self, args):
-        import torch.nn as nn
-
-        unet = self.model.model.unet
-        ema_unet = self.ema.ema_model.model.unet
-
-        # Build new Embedding modules (either from args.initial_embedding or random)
-        if hasattr(args, 'initial_embedding') and args.initial_embedding is not None:
-            W = args.initial_embedding.clone().detach().to(self.device)
-            print(f"Injecting provided embedding matrix of shape {tuple(W.shape)}")
-            new_unet_emb = nn.Embedding(*W.shape).to(self.device)
-            new_ema_emb  = nn.Embedding(*W.shape).to(self.device)
-            new_unet_emb.weight.data.copy_(W)
-            new_ema_emb.weight.data.copy_(W)
+        if isinstance(milestone, int):
+            load_name = f'model-{milestone}.pt' if milestone >= 0 else 'model_recent.pt'
+            try:
+                data = torch.load(str(self.results_folder / load_name), map_location=device)
+            except Exception as e:
+                if milestone >= 0:
+                    raise e
+                print("load model_rencent failed, try to load model_last_recent")
+                data = torch.load(str(self.results_folder / 'model_last_recent.pt'), map_location=device)
         else:
+            data = torch.load(str(milestone), map_location=device)
+
+        model = self.accelerator.unwrap_model(self.model)
+        filtered_model_state = {k: v for k, v in data['model'].items() if 'label_emb' not in k}
+        missing, unexpected = model.load_state_dict(filtered_model_state, strict=False)
+        assert any('label_emb.weight' in key for key in missing), \
+            f"Expected a missing key containing 'label_emb.weight', got {missing}"
+        assert len(unexpected) == 0, f"Unexpected keys found: {unexpected}"
+
+        filtered_ema_state = {k: v for k, v in data['ema'].items() if 'label_emb' not in k}
+        missing, unexpected = self.ema.load_state_dict(filtered_ema_state, strict=False)
+        assert any('label_emb.weight' in key for key in missing), \
+            f"Expected a missing key containing 'label_emb.weight', got {missing}"
+        assert len(unexpected) == 0, f"Unexpected keys found: {unexpected}"
+
+        if 'version' in data:
+            print(f"loading from version {data['version']}, step {data['step']}")
+
+        if exists(self.accelerator.scaler) and exists(data['scaler']):
+            self.accelerator.scaler.load_state_dict(data['scaler'])
+    
+    @torch.no_grad()
+    def load_embedding(self):
+        """Replace and unfreeze the `label_emb` weights, rebuild optimizer."""
+        if self.embedding is not None:
+            print(f"Loading provided embedding matrix of shape {tuple(self.embedding.shape)}")
+            W = self.embedding.clone().detach().to(self.device)
+        else:
+            print("No embedding provided, initializing random embedding matrix")
+            unet = self.model.model.unet
             D, C = unet.label_emb.weight.shape
-            print(f"Initializing random embedding matrix of shape ({D},{C})")
-            new_unet_emb = nn.Embedding(D, C).to(self.device)
-            new_ema_emb  = nn.Embedding(D, C).to(self.device)
+            print(f"Initializing label_emb with shape ({D}, {C})")
+            W = torch.randn(D, C, device=self.device)
+
+        new_unet_emb = nn.Embedding.from_pretrained(W, freeze=False).to(self.device)
+        new_ema_emb  = nn.Embedding.from_pretrained(W, freeze=False).to(self.device)
 
         # Replace the existing label_emb with the new one
+        unet = self.model.model.unet
+        ema_unet = self.ema.ema_model.model.unet
         unet.label_emb = new_unet_emb
         ema_unet.label_emb = new_ema_emb
 
@@ -1789,7 +1794,6 @@ class ConceptTrainer(OvercookedEnvTrainer):
 
         # Recreate the optimizer with only the label_emb parameters
         params_to_opt = [p for p in self.model.parameters() if p.requires_grad]
-        lr = 5e-5
         self.opt = Adam(params_to_opt, lr=self.train_lr, betas=self.adam_betas)
 
         self.model, self.opt, self.text_encoder = \
@@ -1799,10 +1803,16 @@ class ConceptTrainer(OvercookedEnvTrainer):
               f"→ label_emb shape {unet.label_emb.weight.shape}")
 
     def get_embedding(self):
+        """Return the current `label_emb` weights from both UNet and EMA models."""
         unet, ema = self.model.model.unet, self.ema.ema_model.model.unet
         unet_embedding = unet.label_emb.weight.clone().detach().to(self.device)
         ema_embedding = ema.label_emb.weight.clone().detach().to(self.device)
         return unet_embedding, ema_embedding
+    
+    def get_metrics(self):
+        return {
+            'loss': self.loss_history
+        }
     
     @torch.no_grad()
     def print_embedding(self):
@@ -1819,42 +1829,25 @@ class ConceptTrainer(OvercookedEnvTrainer):
 
     def train_one_step(self):
         total_loss = 0.0
+        print(f"[DEBUG] train_one_step: self.ds is "
+              f"{type(self.ds).__name__} (len={len(self.ds)})")
         for _ in range(self.gradient_accumulate_every):
             x, x_cond, policy_id = next(self.dl)
-            # Assuming policy_id is not the correct one, we use the one passed via arguments
-            x, x_cond, _ = x.to(self.device), x_cond.to(self.device), policy_id.to(self.device)
+            print(f"[DEBUG] fetched batch: "
+                  f"x.shape={x.shape}, "
+                  f"x_cond.shape={x_cond.shape}, "
+                  f"policy_id[:3]={policy_id[:3].tolist()}")
+            x, x_cond = x.to(self.device), x_cond.to(self.device)
 
             with self.accelerator.autocast():
                 loss = self._loss(x, x_cond)
-                # x = rearrange(x, "b f h w c -> b (f c) h w")
-                # x_cond = rearrange(x_cond, "b h w c -> b c h w")
-                # new_policy_id = torch.full((x.shape[0],), self.new_policy_id, device=self.device, dtype=torch.long)
-                # loss = self.model(x, x_cond, task_embed=new_policy_id)
                 loss = loss / self.gradient_accumulate_every
                 total_loss += loss.item()
                 self.accelerator.backward(loss)
                 self.loss_history.append(loss.item())
-
-        scale = 1.0
-        if self.accelerator.scaler.get_scale() is not None:
-            scale = self.accelerator.scaler.get_scale()
-        raw_unet = self.accelerator.unwrap_model(self.model).model.unet
-        raw_grad = raw_unet.label_emb.weight.grad
-        gn = None if raw_grad is None else raw_grad[self.new_policy_id].norm().item() / scale
-        self.row_grad_norms.append(gn)
-        raw_unet = self.accelerator.unwrap_model(self.model).model.unet
-        
-        row = raw_unet.label_emb.weight[self.new_policy_id].detach().cpu().clone()
-        self.embedding_history.append(row)
         return total_loss
 
-        # def forward(self, img, img_cond, task_embed=None, mask=None, comp_mask=None, loss_scale=None):
-        # b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
-        # assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}, got({h}, {w})'
-        # t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-
-        # img = self.normalize(img)
-        # return self.p_losses(img, t, img_cond, task_embed, mask, comp_mask, loss_scale)
+        
     def _loss(self, x_start, x_cond):
         batch_size = x_start.shape[0]
         policy_id = torch.full((batch_size,), self.new_policy_id, device=self.device, dtype=torch.long)
@@ -1866,87 +1859,12 @@ class ConceptTrainer(OvercookedEnvTrainer):
         x_start = self.model.normalize(x_start)
         
         t = torch.randint(0, self.model.num_timesteps, (batch_size,), device=x_start.device).long()
-
+        print(policy_id, dummy_cond)
         cond_loss = self.model.p_losses(x_start, t, x_cond, policy_id, None, None, None)
         uncond_loss = self.model.p_losses(x_start, t, x_cond, dummy_cond, None, None, None)
         guidance_scale = 1.0
         total_loss = uncond_loss + guidance_scale * (cond_loss - uncond_loss)
 
-        # print(f"Total loss: {total_loss.item()} | Conditional loss: {cond_loss.item()} | Unconditional loss: {uncond_loss.item()}")
-        
         return total_loss
-    def ____loss(self, x_start, x_cond):
-        # Create Policy IDs
-        batch_size = x_start.shape[0]
-        policy_id = torch.full((batch_size,), self.new_policy_id, device=self.device, dtype=torch.long)
-        dummy_cond = torch.full((batch_size,), self.dummy_id, device=self.device, dtype=torch.long)
-        
-        # Reshaping
-        x_start = rearrange(x_start, "b f h w c -> b (f c) h w")
-        x_cond = rearrange(x_cond, "b h w c -> b c h w")
-
-        # Sample timestep for CFG
-        t = torch.randint(0, self.model.num_timesteps, (batch_size,), device=x_start.device).long()
-
-        # CFG: Get conditional and unconditional losses using p_losses
-        cond_loss = self.model.p_losses(x_start, t, x_cond, policy_id, None, None, None)
-        uncond_loss = self.model.p_losses(x_start, t, x_cond, dummy_cond, None, None, None)
-        
-        # Apply CFG weighting
-        # guidance_scale = self.model.guidance_weight  # or use a smaller value like 0.1 for concept learning
-        # total_loss = uncond_loss + guidance_scale * (cond_loss - uncond_loss)
-        # return self.model(x_start, x_cond, task_embed=policy_id)
-        return cond_loss
     
-    # def __loss(self, x_start, x_cond):
-    #     # Create Policy IDs
-    #     batch_size = x_start.shape[0]
-    #     policy_id = torch.full((batch_size,), self.new_policy_id, device=self.device, dtype=torch.long)
-    #     dummy_cond = torch.full((batch_size,), self.dummy_id, device=self.device, dtype=torch.long)
-        
-    #     # Reshaping
-    #     x_start = rearrange(x_start, "b f h w c -> b (f c) h w")
-    #     x_cond = rearrange(x_cond, "b h w c -> b c h w")
-
-    #     # Normalize Theoretically shouldn't be needed
-    #     # x_start = self.model.normalize(x_start)
-    #     # x_cond = self.model.normalize(x_cond)
-
-    #     # Noise       
-    #     noise = torch.randn_like(x_start)
-    #     t = torch.randint(0, self.model.num_timesteps, (x_start.shape[0],), device=x_start.device).long()
-    #     x_noisy = self.model.q_sample(x_start=x_start, t=t)
-
-    #     # Get Conditional and Unconditional Outputs
-    #     cond_output = self.model.p_losses(x_noisy, x_cond, t, task_embed=policy_id)
-    #     uncond_output = self.model.p_losses(x_noisy, x_cond, t, task_embed=policy_id)
-        
-    #     # epsilon_diff = cond_output - uncond_output
-
-    #     # Compute Final Output
-    #     # final_output = uncond_output + (self.model.guidance_weight * epsilon_diff)
-    #     final_output = cond_output
-        
-    #     # # Use Noise Target
-    #     # target = noise
-    #     # assert self.model.objective == 'pred_noise', \
-    #     #     f"Expected model objective to be 'pred_noise', but got {self.model.objective}"
-    #     # Compute loss against target
-    #     if self.model.objective == 'pred_noise':
-    #         target = noise
-    #     elif self.model.objective == 'pred_x0':
-    #         target = x_start
-    #     elif self.model.objective == 'pred_v':
-    #         target = self.model.predict_v(x_start, t, noise)
-    #     else:
-    #         raise ValueError(f'unknown objective {self.model.objective}')
-        
-
-    #     loss = self.model.loss_fn(final_output, target, reduction='none')
-    #     loss = reduce(loss, 'b ... -> b (...)', 'mean')
-    #     loss = (loss * extract(self.model.loss_weight, t, loss.shape)).mean()
-    #     return loss
-             
-
-
         

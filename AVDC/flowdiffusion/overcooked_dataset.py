@@ -46,6 +46,7 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         if self.allowed_policies:
             print(f"Dataset filtered to include only these policies: {self.allowed_policies}")
             print(f"Train policies after filtering: {self.train_partner_policies}")
+            print(f"Original test policies: {self.org_test_partner_policies}")
             print(f"Test policies after filtering: {self.test_partner_policies}")
 
             # self.dataset_average_rewards = {}
@@ -226,17 +227,13 @@ class SingleEpisodeOvercookedDataset(torch.utils.data.Dataset):
         self.path_idx = self.matching_episodes[episode_idx]
         self.observations = self.base_dataset.observations[self.path_idx]
         self.policy_id = self.base_dataset.policy_id[self.path_idx] 
-
-        print(f"Creating SingleEpisodeOvercookedDataset for policy '{policy_name}' at episode index {episode_idx} with path index {self.path_idx}")
-
         self.episode_length = len(self.observations)
         self.horizon = self.base_dataset.horizon
-        self.observation_dim = self.base_dataset.observation_dim
-        self.dummy_id = self.base_dataset.dummy_id
-        print(f"Matching Episodes : {len(self.matching_episodes)}, Expected Reward: {self.base_dataset.rewards[self.path_idx].sum()}, Dummy ID: {self.dummy_id}")
+
+        print(f"Creating SingleEpisodeOvercookedDataset for policy '{policy_name}' at episode index {episode_idx} (path index {self.path_idx})")
         
     def __len__(self):
-        return len(self.observations)
+        return len(self.observations) - self.horizon + 1
     
     def __getitem__(self, idx, condition_single_input=True):
         start = max(1, idx)
@@ -246,20 +243,19 @@ class SingleEpisodeOvercookedDataset(torch.utils.data.Dataset):
         if end > self.episode_length:
             start = self.episode_length - self.horizon
             end = self.episode_length
-
-
-        obs = self.observations[start:end]
+        
+        obs = self.observations[start:end] # Time x H x W x C
+        cond_obs = self.observations[start-1]
         obs = self.base_dataset.actual_norm(obs)
+        cond_obs = self.base_dataset.actual_norm(cond_obs)
 
         # Condition on Partner Policy
         policy_id = self.policy_id[1]
+         
+        T, H, W, C = obs.shape # Time, Agent, Height, Width, Channel 
 
-        if obs.ndim == 4:
-            obs = np.expand_dims(obs, axis=1)            
-        T, _, H, W, C = obs.shape # Time, Agent, Height, Width, Channel 
-
-        trajectory = obs[start:end, 0]
-        conditions_obs = obs[start-1, 0]
+        trajectory = obs
+        conditions_obs = cond_obs
 
         # Create a Mask for Valid Condition Observations
         valid_len = 1 if condition_single_input else start
