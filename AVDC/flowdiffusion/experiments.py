@@ -75,12 +75,19 @@ class ExperimentRunner:
 
         # Embeddings
         self.policy_embeddings = {}
+        if hasattr(args, 'learnable_guidance') and self.args.learnable_guidance:
+            print("Using learnable guidance weights for concept learning.")
+            weight = np.random.uniform(0, 1, num_concepts-1).astype(np.float32) # Don't include dummy policy
+            self.guidance_w = th.tensor(weight, device=self.device, dtype=th.float32)
+        else:
+            self.guidance_w = self.args.guidance_weight if hasattr(args, 'guidance_weight') else 1.0
+            
+            
         self.embedding_dim = 512 # Default embedding dimension
         self.num_concepts = num_concepts
         self.embedding_changes = []
-        self.embedding_grad_norms = {}
         self.embedding_loss_history = {}
-        self.embedding_history = {}
+        self.guidance_weight_history = {}
 
         assert self.num_concepts > 1, "num_concepts must be greater than 1 for concept learning due to dummy policy embedding"
 
@@ -153,27 +160,55 @@ class ExperimentRunner:
     def get_or_create_embedding(self, policy_id):
         """Get or create an embedding for a given policy ID."""
         if policy_id in self.policy_embeddings:
-            print(f"Using existing embedding for policy {policy_id} with shape {self.policy_embeddings[policy_id].shape}")
+            print(f"Using existing embedding for policy {policy_id} with shape {self.policy_embeddings[policy_id]['embedding'].shape}")
+            print(f"Guidance weight: {self.policy_embeddings[policy_id]['guidance_weight']}")
             return self.policy_embeddings[policy_id]
         
         random_embedding = th.randn(self.num_concepts, self.embedding_dim, device=self.device)
-        self.policy_embeddings[policy_id] = random_embedding
+        weight = deepcopy(self.guidance_w) 
+        self.policy_embeddings[policy_id] = {
+            'embedding': random_embedding,
+            'guidance_weight': weight
+        }
 
         print(f"Created new embedding for policy {policy_id} with shape {random_embedding.shape}")
         print(f"Total embeddings now: {len(self.policy_embeddings)}")
         return self.policy_embeddings[policy_id]
     
     def save_embedding(self, path=None):
+        """Save both embeddings and weights."""
         if path is None:
             path = self.base_output_dir / "policy_embeddings.pt"
-        th.save(self.policy_embeddings, path)
-        print(f"Saved {len(self.policy_embeddings)} policy embeddings to {path}")
+        
+        # Convert to a format that's easy to save
+        save_dict = {}
+        for policy_id, data in self.policy_embeddings.items():
+            save_dict[policy_id] = {
+                'embedding': data['embedding'].cpu(),
+                'guidance_weight': data['guidance_weight']
+            }
+        
+        th.save(save_dict, path)
+        print(f"Saved {len(self.policy_embeddings)} policy embeddings with weights to {path}")
     
     def load_embedding(self, path):
-        """Load policy embeddings from a file."""
-        self.policy_embeddings = th.load(path, map_location=self.device)
-        self.embedding_dim = next(iter(self.policy_embeddings.values())).shape[1]
-        print(f"Loaded {len(self.policy_embeddings)} policy embeddings from {path}")
+        """Load policy embeddings and weights from a file."""
+        loaded_data = th.load(path, map_location=self.device)
+        
+        # Convert back to the expected format
+        self.policy_embeddings = {}
+        for policy_id, data in loaded_data.items():
+            self.policy_embeddings[policy_id] = {
+                'embedding': data['embedding'].to(self.device),
+                'guidance_weight': data['guidance_weight']
+            }
+        
+        # Get embedding dimension from first entry
+        first_embedding = next(iter(self.policy_embeddings.values()))['embedding']
+        self.embedding_dim = first_embedding.shape[1]
+        
+        print(f"Loaded {len(self.policy_embeddings)} policy embeddings with weights from {path}")
+        
 
     
     def load_partner_policy(self, policy_name, device="cpu"):
@@ -241,12 +276,20 @@ class ExperimentRunner:
 
         # Get or create initial embedding for this policy
         pid = cl_args.new_policy_id
+        tracking_key = cl_args.target_policy_name if hasattr(cl_args, 'target_policy_name') else f"policy_{pid}"
 
-        with managed_concept_trainer(self, cl_args) as (trained_embed, metrics):
-            self.policy_embeddings[pid] = trained_embed
-            if pid not in self.embedding_loss_history:
-                self.embedding_loss_history[pid] = []
-            self.embedding_loss_history[pid].extend(metrics.get('loss', []))
+        with managed_concept_trainer(self, cl_args) as (embed, g_w, metrics):
+            self.policy_embeddings[pid]['embedding'] = embed
+            self.policy_embeddings[pid]['guidance_weight'] = g_w
+            
+            if tracking_key not in self.embedding_loss_history:
+                self.embedding_loss_history[tracking_key] = []
+            
+            if tracking_key not in self.guidance_weight_history:
+                self.guidance_weight_history[tracking_key] = []
+            
+            self.embedding_loss_history[tracking_key].extend(metrics.get('loss', []))
+            self.guidance_weight_history[tracking_key].extend(metrics.get('guidance_weight', []))
             self.save_embedding()
 
             # Get model path before cleanup
@@ -269,6 +312,8 @@ class ExperimentRunner:
                            is_test_split=False,
                            target_episode_idx=None):
         """Create a single concept learning experiment definition."""
+        print("Overriding Policy ID to 0 for concept learning")
+        new_policy_id = 0  # Override to 0 for concept learning
         cl_params = {
             'dataset_path': self.args.dataset_path,
             'pretrained_model_path': pretrained_model_path,
@@ -290,13 +335,13 @@ class ExperimentRunner:
             "concept_learning_params": cl_params,
         }
 
-        # if eval_partner_policy:
-        #     experiment_definition["evaluation_configs"] = [{
-        #         "layout_name": eval_layout_name if eval_layout_name is not None else self.args.layout_name,
-        #         "agent_id": new_policy_id,
-        #         "horizon": eval_horizon if eval_horizon is not None else self.args.horizon,
-        #         "partner_policy_name": eval_partner_policy,
-        #     }]
+        if eval_partner_policy:
+            experiment_definition["evaluation_configs"] = [{
+                "layout_name": eval_layout_name if eval_layout_name is not None else self.args.layout_name,
+                "agent_id": new_policy_id,
+                "horizon": eval_horizon if eval_horizon is not None else self.args.horizon,
+                "partner_policy_name": eval_partner_policy,
+            }]
 
         return experiment_definition
     
@@ -382,7 +427,7 @@ class ExperimentRunner:
         partner_policy_name = config["partner_policy_name"]
 
         # Create a unique basedir for this experiment
-        current_experiment_name = f"{layout_name}_agent_id_{agent_id}_horizon_{horizon}_partner_policy_{partner_policy_name}"
+        current_experiment_name = f"{layout_name}_agent_id_{agent_id}_horizon_{horizon}_partner_policy_{partner_policy_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         current_run_basedir = self.exp_group_dir / "evaluation" / current_experiment_name
         current_run_basedir.mkdir(parents=True, exist_ok=True)
         eval_experiment = EvaluationExperiment(
@@ -481,7 +526,7 @@ class ExperimentRunner:
         print(f"\nAll experiments complete. Results saved to {results_file}")
         return self.all_experiment_results
     
-    def run_base_model_evaluation(self, policies_to_evaluate=None):
+    def run_base_model_evaluation(self, num_base_classes, policies_to_evaluate=None, ):
         """
         Run evaluations of the base diffusion model on both training and test policies.
         """
@@ -526,10 +571,7 @@ class ExperimentRunner:
 
         # Get num_classes for model loading
         # num_classes = dataset.num_partner_policies if hasattr(dataset, 'num_partner_policies') else None
-        num_classes = 8
-        print(f"Number of classes for model: {num_classes}")
-        if num_classes is None:
-            raise ValueError("Dataset does not have num_partner_policies attribute. Cannot determine num_classes for model.")
+        
         
         # Run evaluations for each policy 
         for exp_idx, exp_config in enumerate(experiment_configs):
@@ -542,7 +584,7 @@ class ExperimentRunner:
             # Run evaluations
             experiment_results = []
 
-            with managed_model_loading(self, self.args.diffusion_model_path, ema=True, num_classes=num_classes) as diffusion_model:
+            with managed_model_loading(self, self.args.diffusion_model_path, ema=True, num_classes=num_base_classes) as diffusion_model:
                 eval_configs = exp_config.get("evaluation_configs", [])
                 
                 for eval_config in eval_configs:
@@ -811,81 +853,109 @@ class ExperimentRunner:
     def plot_embedding_changes(self):
         plot_dir = self.exp_group_dir / "plots"
         plot_dir.mkdir(exist_ok=True)
-        
-        # Convert embedding changes to DataFrame for better plotting
-        if self.embedding_changes:
-            embedding_change_data = []
-            for run_idx, (pid, delta) in enumerate(self.embedding_changes):
-                embedding_change_data.append({
-                    'policy_id': pid,
-                    'run_index': run_idx,
-                    'l2_shift': delta
-                })
-            
-            if embedding_change_data:
-                df_changes = pd.DataFrame(embedding_change_data)
-                
-                plt.figure(figsize=(14, 8))
-                for pid in df_changes['policy_id'].unique():
-                    policy_data = df_changes[df_changes['policy_id'] == pid]
-                    # Convert to numpy arrays before plotting
-                    plt.plot(policy_data['run_index'].values, policy_data['l2_shift'].values, 
-                            marker='o', linestyle='-', label=f'Policy {pid}')
-                
-                plt.title("Embedding L2-shift per policy (multiple runs)")
-                plt.xlabel("Run Index")
-                plt.ylabel("L2 shift")
-                plt.legend()
-                plt.grid(axis='y', alpha=0.3)
-                plt.tight_layout()
-                plt.savefig(plot_dir/"embedding_shifts.png")
-                plt.close()
-                print(f"Saved embedding shifts plot with {len(df_changes['policy_id'].unique())} policies")
-            else:
-                print("No embedding change data to plot")
 
-        # Convert grad norms to DataFrame for better plotting
-        if self.embedding_grad_norms:
-            grad_norm_data = []
-            for pid, norms in self.embedding_grad_norms.items():
-                print(f"Processing grad norms for policy {pid} with {len(norms)} steps")
-                for step_idx, norm_value in enumerate(norms):
-                    grad_norm_data.append({
-                        'policy_id': pid,
-                        'training_step': step_idx,
-                        'grad_norm': norm_value
-                    })
+        if self.guidance_weight_history:
+            guidance_data = []
+            for policy_name, weights in self.guidance_weight_history.items():
+                print(f"Processing guidance weights for policy {policy_name} with {len(weights)} steps")
+                for step_idx, weight_value in enumerate(weights):
+                    # Handle both scalar and array guidance weights
+                    if isinstance(weight_value, (list, np.ndarray, th.Tensor)):
+                        # Convert to numpy array if needed
+                        if isinstance(weight_value, th.Tensor):
+                            weight_value = weight_value.cpu().numpy()
+                        weight_value = np.array(weight_value)
+                        
+                        # If it's a vector, create separate entries for each component
+                        if weight_value.ndim > 0:
+                            for concept_idx, w in enumerate(weight_value):
+                                guidance_data.append({
+                                    'policy_name': f"{policy_name}_concept{concept_idx}",
+                                    'training_step': step_idx,
+                                    'guidance_weight': float(w)  # Ensure it's a scalar
+                                })
+                        else:
+                            # Scalar weight
+                            guidance_data.append({
+                                'policy_name': policy_name,
+                                'training_step': step_idx,
+                                'guidance_weight': float(weight_value)
+                            })
+                    else:
+                        # Already a scalar
+                        guidance_data.append({
+                            'policy_name': policy_name,
+                            'training_step': step_idx,
+                            'guidance_weight': float(weight_value)
+                        })
             
-            if grad_norm_data:
-                df_grad = pd.DataFrame(grad_norm_data)
+            if guidance_data:
+                df_guidance = pd.DataFrame(guidance_data)
                 
+                # Group by base policy name for better visualization
                 plt.figure(figsize=(14, 8))
-                for pid in df_grad['policy_id'].unique():
-                    policy_data = df_grad[df_grad['policy_id'] == pid]
-                    # Convert to numpy arrays before plotting
-                    plt.plot(policy_data['training_step'].values, policy_data['grad_norm'].values, 
-                            label=f"policy {pid}", marker='o', markersize=2)
+                
+                # Get unique base policy names (without _concept suffix)
+                base_policy_names = set()
+                for pname in df_guidance['policy_name'].unique():
+                    base_name = pname.split('_concept')[0]
+                    base_policy_names.add(base_name)
+                
+                # Use different line styles for different concepts
+                line_styles = ['-', '--', '-.', ':']
+                markers = ['o', 's', '^', 'D', '*', 'x']
+                colors = plt.cm.tab10.colors
+                
+                for i, base_policy in enumerate(sorted(base_policy_names)):
+                    # Get all concept weights for this policy
+                    policy_mask = df_guidance['policy_name'].str.startswith(base_policy)
+                    policy_data = df_guidance[policy_mask]
+                    
+                    # Plot each concept separately
+                    for j, concept_name in enumerate(sorted(policy_data['policy_name'].unique())):
+                        concept_data = policy_data[policy_data['policy_name'] == concept_name]
+                        
+                        # Extract concept index if present
+                        if '_concept' in concept_name:
+                            concept_idx = int(concept_name.split('_concept')[1])
+                            label = f"{base_policy} - Concept {concept_idx}"
+                        else:
+                            label = base_policy
+                        
+                        plt.plot(concept_data['training_step'].values, 
+                                concept_data['guidance_weight'].values,
+                                label=label, 
+                                marker=markers[i % len(markers)], 
+                                linestyle=line_styles[j % len(line_styles)],
+                                color=colors[i % len(colors)],
+                                markersize=4,
+                                linewidth=2)
                 
                 plt.xlabel("Training step")
-                plt.ylabel("Grad-norm of embedding row")
-                plt.title("Embedding-row grad norm vs step")
-                plt.legend()
+                plt.ylabel("Guidance Weight")
+                plt.title("Guidance Weight Evolution During Training")
+                plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
                 plt.grid(axis='y', alpha=0.3)
                 plt.tight_layout()
-                plt.savefig(plot_dir/"embedding_grad_norms.png")
+                plt.savefig(plot_dir/"guidance_weight_evolution.png", dpi=150, bbox_inches='tight')
                 plt.close()
-                print(f"Saved grad norms plot with {len(df_grad['policy_id'].unique())} policies")
+                print(f"Saved guidance weight plot with {len(base_policy_names)} policies")
+                
+                # Also create a normalized weights plot if multiple concepts
+                if any('_concept' in pname for pname in df_guidance['policy_name'].unique()):
+                    self._plot_normalized_guidance_weights(df_guidance, plot_dir)
             else:
-                print("No grad norm data to plot")
+                print("No guidance weight data to plot")
+        
         
         # Convert loss history to DataFrame for better plotting
         if self.embedding_loss_history:
             loss_data = []
-            for pid, losses in self.embedding_loss_history.items():
-                print(f"Processing loss history for policy {pid} with {len(losses)} steps")
+            for policy_name, losses in self.embedding_loss_history.items():
+                print(f"Processing loss history for policy {policy_name} with {len(losses)} steps")
                 for step_idx, loss_value in enumerate(losses):
                     loss_data.append({
-                        'policy_id': pid,
+                        'policy_name': policy_name,
                         'training_step': step_idx,
                         'loss': loss_value
                     })
@@ -894,11 +964,11 @@ class ExperimentRunner:
                 df_loss = pd.DataFrame(loss_data)
                 
                 plt.figure(figsize=(14, 8))
-                for pid in df_loss['policy_id'].unique():
-                    policy_data = df_loss[df_loss['policy_id'] == pid]
+                for policy_name in df_loss['policy_name'].unique():
+                    policy_data = df_loss[df_loss['policy_name'] == policy_name]
                     # Convert to numpy arrays before plotting
                     plt.plot(policy_data['training_step'].values, policy_data['loss'].values, 
-                            label=f"policy {pid}", marker='o', markersize=2)
+                            label=f"policy {policy_name}", marker='o', markersize=2)
                 
                 plt.xlabel("Training step")
                 plt.ylabel("Loss")
@@ -908,10 +978,64 @@ class ExperimentRunner:
                 plt.tight_layout()
                 plt.savefig(plot_dir/"concept_loss_curves.png")
                 plt.close()
-                print(f"Saved loss curves plot with {len(df_loss['policy_id'].unique())} policies")
+                print(f"Saved loss curves plot with {len(df_loss['policy_name'].unique())} policies")
             else:
                 print("No loss history data to plot")
+    def _plot_normalized_guidance_weights(self, df_guidance, plot_dir):
+        """Plot normalized guidance weights (sum to 1) for each policy."""
+        plt.figure(figsize=(14, 8))
         
+        # Get base policy names
+        base_policy_names = set()
+        for pname in df_guidance['policy_name'].unique():
+            base_name = pname.split('_concept')[0]
+            base_policy_names.add(base_name)
+        
+        for base_policy in sorted(base_policy_names):
+            # Get all concept data for this policy
+            policy_mask = df_guidance['policy_name'].str.startswith(base_policy)
+            policy_data = df_guidance[policy_mask]
+            
+            # Group by training step and normalize
+            normalized_data = []
+            for step in policy_data['training_step'].unique():
+                step_data = policy_data[policy_data['training_step'] == step]
+                weights = step_data['guidance_weight'].values
+                
+                # Normalize weights to sum to 1
+                if len(weights) > 1:
+                    weights_sum = np.sum(weights)
+                    if weights_sum > 0:
+                        normalized_weights = weights / weights_sum
+                    else:
+                        normalized_weights = np.ones_like(weights) / len(weights)
+                    
+                    for i, w in enumerate(normalized_weights):
+                        normalized_data.append({
+                            'policy_name': base_policy,
+                            'concept_idx': i,
+                            'training_step': step,
+                            'normalized_weight': w
+                        })
+            
+            # Plot stacked area chart for this policy
+            if normalized_data:
+                df_norm = pd.DataFrame(normalized_data)
+                pivot_df = df_norm.pivot(index='training_step', columns='concept_idx', values='normalized_weight')
+                
+                # Create stacked area plot
+                ax = pivot_df.plot.area(stacked=True, alpha=0.7, figsize=(10, 6))
+                ax.set_xlabel('Training Step')
+                ax.set_ylabel('Normalized Weight')
+                ax.set_title(f'Normalized Guidance Weights for {base_policy}')
+                ax.set_ylim(0, 1)
+                ax.legend(title='Concept', labels=[f'Concept {i}' for i in range(len(pivot_df.columns))])
+                
+                plt.tight_layout()
+                plt.savefig(plot_dir / f"normalized_weights_{base_policy}.png", dpi=150)
+                plt.close()
+        
+        print(f"Saved normalized guidance weight plots")
 
 def parse_args(args, parser):
     parser.add_argument('--gpu_id', type=int, default=0, help='GPU ID to use (-1 for CPU)')
@@ -980,6 +1104,8 @@ def parse_args(args, parser):
                     help='Number of training steps to take for test concept learning')
     parser.add_argument('--exp_group_name', type=str, default=None, 
                     help='Name for experiment group folder')
+    parser.add_argument('--guidance_weight', type=float, default=1.0, help='Guidance weight for concept learning')
+    parser.add_argument('--learnable_guidance', action='store_true', help='Make guidance weight learnable')
     
     all_args = parser.parse_known_args(args)[0]
 
@@ -994,16 +1120,16 @@ if __name__ == "__main__":
 
     #overrde episode len
     args.episode_length = 400
-    runner = ExperimentRunner(args, num_concepts=2)
-    # runner.run_cl_experiments_with_context_managers()
+    runner = ExperimentRunner(args, num_concepts=8)
+    runner.run_cl_experiments_with_context_managers()
 
-    runner.run_base_model_evaluation(policies_to_evaluate={
-        "sp1_final",
-        # "sp2_final",
-        # "sp3_final",
-        # "sp4_final",
-        # "sp5_final",
-    })
+    # runner.run_base_model_evaluation(2, policies_to_evaluate={
+    #     "sp1_final",
+    #     # "sp2_final",
+    #     # "sp3_final",
+    #     # "sp4_final",
+    #     # "sp5_final",
+    # })
     runner.plot_results()
     runner.plot_embedding_changes()
 

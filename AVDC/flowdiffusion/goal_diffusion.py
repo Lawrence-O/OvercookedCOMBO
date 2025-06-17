@@ -630,6 +630,9 @@ class GoalGaussianDiffusion(nn.Module):
     def sample(self, x_cond, task_embed=None, mask=None, comp_mask=None, batch_size=16, return_all_timesteps=False, vis=None):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
+        assert x_cond.min() >= -1 and x_cond.max() <= 1, \
+            f'x_cond must be normalized to [-1, 1], got range [{x_cond.min():.3f}, {x_cond.max():.3f}]'
+
         return sample_fn((batch_size, channels, image_size[0], image_size[1]), x_cond, task_embed, mask, comp_mask, return_all_timesteps = return_all_timesteps, vis = vis)
 
     @torch.no_grad()
@@ -719,6 +722,8 @@ class GoalGaussianDiffusion(nn.Module):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}, got({h}, {w})'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+
+        print(f"Image max: {img.max()}, min: {img.min()}")
 
         img = self.normalize(img)
         assert img.min() >= -1 and img.max() <= 1, f'Image must be normalized to [-1, 1], got range [{img.min():.3f}, {img.max():.3f}]'
@@ -1692,6 +1697,7 @@ class ConceptTrainer(OvercookedEnvTrainer):
             channels,
             dummy_policy_id,
             new_policy_id,
+            guidance_w,
             embedding=None,
             **kwargs
     ):
@@ -1707,9 +1713,24 @@ class ConceptTrainer(OvercookedEnvTrainer):
         self.dummy_id = dummy_policy_id
         self.new_policy_id = new_policy_id
         self.embedding = embedding
+        self.embedding_shape = embedding.shape if embedding is not None else None
         self.step = 0
         self.loss_history = []
-
+        self.guidance_weight_history = []
+        if guidance_w is None:
+            self.guidance_weight = 1.0
+            self.learnable_guidance = False
+            print("Using fixed guidance weight of 1.0")
+        else: # TODO: may want to support custom guidance weights instead of just ints / learnable parameters
+            if isinstance(guidance_w, (int, float)):
+                self.guidance_weight = guidance_w
+                self.learnable_guidance = False
+                print(f"Using fixed guidance weight of {guidance_w}")
+            else:
+                self.guidance_weight = nn.Parameter(torch.tensor(guidance_w, dtype=torch.float32, device=self.device), requires_grad=True)
+                self.learnable_guidance = True
+                print(f"Using learnable guidance weight initialized to {guidance_w}")
+        
         
     def freeze_all_parameters(self):
         """Freeze all parameters in the model and EMA model."""
@@ -1717,7 +1738,6 @@ class ConceptTrainer(OvercookedEnvTrainer):
             param.requires_grad = False
         for param in self.ema.ema_model.model.unet.parameters():
             param.requires_grad = False
-    
     def load_concept_checkpoint(self, ckpt_path):
         """
         Wrapper that first loads base weights (sans embedding),
@@ -1777,6 +1797,7 @@ class ConceptTrainer(OvercookedEnvTrainer):
             D, C = unet.label_emb.weight.shape
             print(f"Initializing label_emb with shape ({D}, {C})")
             W = torch.randn(D, C, device=self.device)
+            self.embedding_shape = W.shape
 
         new_unet_emb = nn.Embedding.from_pretrained(W, freeze=False).to(self.device)
         new_ema_emb  = nn.Embedding.from_pretrained(W, freeze=False).to(self.device)
@@ -1794,14 +1815,26 @@ class ConceptTrainer(OvercookedEnvTrainer):
 
         # Recreate the optimizer with only the label_emb parameters
         params_to_opt = [p for p in self.model.parameters() if p.requires_grad]
+        if self.learnable_guidance:
+            self.guidance_weight.requires_grad = True
+            params_to_opt.append(self.guidance_weight)
+            
         self.opt = Adam(params_to_opt, lr=self.train_lr, betas=self.adam_betas)
+
+        expected_params = len(list(unet.label_emb.parameters()))
+        if self.learnable_guidance:
+            expected_params += 1
+        
+        actual_params = len(params_to_opt)
+        assert actual_params == expected_params, \
+            f"Expected {expected_params} parameters to optimize, got {actual_params}"
 
         self.model, self.opt, self.text_encoder = \
             self.accelerator.prepare(self.model, self.opt, self.text_encoder)
 
         print(f"Loaded embedding; now optimizing {sum(p.numel() for p in params_to_opt)} parameters "
               f"→ label_emb shape {unet.label_emb.weight.shape}")
-
+    @torch.no_grad()
     def get_embedding(self):
         """Return the current `label_emb` weights from both UNet and EMA models."""
         unet, ema = self.model.model.unet, self.ema.ema_model.model.unet
@@ -1809,9 +1842,15 @@ class ConceptTrainer(OvercookedEnvTrainer):
         ema_embedding = ema.label_emb.weight.clone().detach().to(self.device)
         return unet_embedding, ema_embedding
     
+    @torch.no_grad()
+    def get_guidance_weight(self):
+        return self.guidance_weight.clone().detach() if self.learnable_guidance else self.guidance_weight
+    
+    @torch.no_grad()
     def get_metrics(self):
         return {
-            'loss': self.loss_history
+            'loss': self.loss_history,
+            'guidance_weight': self.guidance_weight_history,
         }
     
     @torch.no_grad()
@@ -1829,15 +1868,15 @@ class ConceptTrainer(OvercookedEnvTrainer):
 
     def train_one_step(self):
         total_loss = 0.0
-        print(f"[DEBUG] train_one_step: self.ds is "
-              f"{type(self.ds).__name__} (len={len(self.ds)})")
         for _ in range(self.gradient_accumulate_every):
-            x, x_cond, policy_id = next(self.dl)
-            print(f"[DEBUG] fetched batch: "
-                  f"x.shape={x.shape}, "
-                  f"x_cond.shape={x_cond.shape}, "
-                  f"policy_id[:3]={policy_id[:3].tolist()}")
+            x, x_cond, _ = next(self.dl)
             x, x_cond = x.to(self.device), x_cond.to(self.device)
+
+            if self.learnable_guidance:
+                print(f"[DEBUG] Current guidance weight: {self.guidance_weight}")
+                self.guidance_weight_history.append(self.guidance_weight.clone().detach().cpu().numpy())
+            else:
+                self.guidance_weight_history.append(self.guidance_weight)
 
             with self.accelerator.autocast():
                 loss = self._loss(x, x_cond)
@@ -1846,25 +1885,102 @@ class ConceptTrainer(OvercookedEnvTrainer):
                 self.accelerator.backward(loss)
                 self.loss_history.append(loss.item())
         return total_loss
-
-        
     def _loss(self, x_start, x_cond):
         batch_size = x_start.shape[0]
-        policy_id = torch.full((batch_size,), self.new_policy_id, device=self.device, dtype=torch.long)
         dummy_cond = torch.full((batch_size,), self.dummy_id, device=self.device, dtype=torch.long)
 
         x_start = rearrange(x_start, "b f h w c -> b (f c) h w")
-        x_cond = rearrange(x_cond, "b h w c -> b c h w")
-        
-        x_start = self.model.normalize(x_start)
-        
-        t = torch.randint(0, self.model.num_timesteps, (batch_size,), device=x_start.device).long()
-        print(policy_id, dummy_cond)
-        cond_loss = self.model.p_losses(x_start, t, x_cond, policy_id, None, None, None)
-        uncond_loss = self.model.p_losses(x_start, t, x_cond, dummy_cond, None, None, None)
-        guidance_scale = 1.0
-        total_loss = uncond_loss + guidance_scale * (cond_loss - uncond_loss)
+        x_cond  = rearrange(x_cond,  "b h w c -> b c h w")
+        x_start = self.model.normalize(x_start)  # TODO: REMOVE THIS
+        if not x_start.requires_grad:
+            x_start = x_start.requires_grad_(True)
+        t = torch.randint(0, self.model.num_timesteps,(batch_size,), device=x_start.device).long()
 
+        # unconditional loss
+        uncond_loss = self.model.p_losses(x_start, t, x_cond, dummy_cond,None, None, None)
+
+        # single-concept shortcut
+        if self.embedding_shape[0] - 1 == 1:
+            policy_id = torch.full((batch_size,), self.new_policy_id, device=self.device, dtype=torch.long)
+            cond_loss = self.model.p_losses(x_start, t, x_cond, policy_id,None, None, None)
+            total_loss = uncond_loss + self.guidance_weight * (cond_loss - uncond_loss)
+            print(f"[DEBUG] Single concept loss: {total_loss.item()}")
+            return total_loss
+
+        # multi-concept case
+        concept_ids = [c_id for c_id in range(self.embedding_shape[0]) if c_id != self.dummy_id]
+
+        # pick your weights vector
+        if self.learnable_guidance:
+            weights = self.guidance_weight
+        else:
+            weights = torch.full((len(concept_ids),),self.guidance_weight,device=self.device)
+        weighted_cond_loss = torch.tensor(0.0, device=self.device)
+        for idx, c_id in enumerate(concept_ids):
+            cond_id = torch.full((batch_size,), c_id,device=self.device, dtype=torch.long)
+            cond_loss = self.model.p_losses(x_start, t, x_cond, cond_id,None, None, None)
+            w_i = weights[idx]
+            weighted_cond_loss = weighted_cond_loss + w_i * cond_loss
+
+        print(f"[DEBUG] Weighted conditional loss: {weighted_cond_loss.item()}")
+        print(f"[DEBUG] Unconditional loss: {uncond_loss.item()}")
+
+        total_loss = uncond_loss + weighted_cond_loss
         return total_loss
+    
+    def other_loss(self, x_start, x_cond):
+        import torch.utils.checkpoint as cp 
+        batch_size = x_start.shape[0]
+        dummy_cond = torch.full((batch_size,), self.dummy_id, device=self.device, dtype=torch.long)
+
+        x_start = rearrange(x_start, "b f h w c -> b (f c) h w")
+        x_cond  = rearrange(x_cond,  "b h w c -> b c h w")
+        x_start = self.model.normalize(x_start)  # TODO: REMOVE THIS
+        if not x_start.requires_grad:
+            x_start = x_start.requires_grad_(True)
+        t = torch.randint(0, self.model.num_timesteps,(batch_size,), device=x_start.device).long()
+
+        def chkpt_fn(x_start, t, x_cond, policy_id):
+            return self.model.p_losses(x_start, t, x_cond, policy_id, None, None, None)
+
+        # unconditional loss
+        uncond_loss = cp.checkpoint(chkpt_fn, x_start, t, x_cond, dummy_cond)
+        # uncond_loss = self.model.p_losses(x_start, t, x_cond, dummy_cond,None, None, None)
+
+        # single-concept shortcut
+        if self.embedding_shape[0] - 1 == 1:
+            policy_id = torch.full((batch_size,), self.new_policy_id, device=self.device, dtype=torch.long)
+            # cond_loss = self.model.p_losses(x_start, t, x_cond, policy_id,None, None, None)
+            cond_loss = cp.checkpoint(chkpt_fn, x_start, t, x_cond, policy_id)
+            total_loss = uncond_loss + self.guidance_weight * (cond_loss - uncond_loss)
+            print(f"[DEBUG] Single concept loss: {total_loss.item()}")
+            return total_loss
+
+        # multi-concept case
+        concept_ids = [c_id for c_id in range(self.embedding_shape[0]) if c_id != self.dummy_id]
+
+        # pick your weights vector
+        if self.learnable_guidance:
+            weights = self.guidance_weight
+        else:
+            weights = torch.full((len(concept_ids),),self.guidance_weight,device=self.device)
+        weighted_cond_loss = torch.tensor(0.0, device=self.device)
+        for idx, c_id in enumerate(concept_ids):
+            cond_id = torch.full((batch_size,), c_id,device=self.device, dtype=torch.long)
+
+            # cond_loss = self.model.p_losses(x_start, t, x_cond, cond_id,None, None, None)
+            cond_loss = cp.checkpoint(chkpt_fn, x_start, t, x_cond, cond_id)
+
+            w_i = weights[idx]
+            weighted_cond_loss = weighted_cond_loss + w_i * cond_loss
+
+        print(f"[DEBUG] Weighted conditional loss: {weighted_cond_loss.item()}")
+        print(f"[DEBUG] Unconditional loss: {uncond_loss.item()}")
+
+        total_loss = uncond_loss + weighted_cond_loss
+        return total_loss
+    
+    
+    
     
         

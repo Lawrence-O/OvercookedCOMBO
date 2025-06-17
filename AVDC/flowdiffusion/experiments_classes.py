@@ -19,7 +19,7 @@ from overcooked_sample_renderer import OvercookedSampleRenderer
 
 class ConceptLearnExperiment:
     """Base class for concept learning experiments in Overcooked."""
-    def __init__(self, args, observation_dim, embedding, num_concepts, train_dataset, device=None):
+    def __init__(self, args, observation_dim, embedding, guidance_weight, num_concepts, train_dataset, device=None):
         self.args = args
         if device is None:
             self.device = th.device(f"cuda:{args.gpu_id}" if th.cuda.is_available() and args.gpu_id >= 0 else "cpu")
@@ -49,6 +49,8 @@ class ConceptLearnExperiment:
         self.unet_num_classes = num_concepts + 1
         print(f"Number of concepts to learn: {self.num_concepts}")
         self.embedding = embedding if embedding is not None else None
+        self.guidance_weight = guidance_weight if guidance_weight is not None else 1.0
+        print(f"Using guidance weight: {self.guidance_weight}")
     
     def setup_trainer(self):
         """Initialize the UNet and diffusion trainer."""
@@ -69,7 +71,7 @@ class ConceptLearnExperiment:
             objective="pred_v",
             beta_schedule="cosine",
             min_snr_loss_weight=True, 
-            guidance_weight= self.args.guidance_weight if self.args.guidance_weight else 1.0
+            guidance_weight=1.0
         ).to(self.device)
         
         self.trainer = ConceptTrainer(
@@ -96,6 +98,7 @@ class ConceptLearnExperiment:
             dummy_policy_id=self.dummy_id,
             new_policy_id=self.new_policy_id,
             embedding=self.embedding,
+            guidance_w=self.guidance_weight,
         )
     def train(self):
         """Run the training process."""
@@ -109,7 +112,8 @@ class ConceptLearnExperiment:
         print(f"Model saved to {self.results_folder / self.args.milestone_name}")
         embed, _ = self.trainer.get_embedding()
         metrics = self.trainer.get_metrics()
-        return embed, metrics
+        guidance_weight = self.trainer.get_guidance_weight()
+        return (embed, guidance_weight, metrics)
 
 class EvaluationExperiment:
     """Base class for evaluation experiments in Overcooked."""
@@ -223,15 +227,32 @@ class EvaluationExperiment:
             while not done and steps <= self.args.max_steps:
                 # Setup Condition Obs Based on Obs
                 obs_stack = np.stack([normalize_obs(obs[e][0]) for e in range(self.n_envs)], axis=0) 
-                condition_obs = th.tensor(obs_stack, device=self.device, dtype=th.float32)
-                assert condition_obs.shape[-1] == 26 # Double Check
-                condition_obs = rearrange(condition_obs, "b h w c -> b c h w")
-                samples = self.diffusion.sample(
-                    x_cond=condition_obs,
-                    task_embed=cond,
-                    batch_size=self.n_envs,
-                )
-                samples = rearrange(samples, "b (f c) h w -> b f h w c", c=C, f=self.horizon)
+                
+                if False:
+                    # current_obs = np.stack([obs[e][0] for e in range(self.n_envs)])
+                    # Plan using the diffusion model
+                    samples, best_rewards = self._plan(
+                        current_obs=obs_stack,
+                        cond=cond,
+                        envs=envs,
+                        partner_policy=policy,
+                        num_trajectories=10
+                    )
+                    print(f"Best rewards from planning: {best_rewards}")
+                else:
+                    condition_obs = th.tensor(obs_stack, device=self.device, dtype=th.float32)
+                    assert condition_obs.shape[-1] == 26 # Double Check
+                    assert condition_obs.min() >= -1 and condition_obs.max() <= 1, \
+                        f'condition_obs must be normalized to [-1, 1], got range [{condition_obs.min():.3f}, {condition_obs.max():.3f}]'
+                    assert cond.min() >= 0 and cond.max() < self.args.num_classes if hasattr(self.args, 'num_classes') else 10, \
+                        f'cond (task_embed) contains invalid policy IDs: min={cond.min()}, max={cond.max()}'
+                    condition_obs = rearrange(condition_obs, "b h w c -> b c h w")
+                    samples = self.diffusion.sample(
+                        x_cond=condition_obs,
+                        task_embed=cond,
+                        batch_size=self.n_envs,
+                    )
+                    samples = rearrange(samples, "b (f c) h w -> b f h w c", c=C, f=self.horizon)
                 # Now step through the environment using the plan
                 plan_horizon = min(self.max_steps - steps, self.planning_horizon)
                 # We begin with the first ego obs (first obs of the environment)
@@ -306,7 +327,94 @@ class EvaluationExperiment:
                 
         print(f"Videos saved to {video_dir}")
         
-    def _plan(self, trajectories):
+    def _plan(self, current_obs, cond, envs, partner_policy, num_trajectories=10):
+        raise NotImplementedError("Not done")
+        """Plan trajectories using the diffusion model."""
+        best_trajectories = []
+        best_rewards = []
+        for env_idx in range(self.n_envs):
+            env_best_trajectory = []
+            env_best_reward = -np.inf
+            for _ in range(num_trajectories):
+                env_cond = cond[env_idx:env_idx + 1]
+                env_obs = current_obs[env_idx:env_idx + 1]
+                # Normalize and prepare observation
+                # normalized_obs = normalize_obs(env_obs[0])
+                condition_obs = th.tensor(env_obs[0], device=self.device, dtype=th.float32).unsqueeze(0)
+                condition_obs = rearrange(condition_obs, "b h w c -> b c h w")
+                samples = self.diffusion.sample(
+                    x_cond=env_obs,
+                    task_embed=env_cond,
+                    batch_size=1,
+                )
+                trajectory = rearrange(samples, "b (f c) h w -> b f h w c", c=env_obs.shape[-1], f=self.horizon)
+                trajectory_reward = self._evaluate_trajectory(
+                    trajectory=trajectory[0],
+                    env_idx=env_idx,
+                    initial_state=env_obs[0],
+                    partner_policy=partner_policy,
+                    envs=envs
+                )
 
-        pass
+                if trajectory_reward > env_best_reward:
+                    env_best_reward = trajectory_reward
+                    env_best_trajectory = trajectory
+            best_trajectories.append(env_best_trajectory)
+            best_rewards.append(env_best_reward)
+        # Stack results
+        best_trajectories = np.stack(best_trajectories, axis=0)  # (n_envs, horizon, H, W, C)
+        best_rewards = np.array(best_rewards)  # (n_envs,)
+        return best_trajectories, best_rewards
+    def _evaluate_trajectory(self, trajectory, env_idx, initial_state, partner_policy, envs):
+        """Evaluate a single trajectory in the environment."""
+        print(dir(envs))
+        base_env = envs.base_envs[env_idx]
+
+        # Save Current State
+        original_state = base_env.state.deepcopy()
+        base_env.set_state(initial_state)
+
+        total_reward = 0.0
+        try:
+            for t in range(self.horizon):
+                obs = base_env.get_obs()
+                # Get ego action from trajectory using IDM
+                if t == 0:
+                    # First step: use initial state as obs_t
+                    obs_t = th.tensor(initial_state, device=self.device, dtype=th.float32).unsqueeze(0)
+                else:
+                    # Use previous trajectory observation
+                    obs_t = th.tensor(trajectory[t-1], device=self.device, dtype=th.float32).unsqueeze(0)
+                obs_tp1 = th.tensor(trajectory[t], device=self.device, dtype=th.float32).unsqueeze(0)
+                
+                # Get IDM action
+                ego_action = get_idm_action(obs_t, obs_tp1, self.idm)
+                from overcooked_ai_py.mdp.actions import Action, Direction
+                ego_action = Action.INDEX_TO_ACTION[ego_action.item()]
+
+                # Get partner action
+                partner_obs = obs # Assume they are the same obs
+
+                partner_action_idx = partner_policy.step(
+                    partner_obs[np.newaxis, ...],
+                    [(env_idx, 1)],
+                    deterministic=True
+                )[0, 0]
+                partner_action = Action.INDEX_TO_ACTION[partner_action_idx]
+                
+                # Create joint action
+                joint_action = (ego_action, partner_action)
+                
+                # Step environment
+                next_state, sparse_reward, done, info = base_env.step(joint_action)
+                
+                # Accumulate reward
+                total_reward += sparse_reward
+                
+                # Check if episode ended
+                if done:
+                    break
+        finally:
+            # Restore original state
+            base_env.set_state(original_state)
     

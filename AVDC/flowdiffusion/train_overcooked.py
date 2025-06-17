@@ -70,7 +70,7 @@ class OvercookedTrainer:
         self.unet = UnetOvercooked(
             horizon=self.horizon,
             obs_dim=self.observation_dim,
-            num_classes=8, 
+            num_classes=self.dataset.num_partner_policies, 
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
             model=self.unet,

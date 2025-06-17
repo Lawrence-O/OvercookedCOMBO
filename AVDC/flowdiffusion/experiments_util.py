@@ -135,9 +135,10 @@ def managed_concept_trainer(runner, cl_args):
         
         # Get or create initial embedding for this policy
         pid = cl_args.new_policy_id
-        init_emb = runner.get_or_create_embedding(pid)
-        cl_args.initial_embedding = init_emb
-        
+        embedding_obj = runner.get_or_create_embedding(pid)
+        init_emb = embedding_obj['embedding']
+        init_w = embedding_obj['guidance_weight']
+
         # Get cached datasets first
         if cl_args.target_episode_idx is not None and cl_args.target_policy_name:
             # Load base dataset once
@@ -154,17 +155,18 @@ def managed_concept_trainer(runner, cl_args):
                 args=cl_args,
                 observation_dim=base_dataset.observation_dim,
                 embedding=init_emb,
+                guidance_weight=init_w,
                 num_concepts=runner.num_concepts,
                 train_dataset=single_ep_dataset,
                 device=runner.device,
             )
-            embeding, metrics = trainer.train()
+            embed, guidance_weight, metrics = trainer.train()
         else:
             raise NotImplementedError(
                 "Managed concept trainer only supports single episode datasets for now"
             )
         
-        yield embeding, metrics
+        yield embed, guidance_weight, metrics
         
     finally:
         if trainer is not None:
