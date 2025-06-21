@@ -1497,6 +1497,8 @@ class OvercookedEnvTrainer(Trainer):
             "diffusion_sampling_timesteps": diffusion_model.sampling_timesteps,
             "diffusion_guidance_weight": diffusion_model.guidance_weight,
             "diffusion_ddim_sampling_eta": diffusion_model.ddim_sampling_eta,
+            "diffusion_num_actions": diffusion_model.num_actions if hasattr(diffusion_model, 'num_actions') else 'N/A',
+            "diffusion_no_op_action": diffusion_model.no_op_action if hasattr(diffusion_model, 'no_op_action') else 'N/A',
 
             # Unet parameters
             "unet_model_channels": diffusion_model.model.unet.model_channels if hasattr(diffusion_model.model, 'unet') else 'N/A',
@@ -1514,35 +1516,35 @@ class OvercookedEnvTrainer(Trainer):
             final_wandb_run_name = wandb_run_name if wandb_run_name else f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
             wandb.init(project=wandb_project, entity=wandb_entity, name=final_wandb_run_name, config=config_to_log)
         
-        # if self.accelerator.is_local_main_process:
-        #     underlying_dataset = self.ds.dataset if isinstance(self.ds, Subset) else self.ds
-        #     print("\n" + "="*30 + " TRAINING CONFIGURATION " + "="*30)
-        #     print(f"  Results Folder: {self.results_folder}")
-        #     print(f"  Device: {self.device}")
-        #     print(f"  Debug Mode: {self.debug}")
-        #     print("-" * (60 + len(" TRAINING CONFIGURATION ")))
-        #     print("  Dataset Information:")
-        #     print(f"    Full Dataset Size (from '{underlying_dataset.current_split}' split): {len(underlying_dataset)}")
-        #     print(f"    Train Subset Size: {len(self.ds)}")
-        #     if self.valid_ds:
-        #         print(f"    Validation Subset Size: {len(self.valid_ds)}")
-        #     else:
-        #         print(f"    Validation Subset Size: 0 (No validation set)")
-        #     print(f"    Observation Dimension (H, W, C): {underlying_dataset.observation_dim}")
-        #     print(f"    Horizon: {underlying_dataset.horizon}")
-        #     print(f"    Number of Unique Partner Policies (for UNet classes): {underlying_dataset.num_partner_policies}")
-        #     print(f"    Dummy Policy ID (for CFG): {underlying_dataset.dummy_id}")
-        #     if hasattr(underlying_dataset, 'train_partner_policies'):
-        #         print(f"    Train Partner Policies ({len(underlying_dataset.train_partner_policies)}):")
-        #         for name, id_val in underlying_dataset.train_partner_policies.items():
-        #             print(f"      '{name}': {id_val}")
-        #     if hasattr(underlying_dataset, 'test_partner_policies'):
-        #         print(f"    Test Partner Policies (Offset) ({len(underlying_dataset.test_partner_policies)}):")
-        #         for name, id_val in underlying_dataset.test_partner_policies.items():
-        #             print(f"      '{name}': {id_val}")
-        #     print("-" * (60 + len(" TRAINING CONFIGURATION ")))
+        if self.accelerator.is_local_main_process:
+            underlying_dataset = self.ds.dataset if isinstance(self.ds, Subset) else self.ds
+            print("\n" + "="*30 + " TRAINING CONFIGURATION " + "="*30)
+            print(f"  Results Folder: {self.results_folder}")
+            print(f"  Device: {self.device}")
+            print(f"  Debug Mode: {self.debug}")
+            print("-" * (60 + len(" TRAINING CONFIGURATION ")))
+            print("  Dataset Information:")
+            print(f"    Full Dataset Size (from '{underlying_dataset.current_split}' split): {len(underlying_dataset)}")
+            print(f"    Train Subset Size: {len(self.ds)}")
+            if self.valid_ds:
+                print(f"    Validation Subset Size: {len(self.valid_ds)}")
+            else:
+                print(f"    Validation Subset Size: 0 (No validation set)")
+            print(f"    Observation Dimension (H, W, C): {underlying_dataset.observation_dim}")
+            print(f"    Horizon: {underlying_dataset.horizon}")
+            print(f"    Number of Unique Partner Policies (for UNet classes): {underlying_dataset.num_partner_policies}")
+            print(f"    Dummy Policy ID (for CFG): {underlying_dataset.dummy_id}")
+            if hasattr(underlying_dataset, 'train_partner_policies'):
+                print(f"    Train Partner Policies ({len(underlying_dataset.train_partner_policies)}):")
+                for name, id_val in underlying_dataset.train_partner_policies.items():
+                    print(f"      '{name}': {id_val}")
+            if hasattr(underlying_dataset, 'test_partner_policies'):
+                print(f"    Test Partner Policies (Offset) ({len(underlying_dataset.test_partner_policies)}):")
+                for name, id_val in underlying_dataset.test_partner_policies.items():
+                    print(f"      '{name}': {id_val}")
+            print("-" * (60 + len(" TRAINING CONFIGURATION ")))
         
-            # print(f"Trainer config: {json.dumps(config_to_log, indent=2)}")
+            print(f"Trainer config: {json.dumps(config_to_log, indent=2)}")
 
     @staticmethod
     def overcooked_collate_fn(samples):
