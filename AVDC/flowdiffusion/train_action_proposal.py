@@ -7,12 +7,12 @@ import numpy as np
 import os
 
 # Workspace imports
-from goal_diffusion import GoalGaussianDiffusion, OvercookedEnvTrainer
-from unet import UnetOvercooked 
-from overcooked_dataset import OvercookedSequenceDataset
+from goal_diffusion import GoalGaussianDiffusion, OvercookedActionProposal
+from unet import UnetOvercookedActionProposal 
+from overcooked_dataset import ActionOvercookedSequenceDataset
 
 
-class OvercookedTrainer:
+class ActionProposalTrainer:
     def __init__(self, args, device=None, seed=42):
         self.args = args
         if device is None:
@@ -25,10 +25,6 @@ class OvercookedTrainer:
         self.results_folder.mkdir(exist_ok=True, parents=True)
 
         self.horizon  = args.horizon
-        self.num_actions = 6
-        self.action_horizon = 8
-        self.no_op_action = 4
-        self.dummy_id = 0 # Goal Gaussian Assumes Unconditional Model Uses Zeros for Dummy Policy ID
         
         dataset_args = argparse.Namespace(
             dataset_path = args.dataset_path,
@@ -41,7 +37,7 @@ class OvercookedTrainer:
 
         dataset_split = getattr(args, 'dataset_split', "train")
         print(f"Loading Overcooked dataset from {dataset_args.dataset_path} with split: {dataset_split}")
-        self.dataset = OvercookedSequenceDataset(args=dataset_args, split=dataset_split)        
+        self.dataset = ActionOvercookedSequenceDataset(args=dataset_args, split=dataset_split)        
 
         # Create train/validation split
         dataset_size = len(self.dataset)
@@ -56,6 +52,7 @@ class OvercookedTrainer:
         self.valid_dataset = Subset(self.dataset, valid_indices)
 
         self.observation_dim = self.dataset.observation_dim
+        self.num_actions = 6
         self.diffusion = None
         self.trainer = None
         self.unet = None
@@ -71,37 +68,31 @@ class OvercookedTrainer:
         
     def init_diffusion_trainer(self):
         H,W,C = self.observation_dim
-        self.unet = UnetOvercooked(
+        self.unet = UnetOvercookedActionProposal(
             horizon=self.horizon,
             obs_dim=self.observation_dim,
-            num_classes=self.dataset.num_partner_policies,
-            num_actions=self.num_actions,
-            action_horizon=self.action_horizon, 
+            num_actions=self.num_actions, 
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
             model=self.unet,
-            channels=C * 32, #TODO: Look into this Channels * Horizon
-            image_size=(H,W),
+            channels=1 * 32, #TODO: Look into this Channels * Horizon
+            image_size=(1,1),
             timesteps=1 if self.args.debug else 1000,
             sampling_timesteps=1 if self.args.debug else 100,
             loss_type="l2",
             objective="pred_v",
             beta_schedule="cosine",
             min_snr_loss_weight=True,
-            guidance_weight=1.0,
-            num_actions=self.num_actions,
-            auto_normalize=False,
-            no_op_action=self.no_op_action
+            guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
         ).to(self.device)
-        self.trainer = OvercookedEnvTrainer(
+        self.trainer = OvercookedActionProposal(
                 diffusion_model=self.diffusion,
                 channels=C,
                 train_set=self.train_dataset,
                 valid_set=self.valid_dataset,
                 train_lr=1e-4,
                 train_num_steps = 200000,
-                # save_and_sample_every = 2 if self.args.debug else self.args.save_and_sample_every,
-                save_and_sample_every=100,
+                save_and_sample_every = 2 if self.args.debug else self.args.save_and_sample_every,
                 ema_update_every = 10,
                 ema_decay = 0.999,
                 train_batch_size = 1 if self.args.debug else self.args.train_batch_size,
@@ -112,11 +103,9 @@ class OvercookedTrainer:
                 fp16 =True,
                 amp=True,
                 save_milestone=self.args.save_milestone,
-                cond_drop_chance=getattr(self.args, 'cond_drop_prob', 0.1),
+                cond_drop_chance=0.0,
                 split_batches=getattr(self.args, 'split_batches', True),
                 debug=self.args.debug,
-                dummy_policy_id=self.dummy_id,
-                no_op_action=self.no_op_action,
                 # Wandb arguments
                 wandb_enabled=self.args.wandb,
                 wandb_project=self.args.wandb_project,
@@ -165,5 +154,5 @@ if __name__ == '__main__':
 
     if config.debug:
         print("--- RUNNING IN DEBUG MODE ---")
-    overcooked_trainer_main = OvercookedTrainer(args=config)
+    overcooked_trainer_main = ActionProposalTrainer(args=config)
     overcooked_trainer_main.train()

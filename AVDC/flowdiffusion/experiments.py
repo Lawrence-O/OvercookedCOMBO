@@ -461,7 +461,7 @@ class ExperimentRunner:
         experiment_configs = self.create_test_concept_learn_experiment(
             num_concept_runs=self.args.num_concept_runs,
             fine_tuning_steps=self.args.test_concept_train_steps,
-            test_policies_to_use=["sp9_final","sp10_final", "bc_train"],
+            test_policies_to_use=["sp9_final", "bc_train"],
             target_episodes={}
         )
         
@@ -1120,7 +1120,7 @@ if __name__ == "__main__":
 
     #overrde episode len
     args.episode_length = 400
-    runner = ExperimentRunner(args, num_concepts=8)
+    runner = ExperimentRunner(args, num_concepts=16)
     runner.run_cl_experiments_with_context_managers()
 
     # runner.run_base_model_evaluation(2, policies_to_evaluate={

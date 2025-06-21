@@ -446,6 +446,8 @@ class UNetModel(nn.Module):
         dims=2,
         num_classes=None,
         task_tokens=True,
+        num_actions=None,
+        action_horizon=None,
         task_token_channels=512,
         use_checkpoint=False,
         use_fp16=False,
@@ -471,6 +473,8 @@ class UNetModel(nn.Module):
         self.channel_mult = channel_mult
         self.conv_resample = conv_resample
         self.num_classes = num_classes
+        self.num_actions = num_actions
+        self.action_horizon = action_horizon
         self.task_tokens = task_tokens
         self.use_checkpoint = use_checkpoint
         self.dtype = th.float16 if use_fp16 else th.float32
@@ -491,6 +495,12 @@ class UNetModel(nn.Module):
             self.task_attnpool = nn.Sequential(
                 PerceiverResampler(dim=task_token_channels, depth=2),
                 nn.Linear(task_token_channels, time_embed_dim),
+            )
+        if self.num_actions is not None and self.action_horizon is not None:
+            self.action_cond = nn.Sequential(
+                nn.Linear(num_actions * action_horizon, time_embed_dim),
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, time_embed_dim),
             )
 
         ch = input_ch = int(channel_mult[0] * model_channels)
@@ -647,7 +657,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y=None, mask=None):
+    def forward(self, x, timesteps, y=None, action_embed=None, mask=None):
         """
         Apply the model to an input batch.
 
@@ -666,6 +676,12 @@ class UNetModel(nn.Module):
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
             emb = emb + self.label_emb(y)
+        
+        if self.num_actions is not None and self.action_horizon is not None:
+            B, K, A = action_embed.shape
+            action_embed_flat = action_embed.view(B, K * A)
+            assert action_embed_flat.shape[0] == x.shape[0]
+            emb = emb + self.action_cond(action_embed_flat)
         
         if self.task_tokens:
             label_emb = self.task_attnpool(y).mean(dim=1)

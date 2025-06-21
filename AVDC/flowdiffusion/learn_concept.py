@@ -8,7 +8,7 @@ import os
 # Workspace imports
 from goal_diffusion import GoalGaussianDiffusion, ConceptTrainer
 from unet import UnetOvercooked 
-from overcooked_dataset import OvercookedSequenceDataset
+from overcooked_dataset import OvercookedSequenceDataset, SingleEpisodeOvercookedDataset
 
 
 class ConceptLearnOvercookedTrainer:
@@ -47,8 +47,15 @@ class ConceptLearnOvercookedTrainer:
         else:
             raise ValueError("Must provide either a dataset instance or dataset_path argument")
         
-        self.train_dataset = train_dataset if train_dataset is not None else self.dataset
-        self.valid_dataset = valid_dataset if valid_dataset is not None else self.dataset
+        # self.train_dataset = train_dataset if train_dataset is not None else self.dataset
+        # self.valid_dataset = valid_dataset if valid_dataset is not None else self.dataset
+
+        self.train_dataset = SingleEpisodeOvercookedDataset(
+            base_dataset=self.dataset,
+            policy_name="sp1_final",
+            episode_idx=0,
+        )
+        self.valid_dataset = self.train_dataset
 
         self.diffusion = None
         self.trainer = None

@@ -368,6 +368,8 @@ class GoalGaussianDiffusion(nn.Module):
         min_snr_loss_weight = False, # https://arxiv.org/abs/2303.09556
         min_snr_gamma = 5,
         vis = None,
+        num_actions = None,
+        no_op_action = None, 
     ):
         super().__init__()
         # assert not (type(self) == GoalGaussianDiffusion and model.channels != model.out_dim)
@@ -378,6 +380,10 @@ class GoalGaussianDiffusion(nn.Module):
         self.image_size = image_size
         self.objective = objective
         self.vis = vis
+        self.num_actions = num_actions
+        if self.num_actions and no_op_action is None:
+            raise ValueError('no_op_action must be provided if num_actions is specified')
+        self.no_op_action = no_op_action
 
         assert objective in {'pred_noise', 'pred_x0', 'pred_v'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
 
@@ -495,10 +501,10 @@ class GoalGaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_cond, task_embed=None, mask=None, clip_x_start=False, rederive_pred_noise=False, **kwargs):
+    def model_predictions(self, x, t, x_cond, task_embed=None, action_embed=None, mask=None, clip_x_start=False, rederive_pred_noise=False, **kwargs):
         # task_embed = self.text_encoder(goal).last_hidden_state
         batched_times = torch.full((x.size(0),), t, device = x.device, dtype = torch.long)
-        model_output = self.model(x, x_cond, batched_times, task_embed, mask=mask, **kwargs)
+        model_output = self.model(x, x_cond, batched_times, task_embed, action_embed, mask=mask, **kwargs)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -522,11 +528,15 @@ class GoalGaussianDiffusion(nn.Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_cond, task_embed=None, mask=None, clip_denoised=False):
-        preds_cond = self.model_predictions(x, t, x_cond, task_embed, mask)
+    def p_mean_variance(self, x, t, x_cond, task_embed=None, action_embed=None, mask=None, clip_denoised=False):
+        preds_cond = self.model_predictions(x, t, x_cond, task_embed, action_embed, mask)
         x_start = preds_cond.pred_x_start * (1 + self.guidance_weight)
         if self.guidance_weight > 0:
-            preds_uncond = self.model_predictions(x, t, x_cond, torch.zeros_like(task_embed), None)
+            if action_embed is not None:
+                uncond_actions = torch.ones_like(action_embed)*self.no_op_action
+            else:
+                uncond_actions = None
+            preds_uncond = self.model_predictions(x, t, x_cond, torch.zeros_like(task_embed), uncond_actions, None)
             x_start -= preds_uncond.pred_x_start * self.guidance_weight
 
         if clip_denoised:
@@ -537,14 +547,14 @@ class GoalGaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.no_grad()
-    def p_sample(self, x, t: int, x_cond, task_embed=None, mask=None):
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x, t, x_cond, task_embed, mask, clip_denoised = True)
+    def p_sample(self, x, t: int, x_cond, task_embed=None, action_embed=None, mask=None):
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x, t, x_cond, task_embed, action_embed, mask, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, x_cond, task_embed=None, mask=None, return_all_timesteps=False):
+    def p_sample_loop(self, shape, x_cond, task_embed=None, action_embed=None, mask=None, return_all_timesteps=False):
 
         batch, device = shape[0], self.betas.device
         img = torch.randn(shape, device=device)
@@ -554,7 +564,7 @@ class GoalGaussianDiffusion(nn.Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             # self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, x_cond, task_embed, mask)
+            img, x_start = self.p_sample(img, t, x_cond, task_embed, action_embed, mask)
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
@@ -563,7 +573,7 @@ class GoalGaussianDiffusion(nn.Module):
         return ret
 
     @torch.no_grad()
-    def ddim_sample(self, shape, x_cond, task_embed=None, mask=None, comp_mask=None, return_all_timesteps=False, vis=None):
+    def ddim_sample(self, shape, x_cond, task_embed=None, action_embed=None, mask=None, comp_mask=None, return_all_timesteps=False, vis=None):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -584,18 +594,22 @@ class GoalGaussianDiffusion(nn.Module):
                 vis = [vis]
             elif vis is None:
                 vis = [None for _ in range(len(task_embed))]
+        if action_embed is not None and not isinstance(action_embed, list):
+            action_embed = [action_embed]
 
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             # self_cond = x_start if self.self_condition else None
             if task_embed is None:
-                pred_noise, x_start, *_ = self.model_predictions(img, time, x_cond, task_embed, mask, clip_x_start = False, rederive_pred_noise = True, vis = vis)
+                assert action_embed is None, "Haven't implemented action embedding without task embedding"
+                pred_noise, x_start, *_ = self.model_predictions(img, time, x_cond, task_embed, action_embed, mask, clip_x_start = False, rederive_pred_noise = True, vis = vis)
             else:
-                pred_uncond_noise, x_uncond, *_ = self.model_predictions(img, time, x_cond, torch.zeros_like(task_embed[0]), None, clip_x_start = False, rederive_pred_noise = True)
+                assert task_embed is not None and action_embed is not None, "task_embed and action_embed must be provided when using task embedding"
+                pred_uncond_noise, x_uncond, *_ = self.model_predictions(img, time, x_cond, torch.zeros_like(task_embed[0]), torch.ones_like(action_embed[0])*self.no_op_action, None, clip_x_start = False, rederive_pred_noise = True)
                 pred_noise = pred_uncond_noise
                 x_start = x_uncond
                 
                 for i in range(len(task_embed)):
-                    cur_pred_noise, cur_x_start, *_ = self.model_predictions(img, time, x_cond, task_embed[i], mask[i], clip_x_start = False, rederive_pred_noise = True, vis = vis[i])
+                    cur_pred_noise, cur_x_start, *_ = self.model_predictions(img, time, x_cond, task_embed[i], action_embed[i], mask[i], clip_x_start = False, rederive_pred_noise = True, vis = vis[i])
                     c_mask = comp_mask[i].view(-1, 1, 1, 1) if comp_mask is not None else 1
 
                     x_start = (cur_x_start - x_uncond) * self.guidance_weight * c_mask + x_start
@@ -627,14 +641,26 @@ class GoalGaussianDiffusion(nn.Module):
         return ret
 
     @torch.no_grad()
-    def sample(self, x_cond, task_embed=None, mask=None, comp_mask=None, batch_size=16, return_all_timesteps=False, vis=None):
+    def sample(self, x_cond, task_embed=None, action_embed=None, mask=None, comp_mask=None, batch_size=16, return_all_timesteps=False, vis=None):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         assert x_cond.min() >= -1 and x_cond.max() <= 1, \
             f'x_cond must be normalized to [-1, 1], got range [{x_cond.min():.3f}, {x_cond.max():.3f}]'
+        if action_embed is not None and self.num_actions is not None:
+            assert action_embed.min() >= 0 and action_embed.max() < self.num_actions, \
+                f'action_embed values must be in range [0, {self.num_actions - 1}], got range [{action_embed.min().item()}, {action_embed.max().item()}]'
+            action_embed = F.one_hot(action_embed, num_classes=self.num_actions).float()
 
-        return sample_fn((batch_size, channels, image_size[0], image_size[1]), x_cond, task_embed, mask, comp_mask, return_all_timesteps = return_all_timesteps, vis = vis)
-
+        return sample_fn(
+            shape=(batch_size, channels, image_size[0], image_size[1]), 
+            x_cond=x_cond, 
+            task_embed=task_embed, 
+            action_embed=action_embed, 
+            mask=mask, 
+            comp_mask=comp_mask, 
+            return_all_timesteps=return_all_timesteps, 
+            vis=vis
+        )
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
         b, *_, device = *x1.shape, x1.device
@@ -672,7 +698,7 @@ class GoalGaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
-    def p_losses(self, x_start, t, x_cond, task_embed=None, mask=None, comp_mask=None, loss_scale=None, noise=None):
+    def p_losses(self, x_start, t, x_cond, task_embed=None, action_embed=None, mask=None, comp_mask=None, loss_scale=None, noise=None):
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
@@ -683,9 +709,9 @@ class GoalGaussianDiffusion(nn.Module):
         # predict and take gradient step
 
         if composed:
-            model_out = [self.model(x, x_cond, t, embed, mask=msk) for embed, msk in zip(task_embed, mask)]
+            model_out = [self.model(x, x_cond, t, embed, action_embed, mask=msk) for embed, msk in zip(task_embed, mask)]
         else:
-            model_out = self.model(x, x_cond, t, task_embed, mask=mask)
+            model_out = self.model(x, x_cond, t, task_embed, action_embed, mask=mask)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -718,18 +744,24 @@ class GoalGaussianDiffusion(nn.Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, img_cond, task_embed=None, mask=None, comp_mask=None, loss_scale=None):
+    def forward(self, img, img_cond, task_embed=None, action_embed=None, mask=None, comp_mask=None, loss_scale=None):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size[0] and w == img_size[1], f'height and width of image must be {img_size}, got({h}, {w})'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-
-        print(f"Image max: {img.max()}, min: {img.min()}")
 
         img = self.normalize(img)
         assert img.min() >= -1 and img.max() <= 1, f'Image must be normalized to [-1, 1], got range [{img.min():.3f}, {img.max():.3f}]'
         assert img_cond.min() >= -1 and img_cond.max() <= 1, f'Conditional Image must be normalized to [-1, 1], got range [{img_cond.min():.3f}, {img_cond.max():.3f}]'
         
-        return self.p_losses(img, t, img_cond, task_embed, mask, comp_mask, loss_scale)
+        if self.num_actions is not None:
+            assert action_embed is not None, 'action_embed must be provided when num_actions is set'
+            assert action_embed.shape[0] == b, f'action_embed batch size {action_embed.shape[0]} must match image batch size {b}'
+            assert action_embed.dtype == torch.long, f'action_embed must be of type long, got {action_embed.dtype}'
+            assert action_embed.min() >= 0 and action_embed.max() < self.num_actions, f'action_embed values must be in range [0, {self.num_actions - 1}], got range [{action_embed.min().item()}, {action_embed.max().item()}]'
+            # action_embed shape: ( B, K) where K is the number of actions
+            action_embed = F.one_hot(action_embed, num_classes=self.num_actions).float()
+            # Now shape: (B, K, num_actions)
+        return self.p_losses(img, t, img_cond, task_embed, action_embed, mask, comp_mask, loss_scale)
 
 # trainer class
 
@@ -1376,7 +1408,8 @@ class OvercookedEnvTrainer(Trainer):
                  wandb_enabled=False,
                  wandb_project="combo_overcooked_diffuser",
                  wandb_entity="social-rl",
-                 wandb_run_name=None
+                 wandb_run_name=None,
+                 no_op_action=None,
                 ):
         
         super().__init__(diffusion_model,
@@ -1419,6 +1452,11 @@ class OvercookedEnvTrainer(Trainer):
         self.renderer = OvercookedSampleRenderer()
         self.dummy_id = dummy_policy_id
         self.wandb_enabled = wandb_enabled
+        if no_op_action is None:
+            raise ValueError("no_op_action must be provided for OvercookedEnvTrainer")
+        assert self.dummy_id == 0, "dummy_policy_id must be 0 for OvercookedEnvTrainer"
+        self.no_op_action = no_op_action
+
         
         config_to_log = {
             # Trainer parameters
@@ -1440,6 +1478,7 @@ class OvercookedEnvTrainer(Trainer):
             "save_milestone_checkpoints": save_milestone,
             "debug_mode": self.debug,
             "dummy_policy_id_used": self.dummy_id,
+            "no_op_action": self.no_op_action,
             
             # Dataset parameters
             "dataset_type": train_set.__class__.__name__,
@@ -1466,6 +1505,7 @@ class OvercookedEnvTrainer(Trainer):
             "unet_channel_mult": str(diffusion_model.model.unet.channel_mult) if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_num_classes": diffusion_model.model.unet.num_classes if hasattr(diffusion_model.model, 'unet') else 'N/A',
         }
+        
         
         if cond_drop_chance > 0 and dummy_policy_id is None:
             raise ValueError("Must provide dummy_policy_id when cond_drop_chance > 0")
@@ -1506,49 +1546,42 @@ class OvercookedEnvTrainer(Trainer):
 
     @staticmethod
     def overcooked_collate_fn(samples):
-        # samples is a list of (x_item, x_cond_item, task_emb_id_item, sample_id_str_item)
-        # x_item, x_cond_item are expected to be (Horizon, H, W, C)
-        # task_emb_id_item is an int
-        
-        x_list = [s[0] for s in samples]
-        x_cond_list = [s[1] for s in samples] # This is (Horizon, H, W, C)
-        task_emb_id_list = [s[2] for s in samples]
+        # Unzip the samples into separate lists
+        x, x_cond, policy_id, actions = zip(*samples)
 
-        x_batch = torch.stack(x_list) # (B, Horizon, H, W, C)
-
-        # Assuming UnetOvercooked expects a single frame condition from x_cond_batch's last frame.
-        # x_cond_batch is (B, Horizon_cond, H, W, C)
-        # We take the last frame of the conditioning sequence from the dataset.
-        x_cond_single_frame_batch = torch.stack([s[1][-1] for s in samples]) # (B, H, W, C)
-
-        task_emb_id_batch = torch.tensor(task_emb_id_list, dtype=torch.long)
-        
-        # Return structure: x, x_cond, goal (policy_ids), *remaining_data (sample_ids)
-        return x_batch, x_cond_single_frame_batch, task_emb_id_batch
+        # Stack directly into tensors
+        x = torch.stack(x) # (B F, H, W, C)
+        x_cond = torch.stack(x_cond)  # (B, H, W, C)
+        policy_id = torch.tensor(policy_id, dtype=torch.long)  # (B,)
+        actions = torch.stack(actions)  # (B, K)
+        assert actions.ndim == 2, f"Expected actions to be 2D tensor, got {actions.ndim}D tensor"
+        return x, x_cond, policy_id, actions
+    
     def train_one_step(self):
         total_loss = 0
+
         for _ in range(self.gradient_accumulate_every):
-            x, x_cond, policy_id = next(self.dl)
-            x, x_cond, policy_id = x.to(self.device), x_cond.to(self.device), policy_id.to(self.device)
+            x, x_cond, policy_id, actions = next(self.dl)
+            x, x_cond, policy_id, actions = x.to(self.device), x_cond.to(self.device), policy_id.to(self.device), actions.to(self.device)
 
             x = rearrange(x, "b f h w c -> b (f c) h w")
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
-
             
             if self.cond_drop_chance > 0: 
                 batch_size = policy_id.shape[0]
                 mask = torch.rand(batch_size, device=self.device) < self.cond_drop_chance
                 policy_id = torch.where(mask, self.dummy_id*(torch.ones_like(policy_id)), policy_id)
-                
+                no_op_action = torch.ones_like(actions) * self.no_op_action
+                actions = torch.where(mask.unsqueeze(-1), no_op_action, actions)
 
             with self.accelerator.autocast():
-                loss = self.model(x, x_cond, task_embed=policy_id)
+                loss = self.model(x, x_cond, task_embed=policy_id, action_embed=actions)
                 loss = loss / self.gradient_accumulate_every
                 total_loss += loss.item()
 
                 self.accelerator.backward(loss)
         
-        if self.accelerator.is_local_main_process and not self.debug:
+        if self.accelerator.is_local_main_process and not self.debug and self.wandb_enabled:
             wandb.log({
                 "train/loss": total_loss,
                 "train/step": self.step
@@ -1573,14 +1606,15 @@ class OvercookedEnvTrainer(Trainer):
             "reference": None,
             "unconditional": None
         }
-        for x_org, x_cond, policy_id in self.valid_dl:
+        for x_org, x_cond, policy_id, actions in self.valid_dl:
             B, *_ = x_org.shape
             x = rearrange(x_org, "b f h w c -> b (f c) h w")
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
-            loss = self.model(x, x_cond, task_embed=policy_id)
+            loss = self.model(x, x_cond, task_embed=policy_id, action_embed=actions)
 
             dummy_cond = torch.ones_like(policy_id)*self.dummy_id
-            uncond_loss = self.model(x, x_cond, task_embed=dummy_cond)
+            uncond_actions = torch.ones_like(actions) * self.no_op_action
+            uncond_loss = self.model(x, x_cond, task_embed=dummy_cond, action_embed=uncond_actions)
 
             total_valid_loss.append(loss)
             total_unconditional_loss.append(uncond_loss)
@@ -1591,12 +1625,14 @@ class OvercookedEnvTrainer(Trainer):
             pred_traj = self.ema.ema_model.sample(
                 x_cond=x_cond,
                 task_embed = policy_id,
+                action_embed=actions,
                 batch_size=B,
             )
 
             uncond_pred_traj = self.ema.ema_model.sample(
                 x_cond=x_cond,
                 task_embed=dummy_cond,
+                action_embed=actions,
                 batch_size=B,
             )
             # Process conditional trajectory
@@ -1879,7 +1915,7 @@ class ConceptTrainer(OvercookedEnvTrainer):
                 self.guidance_weight_history.append(self.guidance_weight)
 
             with self.accelerator.autocast():
-                loss = self._loss(x, x_cond)
+                loss = self.other_loss(x, x_cond)
                 loss = loss / self.gradient_accumulate_every
                 total_loss += loss.item()
                 self.accelerator.backward(loss)
@@ -1980,7 +2016,307 @@ class ConceptTrainer(OvercookedEnvTrainer):
         total_loss = uncond_loss + weighted_cond_loss
         return total_loss
     
-    
+class OvercookedActionProposal(Trainer):
+    def __init__(self,
+                 diffusion_model,
+                 train_set,
+                 valid_set,
+                 channels,
+                 *,
+                 train_batch_size=1,
+                 valid_batch_size=1,
+                 gradient_accumulate_every=1,
+                 train_lr=0.0001,
+                 train_num_steps=100000,
+                 ema_update_every=10,
+                 ema_decay=0.995,
+                 adam_betas=(0.9, 0.99),
+                 save_and_sample_every=5000,
+                 num_samples=3,
+                 results_folder='./results',
+                 amp=True,
+                 fp16=True,
+                 split_batches=True,
+                 cond_drop_chance=0.0,
+                 save_milestone=True,
+                 debug=False,
+                 dummy_policy_id=None,
+                 wandb_enabled=False,
+                 wandb_project="overcooked-action-proposal-diffusion",
+                 wandb_entity="social-rl",
+                 wandb_run_name=None
+                ):
+        
+        super().__init__(diffusion_model,
+                         None,
+                         None,
+                         train_set=train_set,
+                         valid_set=valid_set,
+                         channels=channels,
+                         train_batch_size=train_batch_size,
+                         valid_batch_size=valid_batch_size,
+                         gradient_accumulate_every=gradient_accumulate_every,
+                         train_lr=train_lr,
+                         train_num_steps=train_num_steps,
+                         ema_update_every=ema_update_every,
+                         ema_decay=ema_decay,
+                         adam_betas=adam_betas,
+                         save_and_sample_every=save_and_sample_every,
+                         num_samples=num_samples,
+                         results_folder=results_folder,
+                         amp=amp,
+                         fp16=fp16,
+                         split_batches=split_batches,
+                         calculate_fid=False,
+                         cond_drop_chance=cond_drop_chance,
+                         save_milestone=save_milestone,
+                         embed_preprocessed=True)
+        
+        # Dataset Setup
+        dl = DataLoader(self.ds, batch_size = self.batch_size, shuffle = True, pin_memory = True, num_workers = 4, collate_fn=self.action_overcooked_collate_fn)
+        dl = self.accelerator.prepare(dl)
+        self.dl = cycle(dl)
+
+        if self.valid_ds:
+            valid_dl = DataLoader(self.valid_ds, batch_size=self.valid_batch_size, shuffle=True, pin_memory=True, num_workers=4, collate_fn=self.action_overcooked_collate_fn)
+            self.valid_dl = self.accelerator.prepare(valid_dl)
+        else:
+            self.valid_dl = None
+        
+        self.debug = debug
+        self.renderer = OvercookedSampleRenderer()
+        self.wandb_enabled = wandb_enabled
+        
+        config_to_log = {
+            # Trainer parameters
+            "learning_rate": train_lr,
+            "train_batch_size": train_batch_size,
+            "valid_batch_size": valid_batch_size,
+            "gradient_accumulate_every": gradient_accumulate_every,
+            "train_num_steps": train_num_steps,
+            "ema_update_every": ema_update_every,
+            "ema_decay": ema_decay,
+            "adam_beta1": adam_betas[0],
+            "adam_beta2": adam_betas[1],
+            "save_and_sample_every": save_and_sample_every,
+            "num_validation_samples": num_samples,
+            "amp_enabled": amp,
+            "fp16_enabled": fp16,
+            "accelerator_split_batches": split_batches,
+            "cond_drop_chance": cond_drop_chance,
+            "save_milestone_checkpoints": save_milestone,
+            "debug_mode": self.debug,
+            
+            # Dataset parameters
+            "dataset_type": train_set.__class__.__name__,
+            "dataset_horizon": train_set.horizon if hasattr(train_set, 'horizon') else 'N/A',
+            "dataset_max_path_length": train_set.max_path_length if hasattr(train_set, 'max_path_length') else 'N/A',
+            "dataset_use_padding": train_set.use_padding if hasattr(train_set, 'use_padding') else 'N/A',
+
+            # Diffusion model (GoalGaussianDiffusion) parameters
+            "diffusion_model_type": diffusion_model.__class__.__name__,
+            "diffusion_total_input_channels": diffusion_model.channels, # Total channels for the diffusion model
+            "diffusion_image_height": diffusion_model.image_size[0],
+            "diffusion_image_width": diffusion_model.image_size[1],
+            "diffusion_objective": diffusion_model.objective,
+            "diffusion_loss_type": diffusion_model.loss_type,
+            "diffusion_timesteps_total": diffusion_model.num_timesteps,
+            "diffusion_sampling_timesteps": diffusion_model.sampling_timesteps,
+            "diffusion_guidance_weight": diffusion_model.guidance_weight,
+            "diffusion_ddim_sampling_eta": diffusion_model.ddim_sampling_eta,
+
+            # Unet parameters
+            "unet_model_channels": diffusion_model.model.unet.model_channels if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_res_blocks": diffusion_model.model.unet.num_res_blocks if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_attention_resolutions": str(diffusion_model.model.unet.attention_resolutions) if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_channel_mult": str(diffusion_model.model.unet.channel_mult) if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_classes": diffusion_model.model.unet.num_classes if hasattr(diffusion_model.model, 'unet') else 'N/A',
+        }
+        
+        
+        if not self.debug and self.wandb_enabled and self.accelerator.is_local_main_process:
+            final_wandb_run_name = wandb_run_name if wandb_run_name else f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            wandb.init(project=wandb_project, entity=wandb_entity, name=final_wandb_run_name, config=config_to_log)
+        self.num_classes = 6
+
+    @staticmethod
+    def action_overcooked_collate_fn(samples):
+        # samples is a list of (x_item, x_cond_item, task_emb_id_item)
+        # For action dataset:
+        # x_item: action sequence (Horizon,) - future actions
+        # x_cond_item: observation (H, W, C) - current state
+        # task_emb_id_item: int - partner policy ID
+        
+        x_list = [s[0] for s in samples] # Action sequences
+        x_cond_list = [s[1] for s in samples] # Current observations
+        task_emb_id_list = [s[2] for s in samples]
+
+        x_batch = torch.stack(x_list) # (B, Horizon, H, W, C)
+
+        x_cond_single_frame_batch = torch.stack([s[1][-1] for s in samples]) # (B, H, W, C)
+
+        task_emb_id_batch = torch.tensor(task_emb_id_list, dtype=torch.long)
+        
+        # Return structure: x, x_cond, policy_ids
+        return x_batch, x_cond_single_frame_batch, task_emb_id_batch
+    def train_one_step(self):
+        total_loss = 0
+        for _ in range(self.gradient_accumulate_every):
+            x, x_cond, _ = next(self.dl) # 
+            x, x_cond = x.to(self.device), x_cond.to(self.device)
+            # x.shape : (B, Horizon, A) [32,32,1]
+            x_cond = rearrange(x_cond, "b h w c -> b c h w")
+            x = F.one_hot(x, num_classes=self.num_classes).float() #[B Horizon, A, num_classes]
+            x = rearrange(x, "b f a n -> b (f n) a 1") #[B, Horizon * num_classes, A, 1]
+
+
+            with self.accelerator.autocast():
+                loss = self.model(x, x_cond)
+                loss = loss / self.gradient_accumulate_every
+                total_loss += loss.item()
+
+                self.accelerator.backward(loss)
+        
+        if self.accelerator.is_local_main_process and not self.debug:
+            wandb.log({
+                "train/loss": total_loss,
+                "train/step": self.step
+            })
+        
+        return total_loss
+    @torch.no_grad()
+    def valid_one_step(self):
+        return 0.0
+        if not self.valid_dl:
+            return 0.0
+
+        total_valid_loss = []
+        total_unconditional_loss = []
+        viz_output_dir = os.path.join(self.results_folder, "viz")
+        os.makedirs(viz_output_dir, exist_ok=True)
+        ch_output_dir = os.path.join(self.results_folder, "channels")
+        os.makedirs(ch_output_dir, exist_ok=True)
+
+        wandb_videos = {
+            "predicted": None,
+            "argmax": None,
+            "reference": None,
+            "unconditional": None
+        }
+        for x_org, x_cond, policy_id in self.valid_dl:
+            B, *_ = x_org.shape
+            x = rearrange(x_org, "b f h w c -> b (f c) h w")
+            x_cond = rearrange(x_cond, "b h w c -> b c h w")
+            loss = self.model(x, x_cond, task_embed=policy_id)
+
+            dummy_cond = torch.ones_like(policy_id)*self.dummy_id
+            uncond_loss = self.model(x, x_cond, task_embed=dummy_cond)
+
+            total_valid_loss.append(loss)
+            total_unconditional_loss.append(uncond_loss)
+
+            horizon = self.model.model.horizon
+            C = self.model.model.C           
+            
+            pred_traj = self.ema.ema_model.sample(
+                x_cond=x_cond,
+                task_embed = policy_id,
+                batch_size=B,
+            )
+
+            uncond_pred_traj = self.ema.ema_model.sample(
+                x_cond=x_cond,
+                task_embed=dummy_cond,
+                batch_size=B,
+            )
+            # Process conditional trajectory
+            pred_traj = rearrange(pred_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
+            pred_traj = pred_traj.cpu().numpy()
+            argmax_pred = self.renderer.arg_max(pred_traj[..., :2])
+            argmax_traj = np.concatenate([argmax_pred, pred_traj[..., 2:]], axis=-1)
+
+            # Process unconditional trajectory
+            uncond_pred_traj = rearrange(uncond_pred_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
+            uncond_pred_traj = uncond_pred_traj.cpu().numpy()
+
+            grid = self.renderer.extract_grid_from_obs(x_org.cpu().numpy()[0, 0])
+            for i in range(B):
+                pred_traj_path = os.path.join(viz_output_dir, f"pred_traj_step_{self.step}_batch_{i}.mp4")
+                self.renderer.render_trajectory_video(
+                    pred_traj[i],
+                    grid=grid,
+                    output_dir=viz_output_dir,
+                    video_path=pred_traj_path,
+                    fps=1,
+                    normalize=True,
+                )
+
+                arg_pred_traj_path = os.path.join(viz_output_dir, f"argmax_pred_traj_step_{self.step}_batch_{i}.mp4")
+                self.renderer.render_trajectory_video(
+                    argmax_traj[i],
+                    grid=grid,
+                    output_dir=viz_output_dir,
+                    video_path=arg_pred_traj_path,
+                    fps=1,
+                    normalize=True,
+                )
+                ref_traj_path = os.path.join(viz_output_dir, f"reference_traj_step_{self.step}_batch_{i}.mp4")
+                self.renderer.render_trajectory_video(
+                        x_org.cpu().numpy()[i], 
+                        grid=grid, 
+                        output_dir=viz_output_dir, 
+                        video_path=ref_traj_path,
+                        fps=1,
+                        normalize=True,
+                )
+
+                uncond_traj_path = os.path.join(viz_output_dir, f"uncond_traj_step_{self.step}_batch_{i}.mp4")
+                self.renderer.render_trajectory_video(
+                    uncond_pred_traj[i],
+                    grid=grid,
+                    output_dir=viz_output_dir,
+                    video_path=uncond_traj_path,
+                    fps=1,
+                    normalize=True,
+                )
+
+                if i == 0:
+                    wandb_videos["predicted"] = pred_traj_path
+                    wandb_videos["argmax"] = arg_pred_traj_path
+                    wandb_videos["reference"] = ref_traj_path
+                    wandb_videos["unconditional"] = uncond_traj_path
+
+                if i + 1 == B:
+                    ch_max = min(26, B)
+                    for j in range(ch_max):
+                        ch_path = os.path.join(ch_output_dir, f"pred_channels_step_{self.step}_batch_{i}_frame_{j}.png")
+                        self.renderer.visualize_all_channels(
+                            obs=pred_traj[i, j],
+                            output_dir=ch_path
+                        )
+                        argmax_ch_path = os.path.join(ch_output_dir, f"arg_max_pred_channels_step_{self.step}_batch_{i}_frame_{j}.png")
+                        self.renderer.visualize_all_channels(
+                            obs=argmax_traj[i, j],
+                            output_dir=argmax_ch_path
+                        )
+        valid_loss = sum(total_valid_loss) / len(total_valid_loss)
+        uncond_loss = sum(total_unconditional_loss) / len(total_unconditional_loss)
+
+        if self.wandb_enabled and self.accelerator.is_local_main_process and not self.debug:
+            wandb_log_dict = {
+                "evaluation/loss": valid_loss,
+                "evaluation/unconditional_loss": uncond_loss,
+            }
+            for video_type, video_path in wandb_videos.items():
+                if video_path and os.path.exists(video_path):
+                    wandb_log_dict[f"evaluation/{video_type}_trajectory"] = wandb.Video(
+                        video_path, 
+                        fps=2, 
+                        format="mp4",
+                        caption=f"{video_type.capitalize()} trajectory at step {self.step}"
+                    )
+            wandb.log(wandb_log_dict, step=self.step)
+        return valid_loss
     
     
         
