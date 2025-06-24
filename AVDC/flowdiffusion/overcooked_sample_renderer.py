@@ -488,3 +488,13 @@ class OvercookedSampleRenderer:
             plt.savefig(output_dir, bbox_inches='tight', dpi=150)
             print(f"All channels heatmap saved to {output_dir}")
         plt.close(fig)
+    def get_player_position(self, obs, player_idx=0, eps=1e-4):
+        """Extract player position from observation."""
+        player_loc_ch = self.CHANNEL_FEATURE_MAP[f"player_{player_idx}_loc"]
+        player_locs = np.argwhere(obs[:, :, player_loc_ch] >= (1-eps))
+        
+        if len(player_locs) > 0:
+            player_y, player_x = player_locs[0]
+            return (player_x, player_y)
+        return None
+

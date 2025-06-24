@@ -2143,34 +2143,22 @@ class OvercookedActionProposal(Trainer):
 
     @staticmethod
     def action_overcooked_collate_fn(samples):
-        # samples is a list of (x_item, x_cond_item, task_emb_id_item)
-        # For action dataset:
-        # x_item: action sequence (Horizon,) - future actions
-        # x_cond_item: observation (H, W, C) - current state
-        # task_emb_id_item: int - partner policy ID
-        
-        x_list = [s[0] for s in samples] # Action sequences
-        x_cond_list = [s[1] for s in samples] # Current observations
-        task_emb_id_list = [s[2] for s in samples]
+        # Unzip the samples into separate lists
+        x, x_cond = zip(*samples)
 
-        x_batch = torch.stack(x_list) # (B, Horizon, H, W, C)
+        # Stack directly into tensors
+        x = torch.stack(x) #(B, Horizon, A)
+        x_cond = torch.stack(x_cond)  # (B, H, W, C)
+        return x, x_cond
 
-        x_cond_single_frame_batch = torch.stack([s[1][-1] for s in samples]) # (B, H, W, C)
-
-        task_emb_id_batch = torch.tensor(task_emb_id_list, dtype=torch.long)
-        
-        # Return structure: x, x_cond, policy_ids
-        return x_batch, x_cond_single_frame_batch, task_emb_id_batch
     def train_one_step(self):
         total_loss = 0
         for _ in range(self.gradient_accumulate_every):
-            x, x_cond, _ = next(self.dl) # 
+            x, x_cond= next(self.dl) 
             x, x_cond = x.to(self.device), x_cond.to(self.device)
-            # x.shape : (B, Horizon, A) [32,32,1]
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
             x = F.one_hot(x, num_classes=self.num_classes).float() #[B Horizon, A, num_classes]
             x = rearrange(x, "b f a n -> b (f n) a 1") #[B, Horizon * num_classes, A, 1]
-
 
             with self.accelerator.autocast():
                 loss = self.model(x, x_cond)

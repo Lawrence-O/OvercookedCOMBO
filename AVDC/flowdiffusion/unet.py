@@ -143,10 +143,11 @@ class UnetOvercookedActionProposal(nn.Module):
         self.num_actions = num_actions
         self.unet = UNetModel(
             image_size=(1, 1),
-            in_channels=self.C * 2,
+            in_channels=self.num_actions,
             model_channels=128,
-            out_channels=self.C,
+            out_channels=self.num_actions,
             num_res_blocks=2,
+            image_cond_dim=(self.C, self.H, self.W),
             attention_resolutions=(8, 16),
             dropout=0,
             channel_mult=(1, 2),
@@ -161,22 +162,8 @@ class UnetOvercookedActionProposal(nn.Module):
         )
     
     def forward(self, x, x_cond, t, task_embed=None, vis=None, **kwargs):
-        ### THIS IS IN ACTION PROPOSAL MODEL
-        print(x.shape, x_cond.shape, t.shape)
-        x = rearrange(x, "b (f n) 1 1 -> b f n 1 1",  n=self.num_actions) #[32, 32,6, 1,1 ]
-        # x_cond: [32, 32, 26, 8, 5]
-        B, T, *_ = x.shape
-        print(x.shape, x[0, 0, 0, 0, 0])
-        exit()
-        x = rearrange(x, 'b f h w c -> b c f h w')
-        x_cond = rearrange(x_cond, "b c h w -> b h w c")
-        x_cond = self.pad_even(x_cond)
-        x_cond = rearrange(x_cond, 'b h w c -> b c 1 h w')
-        x_cond = repeat(x_cond, 'b c 1 h w -> b c f h w', f=self.horizon)
-        x = torch.cat([x, x_cond], dim=1)
-        out = self.unet(x, t, task_embed, **kwargs)
+        out = self.unet(x, t, task_embed, image_embed=x_cond, **kwargs)
         out = rearrange(out, 'b c f h w -> b f h w c')
-        out = out[:, :, :H, :W, :]
         out = rearrange(out, "b f h w c -> b (f c) h w")
         return out
       

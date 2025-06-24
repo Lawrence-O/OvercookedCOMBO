@@ -4,8 +4,7 @@ import numpy as np
 import pickle
 from hdf5_dataset import HDF5Dataset
 class OvercookedSequenceDataset(torch.utils.data.Dataset):
-    # policies = ["sp1_final", "sp2_final", "sp3_final", "sp4_final", "sp5_final", "sp9_final", "bc_train"]
-    policies = ["sp1_final", "bc_train"]
+    policies = ["sp1_final", "sp2_final", "sp3_final", "sp4_final", "sp5_final", "sp9_final", "bc_train"]
     def __init__(self, args, split="train", allowed_policies=policies):
 
         self.args = args
@@ -189,9 +188,6 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         
         obs = self.actual_norm(to_np(obs))
 
-        # player_loc_orietnations = obs[:, :, :, :, :10]
-        # dish_onions = obs[:, :, :, :, 22:24]
-        # obs = np.concatenate([player_loc_orietnations, dish_onions], axis=-1)
         if obs.ndim == 4:
             obs = np.expand_dims(obs, axis=1)            
         T, _, H, W, C = obs.shape # Time, Agent, Height, Width, Channel 
@@ -342,9 +338,9 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.dataset.__len__()
     
-    def __getitem__(self, idx, condition_single_input=True):
+    def __getitem__(self, idx):
 
-        obs, actions, policy_id = self.dataset.__getitem__(idx)
+        obs, actions, _ = self.dataset.__getitem__(idx)
 
         # obs: horizon x agent_num (2) x H x W x C
         # actions: horizon x 2 x action dim (1) 
@@ -352,39 +348,29 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         
         obs = self.actual_norm(to_np(obs))
 
-        # player_loc_orietnations = obs[:, :, :, :, :10]
-        # dish_onions = obs[:, :, :, :, 22:24]
-        # obs = np.concatenate([player_loc_orietnations, dish_onions], axis=-1)
         if obs.ndim == 4:
             obs = np.expand_dims(obs, axis=1)
 
         T, _, H, W, C = obs.shape # Time, Agent, Height, Width, Channel 
         # Get Ego Agent Observation (Agent ID  = 0)
-        start = random.randint(1, T - self.horizon)
+        start = random.randint(1, T - self.horizon - 1)
         end = start + self.horizon
         future_actions = actions[start:end, 0]
-        future_actions = future_actions.long()
         
-        # Condition on Past Trajectory or Previous Start State
-        conditions_obs = obs[start-1, 0] if condition_single_input else obs[:start, 0]
-
-        # Create a Mask for Valid Condition Observations
-        valid_len = 1 if condition_single_input else start
-        cond_inputs = np.zeros((self.horizon, H, W, C), dtype=np.float32)
-        cond_masks = np.zeros((self.horizon), dtype=np.float32)
-        cond_inputs[-valid_len:] = conditions_obs
-        cond_masks[-valid_len:] = 1.0
+        # Condition on Start State
+        conditions_obs = obs[start-1, 0]
 
         # Actions Shape: (Horizon, 1)
         # Conditions Shape : (1)
         # Condition Inputs: (valid_len, H, W, C)
         # Condition Masks : (valid_len,)
-        x = future_actions.long()
-        x_cond = torch.from_numpy(cond_inputs)
+        x = future_actions
+        x_cond = torch.from_numpy(conditions_obs)
 
         assert x.min() >= 0 and x.max() < 6, f"Actions must be in [0, 6), got range [{x.min()}, {x.max()}]"
         assert x_cond.min() >= -1.0 and x_cond.max() <= 1.0
-        return x, x_cond, policy_id[1]
+        
+        return x, x_cond
 
 
 

@@ -447,6 +447,7 @@ class UNetModel(nn.Module):
         num_classes=None,
         task_tokens=True,
         num_actions=None,
+        image_cond_dim=None,
         action_horizon=None,
         task_token_channels=512,
         use_checkpoint=False,
@@ -481,6 +482,7 @@ class UNetModel(nn.Module):
         self.num_heads = num_heads
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
+        self.image_cond_dim = image_cond_dim
 
         time_embed_dim = model_channels * 4
         self.time_embed = nn.Sequential(
@@ -491,16 +493,32 @@ class UNetModel(nn.Module):
 
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+
         if task_tokens:
             self.task_attnpool = nn.Sequential(
                 PerceiverResampler(dim=task_token_channels, depth=2),
                 nn.Linear(task_token_channels, time_embed_dim),
             )
+
         if self.num_actions is not None and self.action_horizon is not None:
             self.action_cond = nn.Sequential(
                 nn.Linear(num_actions * action_horizon, time_embed_dim),
                 nn.SiLU(),
                 nn.Linear(time_embed_dim, time_embed_dim),
+            )
+        
+        if image_cond_dim is not None:
+            C, _, _ = image_cond_dim
+            self.obs_encoder = nn.Sequential(
+                nn.Conv2d(C, 128, kernel_size=3, padding=1, stride=1), # [128, H, W]
+                nn.ReLU(),
+                nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=1), # [256, H, W]
+                nn.ReLU(),
+                nn.AdaptiveAvgPool2d((1, 1)), # [256, 1, 1]
+                nn.Flatten(), # [256]
+                nn.Linear(256, time_embed_dim), # [512]
+                nn.ReLU(),
+                nn.Linear(time_embed_dim, time_embed_dim) # [512]
             )
 
         ch = input_ch = int(channel_mult[0] * model_channels)
@@ -657,7 +675,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y=None, action_embed=None, mask=None):
+    def forward(self, x, timesteps, y=None, action_embed=None, image_embed=None, mask=None):
         """
         Apply the model to an input batch.
 
@@ -679,9 +697,16 @@ class UNetModel(nn.Module):
         
         if self.num_actions is not None and self.action_horizon is not None:
             B, K, A = action_embed.shape
+            assert B == x.shape[0]
+            assert K == self.action_horizon
+            assert A == self.num_actions
             action_embed_flat = action_embed.view(B, K * A)
-            assert action_embed_flat.shape[0] == x.shape[0]
             emb = emb + self.action_cond(action_embed_flat)
+        
+        if image_embed is not None and self.image_cond_dim is not None:
+            assert image_embed.shape[0] == x.shape[0]
+            assert image_embed.ndim == 4, f"Expected image_embed to be 4D, got {image_embed.ndim}D"
+            emb = emb + self.obs_encoder(image_embed)
         
         if self.task_tokens:
             label_emb = self.task_attnpool(y).mean(dim=1)
