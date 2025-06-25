@@ -275,6 +275,7 @@ class AttentionBlock(nn.Module):
         num_head_channels=-1,
         use_checkpoint=False,
         use_new_attention_order=False,
+        dims=3,
     ):
         super().__init__()
         self.channels = channels
@@ -296,19 +297,35 @@ class AttentionBlock(nn.Module):
             self.attention = QKVAttentionLegacy(self.num_heads)
 
         self.proj_out = conv_nd(1, channels, channels, 1)
+        self.dims = dims
 
     def forward(self, x):
         return checkpoint(self._forward, (x,), self.parameters(), True)
 
     def _forward(self, x):
-        b, c, f, *spatial = x.shape
-        x = rearrange(x, "b c f x y -> (b f) c (x y)")
-        qkv = self.qkv(self.norm(x))
-        h = self.attention(qkv)
-        h = self.proj_out(h)
-        return rearrange((x + h), "(b f) c (x y) -> b c f x y", c=c, f=f, x=spatial[0], y=spatial[1])
-   
-
+        b, c, *spatial = x.shape
+        if self.dims == 1:
+            assert len(spatial) == 1, "1D attention requires 1 spatial dimension"
+            qkv = self.qkv(self.norm(x))
+            h = self.attention(qkv)
+            h = self.proj_out(h)
+            return x + h
+        elif self.dims == 2:
+            assert len(spatial) == 2, "2D attention requires 2 spatial dimensions"
+            x = rearrange(x, "b c x y -> b c (x y)")
+            qkv = self.qkv(self.norm(x))
+            h = self.attention(qkv)
+            h = self.proj_out(h)
+            return rearrange((x + h), "b c (x y) -> b c x y", c=c, x=spatial[0], y=spatial[1])
+        elif self.dims == 3:
+            assert len(spatial) == 3, "3D attention requires 3 spatial dimensions"
+            x = rearrange(x, "b c f x y -> (b f) c (x y)")
+            qkv = self.qkv(self.norm(x))
+            h = self.attention(qkv)
+            h = self.proj_out(h)
+            return rearrange((x + h), "(b f) c (x y) -> b c f x y", c=c, f=f, x=spatial[0], y=spatial[1])
+        else:
+            raise ValueError(f"Unsupported dimension: {self.dims}. Only 1D, 2D, and 3D are supported.")
 def count_flops_attn(model, _x, y):
     """
     A counter for the `thop` package to count the operations in an
@@ -550,6 +567,7 @@ class UNetModel(nn.Module):
                             num_heads=num_heads,
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
+                            dims=dims,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -595,6 +613,7 @@ class UNetModel(nn.Module):
                 num_heads=num_heads,
                 num_head_channels=num_head_channels,
                 use_new_attention_order=use_new_attention_order,
+                dims=dims,
             ),
             ResBlock(
                 ch,
@@ -631,6 +650,7 @@ class UNetModel(nn.Module):
                             num_heads=num_heads_upsample,
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
+                            dims=dims,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -711,6 +731,7 @@ class UNetModel(nn.Module):
         if self.task_tokens:
             label_emb = self.task_attnpool(y).mean(dim=1)
             emb = emb + label_emb
+
         h = x.type(self.dtype)
         for module in self.input_blocks:
             h = module(h, emb)
@@ -824,6 +845,7 @@ class EncoderUNetModel(nn.Module):
                             num_heads=num_heads,
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
+                            dims=dims,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -869,6 +891,7 @@ class EncoderUNetModel(nn.Module):
                 num_heads=num_heads,
                 num_head_channels=num_head_channels,
                 use_new_attention_order=use_new_attention_order,
+                dims=dims,
             ),
             ResBlock(
                 ch,

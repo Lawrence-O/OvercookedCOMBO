@@ -339,7 +339,7 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         return self.dataset.__len__()
     
     def __getitem__(self, idx):
-
+        idx = 0
         obs, actions, _ = self.dataset.__getitem__(idx)
 
         # obs: horizon x agent_num (2) x H x W x C
@@ -366,6 +366,7 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         # Condition Masks : (valid_len,)
         x = future_actions
         x_cond = torch.from_numpy(conditions_obs)
+        
 
         assert x.min() >= 0 and x.max() < 6, f"Actions must be in [0, 6), got range [{x.min()}, {x.max()}]"
         assert x_cond.min() >= -1.0 and x_cond.max() <= 1.0

@@ -1626,7 +1626,7 @@ class OvercookedEnvTrainer(Trainer):
             
             pred_traj = self.ema.ema_model.sample(
                 x_cond=x_cond,
-                task_embed = policy_id,
+                task_embed=policy_id,
                 action_embed=actions,
                 batch_size=B,
             )
@@ -1639,12 +1639,14 @@ class OvercookedEnvTrainer(Trainer):
             )
             # Process conditional trajectory
             pred_traj = rearrange(pred_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
+            pred_traj = rearrange(pred_traj, "b f h w c -> b f w h c")
             pred_traj = pred_traj.cpu().numpy()
             argmax_pred = self.renderer.arg_max(pred_traj[..., :2])
             argmax_traj = np.concatenate([argmax_pred, pred_traj[..., 2:]], axis=-1)
 
             # Process unconditional trajectory
             uncond_pred_traj = rearrange(uncond_pred_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
+            uncond_pred_traj = rearrange(uncond_pred_traj, "b f h w c -> b f w h c")
             uncond_pred_traj = uncond_pred_traj.cpu().numpy()
 
             grid = self.renderer.extract_grid_from_obs(x_org.cpu().numpy()[0, 0])
@@ -2153,12 +2155,13 @@ class OvercookedActionProposal(Trainer):
 
     def train_one_step(self):
         total_loss = 0
+
         for _ in range(self.gradient_accumulate_every):
             x, x_cond= next(self.dl) 
             x, x_cond = x.to(self.device), x_cond.to(self.device)
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
-            x = F.one_hot(x, num_classes=self.num_classes).float() #[B Horizon, A, num_classes]
-            x = rearrange(x, "b f a n -> b (f n) a 1") #[B, Horizon * num_classes, A, 1]
+            x = F.one_hot(x, num_classes=self.num_classes).float() #[B, Horizon, action dim, num_classes]
+            x = rearrange(x, "b f a n -> b (f n) a 1") #[B, Horizon * num_classes, action dim, 1]
 
             with self.accelerator.autocast():
                 loss = self.model(x, x_cond)
@@ -2167,7 +2170,7 @@ class OvercookedActionProposal(Trainer):
 
                 self.accelerator.backward(loss)
         
-        if self.accelerator.is_local_main_process and not self.debug:
+        if self.accelerator.is_local_main_process and not self.debug and self.wandb_enabled:
             wandb.log({
                 "train/loss": total_loss,
                 "train/step": self.step
@@ -2176,137 +2179,86 @@ class OvercookedActionProposal(Trainer):
         return total_loss
     @torch.no_grad()
     def valid_one_step(self):
-        return 0.0
         if not self.valid_dl:
             return 0.0
 
         total_valid_loss = []
-        total_unconditional_loss = []
         viz_output_dir = os.path.join(self.results_folder, "viz")
         os.makedirs(viz_output_dir, exist_ok=True)
-        ch_output_dir = os.path.join(self.results_folder, "channels")
-        os.makedirs(ch_output_dir, exist_ok=True)
 
         wandb_videos = {
-            "predicted": None,
-            "argmax": None,
-            "reference": None,
-            "unconditional": None
+            "action_sequence": None,
+            "ref_action_sequence": None,
         }
-        for x_org, x_cond, policy_id in self.valid_dl:
-            B, *_ = x_org.shape
-            x = rearrange(x_org, "b f h w c -> b (f c) h w")
-            x_cond = rearrange(x_cond, "b h w c -> b c h w")
-            loss = self.model(x, x_cond, task_embed=policy_id)
 
-            dummy_cond = torch.ones_like(policy_id)*self.dummy_id
-            uncond_loss = self.model(x, x_cond, task_embed=dummy_cond)
-
-            total_valid_loss.append(loss)
-            total_unconditional_loss.append(uncond_loss)
-
-            horizon = self.model.model.horizon
-            C = self.model.model.C           
+        for x_org, x_cond in self.valid_dl:
+            B, horizon, *_ = x_org.shape
+            x_cond_rearranged = rearrange(x_cond, "b h w c -> b c h w")
             
-            pred_traj = self.ema.ema_model.sample(
-                x_cond=x_cond,
-                task_embed = policy_id,
+            # Convert actions to one-hot for loss calculation
+            x_one_hot = F.one_hot(x_org, num_classes=self.num_classes).float()
+            x = rearrange(x_one_hot, "b f a n -> b (f n) a 1")
+
+            # Calculate loss
+            loss = self.model(x, x_cond_rearranged)
+            total_valid_loss.append(loss)
+
+            # Sample predicted actions
+            pred_actions = self.ema.ema_model.sample(
+                x_cond=x_cond_rearranged,
                 batch_size=B,
             )
+            
+            # Convert predictions back to discrete actions
+            # pred_actions shape: [B, (horizon * num_classes), 1, 1]
+            pred_actions = pred_actions.view(B, horizon, self.num_classes)
+            pred_actions = torch.argmax(pred_actions, dim=-1)  # [B, horizon]
 
-            uncond_pred_traj = self.ema.ema_model.sample(
-                x_cond=x_cond,
-                task_embed=dummy_cond,
-                batch_size=B,
-            )
-            # Process conditional trajectory
-            pred_traj = rearrange(pred_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
-            pred_traj = pred_traj.cpu().numpy()
-            argmax_pred = self.renderer.arg_max(pred_traj[..., :2])
-            argmax_traj = np.concatenate([argmax_pred, pred_traj[..., 2:]], axis=-1)
-
-            # Process unconditional trajectory
-            uncond_pred_traj = rearrange(uncond_pred_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
-            uncond_pred_traj = uncond_pred_traj.cpu().numpy()
-
-            grid = self.renderer.extract_grid_from_obs(x_org.cpu().numpy()[0, 0])
-            for i in range(B):
-                pred_traj_path = os.path.join(viz_output_dir, f"pred_traj_step_{self.step}_batch_{i}.mp4")
-                self.renderer.render_trajectory_video(
-                    pred_traj[i],
-                    grid=grid,
-                    output_dir=viz_output_dir,
-                    video_path=pred_traj_path,
-                    fps=1,
-                    normalize=True,
+            # Visualize action sequences for each batch
+            x_cond = rearrange(x_cond, "b h w c -> b w h c")
+            for i in range(min(B, 4)):  # Limit to 4 samples
+                # Create action sequence video
+                action_video_path = os.path.join(viz_output_dir, 
+                                            f"action_seq_step_{self.step}_batch_{i}.mp4")
+                self.renderer.visualize_action_sequence_video(
+                    x_cond[i].cpu().numpy(),  
+                    pred_actions[i, :].cpu(),      
+                    action_video_path,
+                    player_idx=0,            
+                    fps=1                    
                 )
-
-                arg_pred_traj_path = os.path.join(viz_output_dir, f"argmax_pred_traj_step_{self.step}_batch_{i}.mp4")
-                self.renderer.render_trajectory_video(
-                    argmax_traj[i],
-                    grid=grid,
-                    output_dir=viz_output_dir,
-                    video_path=arg_pred_traj_path,
-                    fps=1,
-                    normalize=True,
+                ref_action_video_path = os.path.join(
+                    viz_output_dir, f"ref_action_seq_step_{self.step}_batch_{i}.mp4"
                 )
-                ref_traj_path = os.path.join(viz_output_dir, f"reference_traj_step_{self.step}_batch_{i}.mp4")
-                self.renderer.render_trajectory_video(
-                        x_org.cpu().numpy()[i], 
-                        grid=grid, 
-                        output_dir=viz_output_dir, 
-                        video_path=ref_traj_path,
-                        fps=1,
-                        normalize=True,
+                self.renderer.visualize_action_sequence_video(
+                    x_cond[i].cpu().numpy(),
+                    x_org[i, :].cpu().numpy(),
+                    ref_action_video_path,
+                    player_idx=0,
+                    fps=1
                 )
-
-                uncond_traj_path = os.path.join(viz_output_dir, f"uncond_traj_step_{self.step}_batch_{i}.mp4")
-                self.renderer.render_trajectory_video(
-                    uncond_pred_traj[i],
-                    grid=grid,
-                    output_dir=viz_output_dir,
-                    video_path=uncond_traj_path,
-                    fps=1,
-                    normalize=True,
-                )
-
+                
                 if i == 0:
-                    wandb_videos["predicted"] = pred_traj_path
-                    wandb_videos["argmax"] = arg_pred_traj_path
-                    wandb_videos["reference"] = ref_traj_path
-                    wandb_videos["unconditional"] = uncond_traj_path
-
-                if i + 1 == B:
-                    ch_max = min(26, B)
-                    for j in range(ch_max):
-                        ch_path = os.path.join(ch_output_dir, f"pred_channels_step_{self.step}_batch_{i}_frame_{j}.png")
-                        self.renderer.visualize_all_channels(
-                            obs=pred_traj[i, j],
-                            output_dir=ch_path
-                        )
-                        argmax_ch_path = os.path.join(ch_output_dir, f"arg_max_pred_channels_step_{self.step}_batch_{i}_frame_{j}.png")
-                        self.renderer.visualize_all_channels(
-                            obs=argmax_traj[i, j],
-                            output_dir=argmax_ch_path
-                        )
-        valid_loss = sum(total_valid_loss) / len(total_valid_loss)
-        uncond_loss = sum(total_unconditional_loss) / len(total_unconditional_loss)
+                    wandb_videos["action_sequence"] = action_video_path
+                    wandb_videos["ref_action_sequence"] = ref_action_video_path
+                
+        valid_loss = sum(total_valid_loss) / len(total_valid_loss) if total_valid_loss else 0.0
 
         if self.wandb_enabled and self.accelerator.is_local_main_process and not self.debug:
             wandb_log_dict = {
                 "evaluation/loss": valid_loss,
-                "evaluation/unconditional_loss": uncond_loss,
             }
             for video_type, video_path in wandb_videos.items():
                 if video_path and os.path.exists(video_path):
-                    wandb_log_dict[f"evaluation/{video_type}_trajectory"] = wandb.Video(
+                    wandb_log_dict[f"evaluation/{video_type}"] = wandb.Video(
                         video_path, 
                         fps=2, 
                         format="mp4",
-                        caption=f"{video_type.capitalize()} trajectory at step {self.step}"
+                        caption=f"{video_type.replace('_', ' ').capitalize()} at step {self.step}"
                     )
+            
             wandb.log(wandb_log_dict, step=self.step)
+        
         return valid_loss
-    
     
         

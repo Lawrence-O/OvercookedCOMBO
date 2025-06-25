@@ -86,7 +86,7 @@ class UnetOvercooked(nn.Module):
             model_channels=128,
             out_channels=self.C,
             num_res_blocks=2,
-            attention_resolutions=(8, 16),
+            attention_resolutions=(8, 16), # TODO: Change to 2,4; we're currently not using attention
             dropout=0,
             channel_mult=(1, 2),
             conv_resample=True,
@@ -142,30 +142,39 @@ class UnetOvercookedActionProposal(nn.Module):
         self.H, self.W, self.C  = obs_dim
         self.num_actions = num_actions
         self.unet = UNetModel(
-            image_size=(1, 1),
+            image_size=(horizon,),
             in_channels=self.num_actions,
             model_channels=128,
             out_channels=self.num_actions,
             num_res_blocks=2,
             image_cond_dim=(self.C, self.H, self.W),
-            attention_resolutions=(8, 16),
+            attention_resolutions=(4, 8),
             dropout=0,
-            channel_mult=(1, 2),
+            channel_mult=(1, 2, 4),
             conv_resample=True,
-            dims=3,
+            dims=1,
             num_classes=None,
             task_tokens=False,
-            task_token_channels=512,
             use_checkpoint=False,
             use_fp16=False,
             num_head_channels=32,
         )
-    
-    def forward(self, x, x_cond, t, task_embed=None, vis=None, **kwargs):
-        out = self.unet(x, t, task_embed, image_embed=x_cond, **kwargs)
-        out = rearrange(out, 'b c f h w -> b f h w c')
-        out = rearrange(out, "b f h w c -> b (f c) h w")
+    def forward(self, x, x_cond, t, task_embed=None, action_embed=None, vis=None, **kwargs):
+        # x shape: [B, (horizon * num_actions), 1, 1]
+        B = x.shape[0]
+        
+        # Reshape to [B, num_actions, horizon] for 1D processing
+        x = x.view(B, self.horizon, self.num_actions)
+        x = x.permute(0, 2, 1)  # [B, num_actions, horizon]
+
+        out = self.unet(x, t, image_embed=x_cond, **kwargs)
+        
+        # Reshape back to expected format
+        out = out.permute(0, 2, 1)  # [B, horizon, num_actions]
+        out = out.reshape(B, self.horizon * self.num_actions, 1, 1)
+        
         return out
+
       
 class UnetMW_flow(nn.Module):
     def __init__(self):

@@ -9,6 +9,9 @@ from moviepy.editor import ImageSequenceClip
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import cv2
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 import math
 import torch
 
@@ -497,4 +500,191 @@ class OvercookedSampleRenderer:
             player_y, player_x = player_locs[0]
             return (player_x, player_y)
         return None
+    def visualize_action_sequence_video(self, obs, actions, output_path, player_idx=0, fps=1, normalize=True):
+        """
+        Create a video showing action sequence, one frame per action.
+        
+        Args:
+            obs: Initial observation [H, W, C] 
+            actions: Action sequence [Horizon] with values 0-5
+            output_path: Where to save the video
+            player_idx: Which player to track (0 or 1)
+            fps: Frames per second for video
+        """
+        
+        # Extract player position
+        player_pos = self.get_player_position(obs, player_idx)
+        if player_pos is None:
+            print(f"Warning: Could not find player {player_idx} in observation")
+            return
+            
+        start_x, start_y = player_pos
+        
+        # Action mappings
+        action_to_delta = {
+            0: (0, -1),  # North
+            1: (0, 1),   # South
+            2: (1, 0),   # East
+            3: (-1, 0),  # West
+            4: (0, 0),   # Stay
+            5: (0, 0)    # Interact
+        }
+        
+        action_names = ['North', 'South', 'East', 'West', 'Stay', 'Interact']
+        action_colors = ['blue', 'red', 'green', 'orange', 'gray', 'purple']
+        impassable_tiles = {'P', 'X', 'O', 'T', 'D', 'S'}
+        
+        # Get grid and render initial frame
+        grid = self.extract_grid_from_obs(obs)
+        
+        # Track position
+        x, y = start_x, start_y
+        frames = []
+        tile_size = self.UNSCALED_TILE_SIZE
+        
+        # Track statistics
+        action_counts = {i: 0 for i in range(6)}
+        consecutive_stays = 0
+        
+        for t, action in enumerate(actions):
+            action_idx = action.item() if hasattr(action, 'item') else action
+            action_counts[action_idx] += 1
+            
+            # Track consecutive stays
+            if action_idx == 4:  # Stay action
+                consecutive_stays += 1
+            else:
+                consecutive_stays = 0
+            
+            # Render current state
+            surface = self.render_frame(obs, grid, normalize=normalize)
+ 
+            
+            # Convert pygame surface to numpy array
+            w, h = surface.get_size()
+            surf_array = np.frombuffer(surface.get_buffer().raw, dtype=np.uint8)
+            surf_array = pygame.surfarray.array3d(surface)
+            surf_array = np.swapaxes(surf_array, 0, 1) 
+            
+            # Create figure for this frame
+            fig, (ax_main, ax_info) = plt.subplots(1, 2, figsize=(16, 8), 
+                                                gridspec_kw={'width_ratios': [2, 1]})
+            
+            # Main game view
+            ax_main.imshow(surf_array)
+            
+            # Convert grid coords to pixel coords
+            px = x * tile_size + tile_size // 2
+            py = y * tile_size + tile_size // 2
+            
+            # Check if move would be out of bounds
+            dx, dy = action_to_delta[action_idx]
+            new_x = x + dx
+            new_y = y + dy
+            is_out_of_bounds = not (0 <= new_x < obs.shape[1] and 0 <= new_y < obs.shape[0])
+            is_blocked = True if not is_out_of_bounds and grid[new_y][new_x] in impassable_tiles else False
+            # Draw current action
+            if action_idx < 4:  # Movement action
+                arrow_color = 'red' if is_out_of_bounds else action_colors[action_idx]
+                ax_main.arrow(px, py, 
+                        dx * tile_size * 0.7, dy * tile_size * 0.7,
+                        head_width=15, head_length=15, 
+                        fc=arrow_color, 
+                        ec='black', 
+                        linewidth=3,
+                        alpha=0.9)
+                
+                if is_out_of_bounds or is_blocked:
+                    # Add X marker for blocked move
+                    blocked_px = px + dx * tile_size * 0.7
+                    blocked_py = py + dy * tile_size * 0.7
+                    ax_main.scatter(blocked_px, blocked_py, color='red', s=200, 
+                                marker='x', linewidths=4)
+                    
+            elif action_idx == 4:  # Stay
+                # Draw a circle at current position
+                circle = patches.Circle((px, py), 20, 
+                                    color='gray', 
+                                    fill=True, 
+                                    alpha=0.5)
+                ax_main.add_patch(circle)
+                ax_main.text(px, py, '●', ha='center', va='center', 
+                        fontsize=20, color='white', weight='bold')
+                
+            elif action_idx == 5:  # Interact
+                circle = patches.Circle((px, py), 25, 
+                                    color='purple', 
+                                    fill=False, 
+                                    linewidth=4)
+                ax_main.add_patch(circle)
+                ax_main.text(px, py, 'I', ha='center', va='center', 
+                        fontsize=25, color='purple', weight='bold')
+            
+            # Highlight current position
+            current_rect = patches.Rectangle((x * tile_size, y * tile_size), 
+                                        tile_size, tile_size,
+                                        linewidth=3, edgecolor='yellow', 
+                                        facecolor='none')
+            ax_main.add_patch(current_rect)
+            
+            ax_main.set_title(f'Step {t+1}/{len(actions)} - Action: {action_names[action_idx]}', 
+                            fontsize=16)
+            ax_main.axis('off')
+            
+            # Info panel
+            ax_info.axis('off')
+            info_text = f"Current Step: {t+1}/{len(actions)}\n"
+            info_text += f"Current Action: {action_names[action_idx]}\n"
+            info_text += f"Position: ({x}, {y})\n\n"
+            
+            info_text += "Action Counts:\n"
+            for i, name in enumerate(action_names):
+                count = action_counts[i]
+                percentage = (count / (t+1)) * 100
+                info_text += f"{name}: {count} ({percentage:.1f}%)\n"
+            
+            info_text += f"\nConsecutive Stays: {consecutive_stays}\n"
+            
+            if is_out_of_bounds:
+                info_text += "\n OUT OF BOUNDS!"
+            
+            ax_info.text(0.05, 0.85, info_text, transform=ax_info.transAxes,
+                        fontsize=12, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            # Action history (last 10 actions)
+            history_start = max(0, t-16)
+            history_text = "Recent Actions:\n"
+            for i in range(history_start, t+1):
+                hist_action = actions[i].item() if hasattr(actions[i], 'item') else actions[i]
+                history_text += f"{i+1}: {action_names[hist_action]}\n"
+            
+            ax_info.text(0.65, 0.85, history_text, transform=ax_info.transAxes,
+                        fontsize=10, verticalalignment='top',
+                        bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.5))
+            
+            # Convert figure to frame
+            canvas = FigureCanvasAgg(fig)
+            canvas.draw()
+            buf = canvas.buffer_rgba()
+            frame = np.asarray(buf)
+            frames.append(cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR))
+            
+            plt.close(fig)
+            
+            # Update position only if in bounds
+            if not is_out_of_bounds and not is_blocked and action_idx < 4:
+                x, y = new_x, new_y
+        
+        # Write video
+        if frames:
+            rgb_frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames]
+            clip = ImageSequenceClip(rgb_frames, fps=fps)
+            clip.write_videofile(output_path, codec="libx264", fps=fps, verbose=False, logger=None)
+            print(f"Action sequence video saved to {output_path}")
+            
+        return output_path
+
+
+
 
