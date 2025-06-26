@@ -56,7 +56,7 @@ class RewardPredictor(nn.Module):
     def loss(self, obs, next_obs, reward):
         assert obs.min() >= -1.0 and obs.max() <= 1.0, "Observations must be normalized to [-1, 1]"
         assert next_obs.min() >= -1.0 and next_obs.max() <= 1.0, "Next observations must be normalized to [-1, 1]"  
-        # assert reward.min() >= 0.0 and reward.max() <= 1.0, "Reward must be normalized to [0, 1]"
+        assert reward.min() >= 0.0 and reward.max() <= 1.0, "Reward must be normalized to [0, 1]"
         
         pred_reward = self(obs, next_obs)
         loss = self.criterion(pred_reward, reward)

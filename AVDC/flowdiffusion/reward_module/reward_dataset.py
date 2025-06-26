@@ -67,7 +67,7 @@ class RewardPredictorDataset(torch.utils.data.Dataset):
         if obs.ndim == 4:
             obs = np.expand_dims(obs, axis=1)
         rewards = self.rewards[idx]
-        # rewards = self.normalize_reward(to_np(rewards))
+        rewards = self.normalize_reward(to_np(rewards))
 
         T = obs.shape[0]
         # Sample A random time step
@@ -83,7 +83,7 @@ class RewardPredictorDataset(torch.utils.data.Dataset):
 
         assert obs.min() >= -1.0 and obs.max() <= 1.0
         assert next_obs_t.min() >= -1.0 and next_obs_t.max() <= 1.0
-        # assert reward_t.min() >= 0.0 and reward_t.max() <= 1.0
+        assert reward_t.min() >= 0.0 and reward_t.max() <= 1.0
         
         return obs_t, next_obs_t, reward_t
     
