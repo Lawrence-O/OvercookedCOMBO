@@ -2177,6 +2177,7 @@ class OvercookedActionProposal(Trainer):
             })
         
         return total_loss
+    
     @torch.no_grad()
     def valid_one_step(self):
         if not self.valid_dl:
@@ -2191,7 +2192,7 @@ class OvercookedActionProposal(Trainer):
             "ref_action_sequence": None,
         }
 
-        for x_org, x_cond in self.valid_dl:
+        for j, (x_org, x_cond) in enumerate(self.valid_dl):
             B, horizon, *_ = x_org.shape
             x_cond_rearranged = rearrange(x_cond, "b h w c -> b c h w")
             
@@ -2212,6 +2213,13 @@ class OvercookedActionProposal(Trainer):
             # Convert predictions back to discrete actions
             # pred_actions shape: [B, (horizon * num_classes), 1, 1]
             pred_actions = pred_actions.view(B, horizon, self.num_classes)
+
+            pred_actions_path = os.path.join(viz_output_dir, f"pred_actions_step_{self.step}.png")
+            self.renderer.visualize_action_logits(pred_actions, pred_actions_path)
+            if self.wandb_enabled and self.accelerator.is_local_main_process and j == 0:
+                wandb.log({
+                    "evaluation/predicted_action_logits": wandb.Image(pred_actions_path, caption=f"Predicted Action Logits at step {self.step}")
+                }, step=self.step)
             pred_actions = torch.argmax(pred_actions, dim=-1)  # [B, horizon]
 
             # Visualize action sequences for each batch

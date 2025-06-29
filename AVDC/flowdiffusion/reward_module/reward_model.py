@@ -20,7 +20,7 @@ class ResidualConvBlock(nn.Module):
         return self.relu(out + residual)
 
 class RewardPredictor(nn.Module):
-    def __init__(self, input_channels=26, hidden_channels=64, mlp_hidden=128):
+    def __init__(self, input_channels=52, hidden_channels=128, mlp_hidden=256):
         super().__init__()
         # Initial 3x3 conv
         self.conv_in = nn.Conv2d(input_channels, hidden_channels, kernel_size=3, padding=1)

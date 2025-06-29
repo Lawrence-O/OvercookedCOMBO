@@ -14,7 +14,7 @@ import warnings
 warnings.filterwarnings("ignore")
 from goal_diffusion import GoalGaussianDiffusion, ConceptTrainer
 from unet import UnetOvercooked 
-from experiments_util import managed_environment, normalize_obs, to_torch, get_idm_action
+from experiments_util import managed_environment, normalize_obs, to_torch, get_idm_action, convert_to_binary_obs
 from overcooked_sample_renderer import OvercookedSampleRenderer
 
 class ConceptLearnExperiment:
@@ -117,26 +117,36 @@ class ConceptLearnExperiment:
 
 class EvaluationExperiment:
     """Base class for evaluation experiments in Overcooked."""
-    def __init__(self, args, diffusion, idm, policy_name, policy_id, num_episodes, results_dir, n_envs, max_steps, planning_horizon=32, device=None):
+    def __init__(self, args, world_model, idm, action_proposal_model, value_model, policy_name, policy_id, num_episodes, results_dir, n_envs, max_steps, planning_horizon=32, action_horizon=8, device=None):
         self.args = args
-        self.diffusion = diffusion
-        if hasattr(self.diffusion, 'ema_model'):
-            self.diffusion = self.diffusion.ema_model
+        self.world_model = world_model
         self.idm = idm
+        self.action_proposal_model = action_proposal_model
+        self.value_model = value_model
+        if hasattr(self.world_model, 'ema_model'):
+            self.world_model = self.world_model.ema_model
+        if hasattr(self.action_proposal_model, 'ema_model'):
+            self.action_proposal_model = self.action_proposal_model.ema_model
         self.n_envs = n_envs
         self.max_steps = max_steps
         self.policy_name = policy_name
         self.policy_id = policy_id
         self.planning_horizon = planning_horizon
+        self.action_horizon = action_horizon
         self.num_episodes = num_episodes
         self.renderer = OvercookedSampleRenderer()
         self.results_dir = Path(results_dir)
+        self.num_candidates = args.num_candidates if hasattr(args, 'num_candidates') else 10
         self.horizon = args.horizon
+        self.num_action_classes = 6
+        self.ranked_candidates_dicts = []
+        self.H, self.W, self.C = (8, 5, 26)
         if device is None:
             self.device = th.device("cuda" if th.cuda.is_available() else "cpu")
         else:
             self.device = device
         print(f"Using device: {self.device}")
+        
     def run(self, save_videos=False):
         """Run the evaluation process."""
         episode_metrics = []
@@ -145,7 +155,6 @@ class EvaluationExperiment:
             print(f"Starting episode {episode + 1}/{self.num_episodes}...")
             results = self._evaluate()
             frames = results["frames"]
-            samples_frames = results["samples_frames"]
             episode_reward = results["episode_reward"]
             steps = results["steps"]
             episode_metrics.append(results)
@@ -153,9 +162,8 @@ class EvaluationExperiment:
             # Save videos for this episode
             video_dir = self.results_dir / f"episode_{episode + 1}"
             video_dir.mkdir(parents=True, exist_ok=True)
-            grid = self.renderer.extract_grid_from_obs(frames[0][0])
             if save_videos:
-                self._save_episode_videos(frames, samples_frames, grid, episode, video_dir, show_samples=False)
+                self._save_episode_videos(frames, episode, video_dir)
             print(f"Episode {episode + 1} completed. Total steps: {steps}")
         return self.calculate_evaluation_summary(
             episode_rewards_list, 
@@ -207,12 +215,157 @@ class EvaluationExperiment:
             'metrics_per_episode_reset': episode_metrics,
             'raw_episode_rewards': [arr.tolist() for arr in episode_rewards_list], 
         }
+    @th.no_grad()
+    def _generate_trajectory_candidates(self, current_obs, policy_id):
+        """Generate trajectory candidates using the world model and action proposal model."""
+        # Generate initial action proposals
+        proposals = []
+        current_obs = to_torch(current_obs, device=self.device, dtype=th.float32)
+        current_obs = current_obs.view(self.n_envs, self.C, self.H, self.W)
+        for _ in range(self.num_candidates):
+            # Sample a random action proposal
+            action_proposal = self.action_proposal_model.sample(
+                x_cond=current_obs,
+                batch_size=self.n_envs,
+            )
+            # Reshape to [B, Horizon, Num_Action_Classes]
+            action_proposal = action_proposal.view(self.n_envs, self.horizon, self.num_action_classes)
+            action_condition = action_proposal[:, :self.action_horizon, :] 
+            action_condition = th.argmax(action_condition, dim=-1)
+            print(f"Sampled actions:", action_condition)
+            # Sample a trajectory using the world model
+            trajectory = self.world_model.sample(
+                x_cond=current_obs,
+                action_embed=action_condition,
+                batch_size=self.n_envs,
+                task_embed=policy_id)
+            trajectory = rearrange(trajectory, "b (f c) h w -> b f h w c", c=self.C, f=self.horizon)
+            proposals.append((action_proposal, trajectory))
+        print(f"Generated {len(proposals)} trajectory candidates.")
+        return proposals
+    
+    # def _rank_trajectories(self, trajectories):
+    #     """Rank the generated candidates based on their expected rewards."""
+    #     ranked_candidates = []
+    #     for trajectory in trajectories: # [B, Horizon, H, W, C]
+    #         trajectory = normalize_obs(trajectory)
+    #         total_value = th.zeros((self.n_envs,), device=self.device)
+    #         for i in range(trajectory.shape[0]-1):
+    #             obs_t = trajectory[:, i, ...]  # [B, H, W, C]
+    #             obs_tp1 = trajectory[:, i + 1, ...]
+    #             value = self.value_model(obs_t, obs_tp1)
+    #             total_value += value
+    #         # Store the trajectory and its total value
+    #         print(f"Total value for trajectory: {total_value}")
+    #         print(total_value.shape)
+    #         ranked_candidates.append((total_value, trajectory))
+    #     # Sort candidates by their expected rewards (total value)
+    #     for i in range(self.n_envs):
+    #         ranked_candidates.sort(key=lambda x: x[0][i].item(), reverse=True)
+    #     print(f"Ranked {len(ranked_candidates)} candidates based on expected rewards.")
+    #     return ranked_candidates
+    @th.no_grad()
+    def _rank_trajectories(self, trajectories):
+        """Rank the generated candidates based on their expected rewards."""
+        N = len(trajectories)
+        B, T, H, W, C = trajectories[0].shape
+        traj_tensor = th.stack(trajectories, dim=0)  # [N, B, T, H, W, C]
+        traj_tensor = traj_tensor.permute(1, 0, 2, 3, 4, 5)  # [B, N, T, H, W, C]
+        all_trajs = traj_tensor.reshape(B*N, T, H, W, C)  # [B*N, T, H, W, C]
+        print(f"All Trajectories Before Norm Min and Max: {all_trajs.min()}, {all_trajs.max()}")
+        all_trajs = convert_to_binary_obs(all_trajs)  # Normalize the trajectories
+        print(f"All Trajectories Post Norm Min and Max: {all_trajs.min()}, {all_trajs.max()}")
+        print(f"All trajectories shape: {all_trajs.shape}")
+        total_vals = th.zeros((B * N,), device=self.device)
+        for t in range(T-1):
+            obs_t = all_trajs[:, t, ...]
+            obs_tp1 = all_trajs[:, t + 1, ...]
+            vals = self.value_model(obs_t, obs_tp1)  # [B*N]
+            total_vals += vals
+        # Reshape total_vals to [B, N]
+        total_vals = total_vals.view(B, N)  # [B, N]
+        ranked_candidates = []
+        print(f"Total values shape: {total_vals.shape}")
+        print(f"Total values: {total_vals}")
+        # Now we need to rank the candidates for each environment
+        for i in range(B):
+            # Sort candidates by their expected rewards (total value)
+            sorted_indices = th.argsort(total_vals[i], descending=True)
+            env_list = [
+                (total_vals[i, idx].item(), trajectories[idx][i])  # now [T,H,W,C]
+                for idx in sorted_indices
+            ]
+            ranked_candidates.append(env_list)
+        # Sort candidates by their expected rewards (total value)
+        ranked_candidates = sorted(ranked_candidates, key=lambda x: x[0], reverse=True)
+        print(f"Ranked {len(ranked_candidates)} candidates based on expected rewards.")
+        # Print the top 5 candidates for each environment
+        for i in range(B):
+            print(f"Top candidates for environment {i}:")
+            for j in range(min(5, len(ranked_candidates[i]))):
+                print(f"  Candidate {j+1}: Reward = {ranked_candidates[i][j][0]:.4f}, Trajectory shape = {ranked_candidates[i][j][1].shape}")
+        return ranked_candidates
+    
+    def _rank_and_select_candidates(self, current_obs, policy_id):
+        """Generate and rank trajectory candidates."""
+        # Generate trajectory candidates
+        proposals = self._generate_trajectory_candidates(current_obs, policy_id)
+        # Rank the candidates based on their expected rewards
+        action_proposals, trajectories = zip(*proposals)
+        ranked_candidates = self._rank_trajectories(trajectories)
+        # For each environment, select the top candidate
+        reward_values = [env_list[0][0] for env_list in ranked_candidates]
+        ranked_trajectories = [env_list[0][1] for env_list in ranked_candidates]
+        ranked_trajectories = th.stack(ranked_trajectories, dim=0)  # [B, T, H, W, C]
+        return {
+            "action_candidates": action_proposals,
+            "trajectory_candidates": trajectories,
+            "ranked_candidates": ranked_candidates,
+            "reward_values": reward_values,
+            "ranked_trajectories": ranked_trajectories,
+        }
+    @th.no_grad()
+    def _get_next_actions(self, current_obs, policy_id):
+        """Get the next actions for the ego agent based on the ranked candidates."""
+        ranked_candidates_dict = self._rank_and_select_candidates(current_obs, policy_id)
+        # self.ranked_candidates_dicts.append(ranked_candidates_dict)
+        best_trajectory = ranked_candidates_dict["ranked_trajectories"]
+        B, T, H, W, C = best_trajectory.shape
+        # Get Initial Actions
+        current_obs = to_torch(current_obs, device=self.device, dtype=th.float32)
+        init_states = best_trajectory[:, 0, ...]
+        init_actions = get_idm_action(
+            current_obs,
+            init_states,
+            self.idm
+        )
+        # Get all obs_t and obs_tp1 pairs
+        obs_t = best_trajectory[:, :-1, ...]  # [B, T-1, H, W, C]
+        obs_tp1 = best_trajectory[:, 1:, ...]  # [B, T-1, H, W, C]
+        # Flatten batch and time dims for input:
+        obs_t_flat = obs_t.reshape(B * (T - 1), H, W, C)
+        obs_tp1_flat = obs_tp1.reshape(B * (T - 1), H, W, C)
+        traj_actions = get_idm_action(
+            obs_t_flat, 
+            obs_tp1_flat,
+            self.idm
+        )
+        ego_actions = th.cat([init_actions, traj_actions])
+        ego_actions = ego_actions.reshape(B, T)
+        print(f"Generated next actions shape: {ego_actions.shape}")
+        print(f"Generated next actions: {ego_actions}")
+        return ego_actions
+    
+    def _get_candidate_metrics(self, ranked_candidates_dict):
+        pass
+            
+
     def _evaluate(self):
         """Run the evaluation process with the given environments and policy."""
         with managed_environment(self.args, self.policy_name, self.n_envs) as (envs, policy):
             print(f"Running evaluation with {self.n_envs} environments...")
             cond = th.full((self.n_envs,), self.policy_id, dtype=th.int64, device=self.device)
-            policy.reset(num_envs=self.args.n_envs, num_agents=2)
+            policy.reset(num_envs=self.args.n_envs, num_agents=1)
             for e in range(self.args.n_envs):
                 policy.register_control_agent(e=e, a=1)
             obs, _, _ = envs.reset([True] * self.n_envs)
@@ -220,56 +373,25 @@ class EvaluationExperiment:
             done = False
             episode_reward = np.zeros((self.n_envs, 2))
             frames = [[obs[i][0]] for i in range(self.n_envs)]
-            samples_frames = [[] for _ in range(self.n_envs)]
             step_actions = np.zeros((self.args.n_envs, 2, 1), dtype=np.int64)
             *_, C = obs[0][0].shape
             
             while not done and steps <= self.args.max_steps:
                 # Setup Condition Obs Based on Obs
                 obs_stack = np.stack([normalize_obs(obs[e][0]) for e in range(self.n_envs)], axis=0) 
-                
-                if False:
-                    # current_obs = np.stack([obs[e][0] for e in range(self.n_envs)])
-                    # Plan using the diffusion model
-                    samples, best_rewards = self._plan(
-                        current_obs=obs_stack,
-                        cond=cond,
-                        envs=envs,
-                        partner_policy=policy,
-                        num_trajectories=10
-                    )
-                    print(f"Best rewards from planning: {best_rewards}")
-                else:
-                    condition_obs = th.tensor(obs_stack, device=self.device, dtype=th.float32)
-                    assert condition_obs.shape[-1] == 26 # Double Check
-                    assert condition_obs.min() >= -1 and condition_obs.max() <= 1, \
-                        f'condition_obs must be normalized to [-1, 1], got range [{condition_obs.min():.3f}, {condition_obs.max():.3f}]'
-                    assert cond.min() >= 0 and cond.max() < self.args.num_classes if hasattr(self.args, 'num_classes') else 10, \
-                        f'cond (task_embed) contains invalid policy IDs: min={cond.min()}, max={cond.max()}'
-                    condition_obs = rearrange(condition_obs, "b h w c -> b c h w")
-                    samples = self.diffusion.sample(
-                        x_cond=condition_obs,
-                        task_embed=cond,
-                        batch_size=self.n_envs,
-                    )
-                    samples = rearrange(samples, "b (f c) h w -> b f h w c", c=C, f=self.horizon)
+                condition_obs = th.tensor(obs_stack, device=self.device, dtype=th.float32)
+                assert condition_obs.shape[-1] == 26 # Double Check
+                assert condition_obs.min() >= -1 and condition_obs.max() <= 1, \
+                    f'condition_obs must be normalized to [-1, 1], got range [{condition_obs.min():.3f}, {condition_obs.max():.3f}]'
+                assert cond.min() >= 0 and cond.max() < self.args.num_classes if hasattr(self.args, 'num_classes') else 10, \
+                    f'cond (task_embed) contains invalid policy IDs: min={cond.min()}, max={cond.max()}'
+                ego_actions = self._get_next_actions(condition_obs, cond)
+                ego_actions = ego_actions.cpu().numpy()
                 # Now step through the environment using the plan
-                plan_horizon = min(self.max_steps - steps, self.planning_horizon)
+                plan_horizon = min(self.max_steps - steps, self.planning_horizon, 8)
                 # We begin with the first ego obs (first obs of the environment)
-                obs_t = to_torch(obs_stack, device=self.device)
                 for t in range(plan_horizon): 
-                    obs_tp1 = samples[:, t, ...]
-                    if self.args.save_videos:
-                        for e in range(self.args.n_envs):
-                            samples_frames[e].append(obs_tp1[e].cpu().numpy())
-                    for env_i in range(self.args.n_envs):
-                        # IDM takes in 26 channels
-                        ego_action = get_idm_action(
-                            to_torch(obs_t[env_i], device=self.device).unsqueeze(0), 
-                            to_torch(obs_tp1[env_i], device=self.device).unsqueeze(0), 
-                            self.idm
-                        )
-                        step_actions[env_i, 0, 0] = ego_action
+                    step_actions[:, 0, 0] = ego_actions[:, t]
                     partner_obs_lst = [obs[e][1] for e in range(self.args.n_envs)]
                     partner_obs = np.stack(partner_obs_lst, axis=0)
                     partner_action = policy.step(
@@ -281,7 +403,6 @@ class EvaluationExperiment:
                     # Take environment step
                     obs, _, reward, done, _, _ = envs.step(step_actions)
                     episode_reward += reward.squeeze(axis=2)
-                    obs_t = obs_tp1
                     if self.args.save_videos:
                         for e in range(min(self.args.n_envs, 3)):
                             frames[e].append(obs[e][0])
@@ -292,18 +413,23 @@ class EvaluationExperiment:
                         break
             return {
                 "frames": frames,
-                "samples_frames": samples_frames,
                 "episode_reward": episode_reward,
                 "steps": steps,
             }
 
-    def _save_episode_videos(self, frames, samples_frames, grid, episode, video_dir, show_samples=False):
+    def _save_episode_videos(self, frames, episode, video_dir):
         """Save videos for a completed episode."""
         print(f"Saving videos for episode {episode + 1}...")
+        print(len(frames), len(frames[0]))
+        frames = [
+            [np.transpose(f, (1, 0, 2)) for f in env_frames]
+            for env_frames in frames
+        ]
+        grid = self.renderer.extract_grid_from_obs(frames[0][0])
         for e in range(len(frames)):
-            frames[e] = rearrange(frames[e], "f w h c -> f h w c")
             env_dir = video_dir / f"episode_{episode + 1}_env_{e + 1}"
             env_dir.mkdir(parents=True, exist_ok=True)
+            print(frames[e][0].shape)
             
             # Save actual trajectory
             saved_video = self.renderer.render_trajectory_video(
@@ -313,108 +439,7 @@ class EvaluationExperiment:
                 video_path=str(env_dir / "actual_trajectory.mp4"),
                 fps=1
             )
-            
-            # Save samples trajectory if needed
-            if show_samples:
-                self.renderer.render_trajectory_video(
-                    samples_frames[e],
-                    grid,
-                    output_dir=str(env_dir),
-                    video_path=str(env_dir / "samples_trajectory.mp4"),
-                    fps=1,
-                    normalize=True,
-                )
                 
         print(f"Videos saved to {video_dir}")
-        
-    def _plan(self, current_obs, cond, envs, partner_policy, num_trajectories=10):
-        raise NotImplementedError("Not done")
-        """Plan trajectories using the diffusion model."""
-        best_trajectories = []
-        best_rewards = []
-        for env_idx in range(self.n_envs):
-            env_best_trajectory = []
-            env_best_reward = -np.inf
-            for _ in range(num_trajectories):
-                env_cond = cond[env_idx:env_idx + 1]
-                env_obs = current_obs[env_idx:env_idx + 1]
-                # Normalize and prepare observation
-                # normalized_obs = normalize_obs(env_obs[0])
-                condition_obs = th.tensor(env_obs[0], device=self.device, dtype=th.float32).unsqueeze(0)
-                condition_obs = rearrange(condition_obs, "b h w c -> b c h w")
-                samples = self.diffusion.sample(
-                    x_cond=env_obs,
-                    task_embed=env_cond,
-                    batch_size=1,
-                )
-                trajectory = rearrange(samples, "b (f c) h w -> b f h w c", c=env_obs.shape[-1], f=self.horizon)
-                trajectory_reward = self._evaluate_trajectory(
-                    trajectory=trajectory[0],
-                    env_idx=env_idx,
-                    initial_state=env_obs[0],
-                    partner_policy=partner_policy,
-                    envs=envs
-                )
-
-                if trajectory_reward > env_best_reward:
-                    env_best_reward = trajectory_reward
-                    env_best_trajectory = trajectory
-            best_trajectories.append(env_best_trajectory)
-            best_rewards.append(env_best_reward)
-        # Stack results
-        best_trajectories = np.stack(best_trajectories, axis=0)  # (n_envs, horizon, H, W, C)
-        best_rewards = np.array(best_rewards)  # (n_envs,)
-        return best_trajectories, best_rewards
-    def _evaluate_trajectory(self, trajectory, env_idx, initial_state, partner_policy, envs):
-        """Evaluate a single trajectory in the environment."""
-        print(dir(envs))
-        base_env = envs.base_envs[env_idx]
-
-        # Save Current State
-        original_state = base_env.state.deepcopy()
-        base_env.set_state(initial_state)
-
-        total_reward = 0.0
-        try:
-            for t in range(self.horizon):
-                obs = base_env.get_obs()
-                # Get ego action from trajectory using IDM
-                if t == 0:
-                    # First step: use initial state as obs_t
-                    obs_t = th.tensor(initial_state, device=self.device, dtype=th.float32).unsqueeze(0)
-                else:
-                    # Use previous trajectory observation
-                    obs_t = th.tensor(trajectory[t-1], device=self.device, dtype=th.float32).unsqueeze(0)
-                obs_tp1 = th.tensor(trajectory[t], device=self.device, dtype=th.float32).unsqueeze(0)
-                
-                # Get IDM action
-                ego_action = get_idm_action(obs_t, obs_tp1, self.idm)
-                from overcooked_ai_py.mdp.actions import Action, Direction
-                ego_action = Action.INDEX_TO_ACTION[ego_action.item()]
-
-                # Get partner action
-                partner_obs = obs # Assume they are the same obs
-
-                partner_action_idx = partner_policy.step(
-                    partner_obs[np.newaxis, ...],
-                    [(env_idx, 1)],
-                    deterministic=True
-                )[0, 0]
-                partner_action = Action.INDEX_TO_ACTION[partner_action_idx]
-                
-                # Create joint action
-                joint_action = (ego_action, partner_action)
-                
-                # Step environment
-                next_state, sparse_reward, done, info = base_env.step(joint_action)
-                
-                # Accumulate reward
-                total_reward += sparse_reward
-                
-                # Check if episode ended
-                if done:
-                    break
-        finally:
-            # Restore original state
-            base_env.set_state(original_state)
+    
     

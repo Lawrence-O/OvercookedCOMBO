@@ -1,0 +1,113 @@
+def find_high_reward_trajectories(self, lengths=[32, 16, 8]):
+        """
+        For each episode in self.data, find all sub-trajectories of specified lengths
+        where the last state results in a nonzero reward for the specified agent.
+        """
+        if self.data is None:
+            raise ValueError("No data collected. Please run collect_data() first.")
+        trajectories = {L : [] for L in lengths}
+        for episode_idx, episode in tqdm(enumerate(self.data), desc="Finding High Reward Trajectories"):
+            rewards = episode["rewards"]
+            n_steps = len(rewards)
+            for L in lengths:
+                if n_steps < L:
+                    continue
+                for start in range(n_steps - L + 1):
+                    last_idx = start + L - 1
+                    last_reward = rewards[last_idx]  # shape (n_envs, 2)
+                    ego_rewards = last_reward[:, 0]  # shape (n_envs,)
+                    nonzero_envs = np.where(ego_rewards != 0)[0]
+                    for env_idx in nonzero_envs:
+                        traj = {
+                            "obs_t": [step[0][env_idx] for step in episode["obs_t"][start:start+L]],
+                            "obs_tp1": [step[0][env_idx] for step in episode["obs_tp1"][start:start+L]],
+                            "actions": [step[0][env_idx] for step in episode["actions"][start:start+L]],
+                            "rewards": [step[env_idx] for step in episode["rewards"][start:start+L]],
+                            "done": [step[env_idx] for step in episode["done"][start:start+L]],
+                            "steps": episode["steps"][start:start+L],
+                            "episode_idx": episode_idx,
+                            "start_idx": start,
+                            "env_idx": env_idx,
+                        }
+                        trajectories[L].append(traj)
+        print(f"Found {sum(len(trajs) for trajs in trajectories.values())} high reward trajectories across all lengths.")
+        return trajectories
+
+@th.no_grad()
+    def run_action_proposal_eval(self, high_reward_trajectories):
+        results = {}
+        self.action_proposal_model.eval()
+        for L, trajs in high_reward_trajectories.items():
+            if not trajs:
+                print(f"No high reward trajectories found for length {L}. Skipping evaluation.")
+                continue
+            print(f"Evaluating Action Proposal Model on {len(trajs)} trajectories of length {L}...")
+            all_obs = []
+            all_actions = []
+            for traj in trajs:
+                # Stack obs_t for the trajectory (ego agent only)
+                obs_seq = [np.array(obs_t) for obs_t in traj["obs_t"]]
+                obs_seq = np.stack(obs_seq, axis=0)  # [L, H, W, C]
+                all_obs.append(obs_seq)
+                # Stack actions for the trajectory (ego agent only)
+                actions_seq = [np.array(a[0]).flatten() for a in traj["actions"]]
+                actions_seq = np.stack(actions_seq, axis=0)  # [L,]
+                all_actions.append(actions_seq)
+            # Convert to arrays
+            all_obs = np.stack(all_obs, axis=0)  # [N, L, H, W, C]
+            all_actions = np.stack(all_actions, axis=0)  # [N, L]
+            N, L = all_obs.shape[:2]
+            # Flatten for model input
+            all_obs_flat = all_obs.reshape(N * L, *all_obs.shape[2:])  # [N*L, H, W, C]
+            # Normalize and binarize obs as needed
+            all_obs_norm = normalize_obs(all_obs_flat)
+            # Convert to torch tensors
+            obs_tensor = to_torch(all_obs_norm, device=self.device)
+            obs_tensor = obs_tensor.view(N * L,  self.C, self.H, self.W)
+
+            BATCH_SIZE = 32 
+            num_samples = obs_tensor.shape[0]
+            num_eval = min(32, num_samples)
+            obs_tensor = obs_tensor[:num_eval]  # Only use the first 1024 samples
+
+            batch_pred = self.action_proposal_model.sample(
+                x_cond=obs_tensor,
+                batch_size=obs_tensor.shape[0],
+            )
+            print(f"Batch prediction shape: {batch_pred.shape}")
+            batch_pred = batch_pred.view(obs_tensor.shape[0], self.horizon, self.num_actions)
+            print(f"Reshaped batch prediction shape: {batch_pred.shape}")
+            batch_pred = th.argmax(batch_pred, dim=-1)
+            pred_actions = batch_pred.cpu()
+            print(f"Predicted actions shape: {pred_actions.shape}")
+            
+            results[L] = {
+                "pred_actions": pred_actions,
+                "true_actions": all_actions[:num_eval],
+            }
+            
+            # BATCH_SIZE = 1024 
+            # num_samples = obs_tensor.shape[0]
+            # all_pred_actions = []
+
+            # for start in range(0, num_samples, BATCH_SIZE):
+            #     end = min(start + BATCH_SIZE, num_samples)
+            #     batch_obs = obs_tensor[start:end]
+            #     batch_pred = self.action_proposal_model.sample(
+            #         x_cond=batch_obs,
+            #         batch_size=batch_obs.shape[0],
+            #     )
+            #     batch_pred = batch_pred.view(batch_obs.shape[0], self.horizon, self.num_actions)
+            #     batch_pred = th.argmax(batch_pred, dim=-1)
+            #     all_pred_actions.append(batch_pred.cpu())
+            #     break;
+            
+
+            # pred_actions = th.cat(all_pred_actions, dim=0)
+            # # Reshape back to [N, L]
+            # pred_actions = pred_actions.view(N, L)
+            # results[L] = {
+            #     "pred_actions": pred_actions,
+            #     "true_actions": all_actions,
+            # }
+        return results

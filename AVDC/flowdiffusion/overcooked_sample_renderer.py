@@ -503,13 +503,6 @@ class OvercookedSampleRenderer:
     def visualize_action_sequence_video(self, obs, actions, output_path, player_idx=0, fps=1, normalize=True):
         """
         Create a video showing action sequence, one frame per action.
-        
-        Args:
-            obs: Initial observation [H, W, C] 
-            actions: Action sequence [Horizon] with values 0-5
-            output_path: Where to save the video
-            player_idx: Which player to track (0 or 1)
-            fps: Frames per second for video
         """
         
         # Extract player position
@@ -684,6 +677,30 @@ class OvercookedSampleRenderer:
             print(f"Action sequence video saved to {output_path}")
             
         return output_path
+    def visualize_action_logits(self, pred_actions, save_path=None):
+        if hasattr(pred_actions, "detach"):
+            logits = pred_actions.detach().cpu().numpy()
+        else:
+            logits = np.array(pred_actions)
+        B, horizon, num_classes = logits.shape
+
+        num_samples = min(B, 5)
+        fig_height = num_samples * 4
+        fig_width = max(10, horizon * 0.8)
+        fig, axes = plt.subplots(num_samples, 1, figsize=(fig_width, fig_height), squeeze=False)
+        for i in range(num_samples):
+            ax = axes[i, 0]
+            im = ax.imshow(logits[i].T, aspect="auto", cmap="viridis")
+            ax.set_ylabel("Action class", fontsize=14)
+            ax.set_xlabel("Timestep", fontsize=14)
+            ax.set_title(f"Sample {i}", fontsize=16)
+            fig.colorbar(im, ax=ax, orientation="vertical", fraction=0.02)
+            ax.tick_params(axis='both', which='major', labelsize=12)
+        plt.tight_layout()
+        if save_path is not None:
+            plt.savefig(save_path, bbox_inches='tight', dpi=150)
+            print(f"Action logits plot saved to {save_path}")
+        plt.show()
 
 
 

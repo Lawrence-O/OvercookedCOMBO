@@ -323,7 +323,7 @@ class AttentionBlock(nn.Module):
             qkv = self.qkv(self.norm(x))
             h = self.attention(qkv)
             h = self.proj_out(h)
-            return rearrange((x + h), "(b f) c (x y) -> b c f x y", c=c, f=f, x=spatial[0], y=spatial[1])
+            return rearrange((x + h), "(b f) c (x y) -> b c f x y", c=c, f=spatial[0], x=spatial[1], y=spatial[2])
         else:
             raise ValueError(f"Unsupported dimension: {self.dims}. Only 1D, 2D, and 3D are supported.")
 def count_flops_attn(model, _x, y):

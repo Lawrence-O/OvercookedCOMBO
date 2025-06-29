@@ -29,7 +29,8 @@ from mapbt_package.mapbt.config import get_config
 from experiments_util import managed_model_loading, managed_concept_trainer
 from experiments_classes import EvaluationExperiment
 from goal_diffusion import GoalGaussianDiffusion
-from unet import UnetOvercooked
+from reward_module.reward_model import RewardPredictor
+from unet import UnetOvercooked, UnetOvercookedActionProposal
 from ema_pytorch import EMA
 
 
@@ -44,6 +45,7 @@ class ExperimentRunner:
             use_successive_models: Whether to use the model from the previous step
         """
         self.args = args
+        self.horizon = args.horizon
 
         # Disable WandB and Debugging
         self.args.wandb = False
@@ -61,10 +63,6 @@ class ExperimentRunner:
         self.exp_group_dir = self.base_output_dir / (args.exp_group_name or datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         self.exp_group_dir.mkdir(parents=True, exist_ok=True)
         
-        # Initialize common resources
-        self.idm_model = self._load_idm_model()
-        self.renderer = OvercookedSampleRenderer()
-        
         # Track experiment state
         self.current_model_path = args.diffusion_model_path
         self.current_args = deepcopy(args)
@@ -72,6 +70,8 @@ class ExperimentRunner:
         
         # Cache for datasets to avoid reloading
         self.dataset_cache = {}
+        self.train_partner_policies = None # Policy_Name -> Policy_ID
+        self.test_partner_policies = None # Policy_Name -> Policy_ID
 
         # Embeddings
         self.policy_embeddings = {}
@@ -89,23 +89,73 @@ class ExperimentRunner:
         self.embedding_loss_history = {}
         self.guidance_weight_history = {}
 
-        assert self.num_concepts > 1, "num_concepts must be greater than 1 for concept learning due to dummy policy embedding"
+        # assert self.num_concepts > 1, "num_concepts must be greater than 1 for concept learning due to dummy policy embedding"
 
         self.observation_dim = (8,5,26) #TODO: this should be set based on the dataset or model
 
+        self.num_actions = 6 # Number of actions in Overcooked
+        self.action_horizon = 8 # Default action horizon for world model
+        self.no_op_action = 4 # Default no-op action in Overcooked
 
+        # Initialize common resources
+        self.idm_model = self._load_idm_model()
+        self.value_model = self._load_value_model()
+        self.action_proposal_model = self._load_action_proposal_model(ema=True)
+        self.renderer = OvercookedSampleRenderer()
+
+    def _load_value_model(self):
+        """Load the value predictor model."""
+        if not osp.exists(self.args.value_model_path):
+            raise FileNotFoundError(f"Value model path {self.args.value_model_path} does not exist.")
+        weights = th.load(self.args.value_model_path)
+        value_model = RewardPredictor()
+        value_model.load_state_dict(weights)
+        value_model.to(self.device)
+        value_model.eval()
+        return value_model
+    
+    def _load_action_proposal_model(self,ema=True):
+        """Load the action proposal model."""
+        if not osp.exists(self.args.action_proposal_model_path):
+            raise FileNotFoundError(f"Action proposal model path {self.args.action_proposal_model_path} does not exist.")
+        ckpt = th.load(self.args.action_proposal_model_path, map_location="cpu")
+        unet = UnetOvercookedActionProposal(
+            horizon=self.args.horizon,
+            obs_dim=self.observation_dim,
+            num_actions=self.num_actions,
+        ).to(self.device)
+        diffusion = GoalGaussianDiffusion(
+            model=unet,
+            channels=self.num_actions * self.horizon,
+            image_size=(1,1),
+            timesteps=1000,
+            sampling_timesteps=100,
+            loss_type="l2",
+            objective="pred_v",
+            beta_schedule="cosine",
+            min_snr_loss_weight=True,
+            guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
+            auto_normalize=False,
+        ).to(self.device)
+        if ema:
+            ema_wrap = EMA(diffusion,beta = 0.999,update_every=10)
+            ema_wrap.load_state_dict(ckpt['ema'])
+            return ema_wrap
+        else:
+            diffusion.load_state_dict(ckpt['model'])
+            return diffusion
         
     def _load_idm_model(self):
         """Load the Inverse Dynamics Model."""
-        print(f"Loading IDM model from {self.args.idm_path}")
+        if not osp.exists(self.args.idm_path):
+            raise FileNotFoundError(f"Inverse Dynamics Model path {self.args.idm_path} does not exist.")
         weights = th.load(self.args.idm_path)
-        idm = InverseDynamicsModel(num_actions=6)
+        idm = InverseDynamicsModel(num_actions=self.num_actions)
         idm.load_state_dict(weights['model'])
         idm.to(self.device)
         idm.eval()
         return idm
     
-    #TODO: REMOVE AUTO NORMALIZE FROM ALL DIFFUSION MODELS*****
 
     def load_diffusion_model(self, model_path, ema=True, num_classes=None):
         """Load the diffusion model for evaluation only."""
@@ -117,11 +167,13 @@ class ExperimentRunner:
             horizon=self.args.horizon,
             obs_dim=self.observation_dim,
             num_classes=num_classes,
+            num_actions=self.num_actions,
+            action_horizon=self.action_horizon,
         ).to(self.device)
         H,W,C = self.observation_dim
         diffusion = GoalGaussianDiffusion(
             model=unet,
-            channels=C * 32,
+            channels=C * self.horizon,
             image_size=(H,W),
             timesteps=1 if self.args.debug else 1000,
             sampling_timesteps=1 if self.args.debug else 100,
@@ -130,6 +182,9 @@ class ExperimentRunner:
             beta_schedule="cosine",
             min_snr_loss_weight=True,
             guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
+            auto_normalize=False,
+            num_actions=self.num_actions,
+            no_op_action=self.no_op_action
         ).to(self.device)
         if ema:
             ema_wrap = EMA(diffusion,beta = 0.999,update_every=10)
@@ -155,6 +210,10 @@ class ExperimentRunner:
             self.dataset_cache[cache_key] = OvercookedSequenceDataset(
                 args=dataset_args, split=split
             )
+        if self.train_partner_policies is None:
+            # Initialize train and test ID mappings if not already done
+            self.train_partner_policies = self.dataset_cache[cache_key].train_partner_policies
+            self.test_partner_policies = self.dataset_cache[cache_key].test_partner_policies
         return self.dataset_cache[cache_key]
 
     def get_or_create_embedding(self, policy_id):
@@ -432,8 +491,10 @@ class ExperimentRunner:
         current_run_basedir.mkdir(parents=True, exist_ok=True)
         eval_experiment = EvaluationExperiment(
             args=self.args,
-            diffusion=diffusion_model,
+            world_model=diffusion_model,
             idm=self.idm_model,
+            action_proposal_model=self.action_proposal_model,
+            value_model=self.value_model,
             policy_name=partner_policy_name,
             policy_id=agent_id,
             num_episodes=self.args.exp_eval_episodes,
@@ -441,6 +502,7 @@ class ExperimentRunner:
             n_envs=self.args.n_envs,
             max_steps=self.args.max_steps,
             planning_horizon=horizon,
+            action_horizon=self.action_horizon,
             device=self.device
          )
         summary = eval_experiment.run(save_videos=self.args.save_videos)
@@ -536,29 +598,31 @@ class ExperimentRunner:
         experiment_configs = []
         
         included_policies = set()
-        dataset = self._get_dataset(self.args.dataset_path, "train")
-        if dataset.train_partner_policies:
-            train_policies = dataset.train_partner_policies
-            print(f"Found {len(train_policies)} train policies: {list(train_policies.keys())}")
-            
-            # Filter policies if requested
-            for policy_name in train_policies:
-                # Skip if not in the requested list (when a list is provided)
-                if policies_to_evaluate is not None and policy_name not in policies_to_evaluate:
-                    print(f"Skipping train policy {policy_name} (not in requested list)")
-                    continue
-                    
-                included_policies.add(policy_name)
-                experiment_configs.append({
-                    "name": f"base_model_eval_train_policy_{policy_name}",
-                    "evaluation_configs": [{
-                        "layout_name": self.args.layout_name,
-                        "agent_id": train_policies[policy_name],
-                        "horizon": self.args.horizon,
-                        "partner_policy_name": policy_name,
-                    }]
-                })
-            print(f"Created {len(included_policies)} training policy evaluations")
+        _ = self._get_dataset(self.args.dataset_path, "train")
+        assert self.train_partner_policies is not None
+        
+        train_policies = self.train_partner_policies
+        print(f"Found {len(train_policies)} train policies: {list(train_policies.keys())}")
+        
+        # Filter policies if requested
+        for policy_name in train_policies:
+            # Skip if not in the requested list (when a list is provided)
+            if policies_to_evaluate is not None and policy_name not in policies_to_evaluate:
+                print(f"Skipping train policy {policy_name} (not in requested list)")
+                continue
+            policy_id = train_policies[policy_name]
+                
+            included_policies.add(policy_name)
+            experiment_configs.append({
+                "name": f"base_model_eval_train_policy_{policy_name}",
+                "evaluation_configs": [{
+                    "layout_name": self.args.layout_name,
+                    "agent_id": policy_id,
+                    "horizon": self.args.horizon,
+                    "partner_policy_name": policy_name,
+                }]
+            })
+        print(f"Created {len(included_policies)} training policy evaluations")
         
         # Early exit if no policies to evaluate
         if not experiment_configs:
@@ -1075,6 +1139,9 @@ def parse_args(args, parser):
     parser.add_argument("--exp_eval_episodes", type=int, default=3, help="Number of evaluation episodes")
     parser.add_argument("--show_samples", default=False, action='store_true', help="Whether to visualize samples during evaluation")
     parser.add_argument("--save_videos", default=False, action='store_true', help="Whether to save videos of the evaluation")
+    parser.add_argument("--action_proposal_model_path", type=str, required=True, help="Path to the action proposal (diffusion) model checkpoint")
+    parser.add_argument("--value_model_path", type=str, required=True, help="Path to the reward/value model checkpoint")
+    parser.add_argument("--num_candidates", type=int, default=10, help="Number of action/trajectory candidates to generate per step")
     
     # Mapt Package Args  
     parser.add_argument("--old_dynamics", default=False, action='store_true', help="old_dynamics in mdp")
@@ -1121,15 +1188,15 @@ if __name__ == "__main__":
     #overrde episode len
     args.episode_length = 400
     runner = ExperimentRunner(args, num_concepts=16)
-    runner.run_cl_experiments_with_context_managers()
+    # runner.run_cl_experiments_with_context_managers()
 
-    # runner.run_base_model_evaluation(2, policies_to_evaluate={
-    #     "sp1_final",
-    #     # "sp2_final",
-    #     # "sp3_final",
-    #     # "sp4_final",
-    #     # "sp5_final",
-    # })
+    runner.run_base_model_evaluation(8, policies_to_evaluate={
+        "sp1_final",
+        # "sp2_final",
+        # "sp3_final",
+        # "sp4_final",
+        # "sp5_final",
+    })
     runner.plot_results()
     runner.plot_embedding_changes()
 

@@ -326,6 +326,8 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         
         *_, H, W, C = self.observations.shape
         self.observation_dim = self.obs_cond_dim = (H, W, C)
+        self.reward_threshold = 5.0
+        self.filtered_indices = self._filter_high_reward_trajectories()
           
     
     def actual_norm(self, obs):
@@ -334,46 +336,43 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         obs_norm = 2 * (obs - obs_min) / (obs_max - obs_min + 1e-8) - 1
         return obs_norm.astype(np.float32)
     
+    def _filter_high_reward_trajectories(self):
+        filtered = []
+        for traj_idx in range(len(self.dataset)):
+            rewards = self.rewards[traj_idx]  # shape: [T, 2, 1]
+            traj_len = rewards.shape[0]
+            for start in range(1, traj_len - self.horizon):
+                end = start + self.horizon
+                reward_sum = rewards[start:end, 0].sum()  # agent 0 reward
+                if reward_sum >= self.reward_threshold:
+                    filtered.append((traj_idx, start))
+        print(f"Filtered {len(filtered)} trajectories with rewards >= {self.reward_threshold}")
+        return filtered
+    
 
     def __len__(self):
-        return self.dataset.__len__()
+        return len(self.filtered_indices)
     
     def __getitem__(self, idx):
-        idx = 0
-        obs, actions, _ = self.dataset.__getitem__(idx)
+        traj_idx, start = self.filtered_indices[idx]
+        obs = self.observations[traj_idx]  # shape: [T+1, 2, H, W, C]
+        actions = self.actions[traj_idx]   # shape: [T, 2, 1]
 
-        # obs: horizon x agent_num (2) x H x W x C
-        # actions: horizon x 2 x action dim (1) 
-        # policy : 2 (tuple)
-        
-        obs = self.actual_norm(to_np(obs))
+        obs = self.actual_norm(obs)
 
         if obs.ndim == 4:
             obs = np.expand_dims(obs, axis=1)
 
-        T, _, H, W, C = obs.shape # Time, Agent, Height, Width, Channel 
-        # Get Ego Agent Observation (Agent ID  = 0)
-        start = random.randint(1, T - self.horizon - 1)
-        end = start + self.horizon
-        future_actions = actions[start:end, 0]
-        
-        # Condition on Start State
-        conditions_obs = obs[start-1, 0]
+        conditions_obs = obs[start - 1, 0]  # ego agent
+        future_actions = actions[start:start + self.horizon, 0]
 
-        # Actions Shape: (Horizon, 1)
-        # Conditions Shape : (1)
-        # Condition Inputs: (valid_len, H, W, C)
-        # Condition Masks : (valid_len,)
-        x = future_actions
-        x_cond = torch.from_numpy(conditions_obs)
-        
+        x = torch.from_numpy(future_actions)  # shape: [horizon, 1]
+        x_cond = torch.from_numpy(conditions_obs)  # shape: [H, W, C]
 
         assert x.min() >= 0 and x.max() < 6, f"Actions must be in [0, 6), got range [{x.min()}, {x.max()}]"
         assert x_cond.min() >= -1.0 and x_cond.max() <= 1.0
-        
+
         return x, x_cond
-
-
 
 def to_np(x):
 	if torch.is_tensor(x):

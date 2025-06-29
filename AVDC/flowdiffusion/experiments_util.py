@@ -43,12 +43,21 @@ def load_partner_policy(args, policy_name, device="cpu"):
 
 
 def normalize_obs(obs):
-    obs_max = obs.max(axis=(0, 1, 2), keepdims=True)  # shape [1, 1, 1, C]
-    obs_min = obs.min(axis=(0, 1, 2), keepdims=True)  # shape [1, 1, 1, C]
-    obs_norm = 2 * (obs - obs_min) / (obs_max - obs_min + 1e-8) - 1
+    if isinstance(obs, th.Tensor):
+        # Assume obs shape is [T, H, W, C]
+        obs_max = th.amax(obs, dim=(0, 1, 2), keepdim=True)
+        obs_min = th.amin(obs, dim=(0, 1, 2), keepdim=True)
+        obs_norm = 2 * (obs - obs_min) / (obs_max - obs_min + 1e-8) - 1
+        return obs_norm.float()
+    elif isinstance(obs, np.ndarray):
+        obs_max = obs.max(axis=(0, 1, 2), keepdims=True)
+        obs_min = obs.min(axis=(0, 1, 2), keepdims=True)
+        obs_norm = 2 * (obs - obs_min) / (obs_max - obs_min + 1e-8) - 1
+    else:
+        raise ValueError("Unsupported observation type. Must be numpy array or PyTorch tensor.")
     return obs_norm.astype(np.float32)
 
-def preprocess_for_idm(obs):
+def convert_to_binary_obs(obs):
     if isinstance(obs, np.ndarray):
         # For numpy arrays
         preprocessed_obs = np.where(obs < 0, -1.0, 1.0)
@@ -77,15 +86,14 @@ def to_torch(x, dtype=None, device=None):
     return th.tensor(x, dtype=dtype, device=device)
 
 def get_idm_action(current_obs, next_obs, idm_model):
-    current_obs = preprocess_for_idm(current_obs)
-    next_obs = preprocess_for_idm(next_obs)
+    current_obs = convert_to_binary_obs(current_obs)
+    next_obs = convert_to_binary_obs(next_obs)
     
     assert th.all((current_obs == -1) | (current_obs == 1)), "obs contains values other than -1 or 1"
     assert th.all((next_obs == -1) | (next_obs == 1)), "obs contains values other than -1 or 1"
     with th.no_grad():
         logits = idm_model(current_obs, next_obs)
-        probs = F.softmax(logits, dim=1)
-        action = th.argmax(probs)
+        action = th.argmax(logits, dim=1)
     return action
 
 @contextmanager

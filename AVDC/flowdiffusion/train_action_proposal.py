@@ -84,6 +84,7 @@ class ActionProposalTrainer:
             beta_schedule="cosine",
             min_snr_loss_weight=True,
             guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
+            auto_normalize=False,
         ).to(self.device)
         self.trainer = OvercookedActionProposal(
                 diffusion_model=self.diffusion,
