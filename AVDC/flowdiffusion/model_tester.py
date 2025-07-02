@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import pickle
+import random
 import sys
 
 from tqdm import tqdm
@@ -20,7 +21,7 @@ import warnings
 warnings.filterwarnings("ignore")
 from goal_diffusion import GoalGaussianDiffusion, ConceptTrainer
 from unet import UnetOvercooked 
-from experiments_util import managed_environment, normalize_obs, make_eval_env, to_torch, load_partner_policy, get_idm_action, convert_to_binary_obs
+from experiments_util import to_np, normalize_obs, make_eval_env, to_torch, load_partner_policy, get_idm_action, convert_to_binary_obs
 from overcooked_sample_renderer import OvercookedSampleRenderer
 from mapbt_package.mapbt.config import get_config
 import numpy as np
@@ -32,6 +33,7 @@ from idm.inverse_dynamics import InverseDynamicsModel
 from overcooked_dataset import OvercookedSequenceDataset
 from unet import UnetOvercooked, UnetOvercookedActionProposal
 from ema_pytorch import EMA
+from model_test_util import analyze_ambiguity_direct
 
 class ModelTester:
     def __init__(self, args):
@@ -45,6 +47,8 @@ class ModelTester:
         self.num_action_classes = 6  # Overcooked default
         self.H, self.W, self.C = 8, 5, 26  # Overcooked obs shape
         self.num_actions = 6
+        self.action_horizon = 8
+        self.no_op_action = 4
         self.n_envs = args.n_envs
         self.data = None
         self.value_min, self.value_max = 0.0, 25.0
@@ -150,14 +154,15 @@ class ModelTester:
         envs.close()
         self.data = all_data
         return all_data
-    def evaluate_in_env(self, state_action_fn, num_episodes=10):
+    def evaluate_in_env(self, state_action_fn, num_episodes=10, policy_name="bc_train"):
         """Test the value model by running episodes and collecting rewards.
         Supports both single-step and planning horizon action outputs.
         """
         all_data = []
-        bc_policy, _ = load_partner_policy(self.args, "bc_train", device="cpu")
+        bc_policy, _ = load_partner_policy(self.args, policy_name, device="cpu")
         envs = make_eval_env(self.args, run_dir=self.args.run_dir, nenvs=self.n_envs)
-        envs.reset_featurize_type([("ppo", "bc") for _ in range(self.n_envs)])
+        if policy_name == "bc_train":
+            envs.reset_featurize_type([("ppo", "bc") for _ in range(self.n_envs)])
         for episode in tqdm(range(num_episodes), desc="Collecting data"):
             # Reset Policy
             bc_policy.reset(num_envs=self.n_envs, num_agents=1)
@@ -315,7 +320,7 @@ class ModelTester:
             'team_mean_reward': mean_team_reward,
             'team_std_reward': std_team_reward,
         }
-    def plot_base_model_results(self, results):
+    def plot_base_model_results(self, results, agent_label="sp_best"):
         """
         Generate a grouped bar plot for base model evaluation results.
         Assumes all results are for the same partner policy ("bc_train").
@@ -332,7 +337,6 @@ class ModelTester:
             return
 
         # Always use "bc_train" as the label
-        labels = ["bc_train"] * len(df)
         x = np.arange(len(df))  # the label locations
 
         # Bar width
@@ -353,12 +357,12 @@ class ModelTester:
 
         plt.figure(figsize=(10, 6))
         plt.bar(r1, agent0_means, yerr=agent0_stds, width=bar_width, label='Agent 0 (Diffusion)', capsize=5, color='skyblue')
-        plt.bar(r2, agent1_means, yerr=agent1_stds, width=bar_width, label='Agent 1 (bc_train)', capsize=5, color='lightgreen')
+        plt.bar(r2, agent1_means, yerr=agent1_stds, width=bar_width, label=f'Agent 1 ({agent_label})', capsize=5, color='lightgreen')
         plt.bar(r3, team_means, yerr=team_stds, width=bar_width, label='Team Total', capsize=5, color='coral')
 
         plt.xlabel('Evaluation Run')
         plt.ylabel('Mean Reward')
-        plt.title('Base Model Performance (Partner: bc_train)')
+        plt.title(f'Base Model Performance (Partner: {agent_label})')
         plt.xticks(x + bar_width, [f'Run {i+1}' for i in x])
         plt.legend()
         plt.grid(axis='y', alpha=0.3)
@@ -444,7 +448,7 @@ class ModelTester:
             use_padding=self.args.use_padding,
         )
         return OvercookedSequenceDataset(
-            args=dataset_args, split=split
+            args=dataset_args, split=split, allowed_policies=None,
         )
     def _load_action_proposal_model(self,ema=True):
         """Load the action proposal model."""
@@ -575,8 +579,14 @@ class ModelTester:
                 obs_t_tensor = to_torch(obs_t_ego_bin, device=self.device)
                 obs_tp1_tensor = to_torch(obs_tp1_ego_bin, device=self.device)
 
+                # if True:
+                #     other_agent_channels = [1, 6, 7, 8, 9]  # player_1_loc and player_1_orientation_*
+                #     obs_t_tensor[..., other_agent_channels] = 0.0
+                #     obs_tp1_tensor[..., other_agent_channels] = 0.0
+
                 # IDM predicts action given (obs_t, obs_tp1)
                 pred_logits = self.idm(obs_t_tensor, obs_tp1_tensor)  # shape: (n_envs, num_actions)
+                # TODO: Try out with softmax
                 pred_actions = pred_logits.argmax(dim=-1).cpu().numpy()  # shape: (n_envs,)
 
                 # Store input gradients for analysis
@@ -603,9 +613,8 @@ class ModelTester:
             "input_gradients": input_grads,
         }
     
-    
     @th.no_grad()
-    def evaluate_action_proposal_in_env(self, num_episodes=10, planning_horizon=8):
+    def evaluate_action_proposal_in_env(self, num_episodes=10, planning_horizon=32, policy_name="sp_best"):
         self.action_proposal_model.eval()
         def action_proposal_fn(obs):
             """
@@ -624,9 +633,123 @@ class ModelTester:
             print(f"Action proposal shape: {action.shape}")
             return action
         # Evaluate in environment
-        eval_data = self.evaluate_in_env(action_proposal_fn, num_episodes=num_episodes)
+        eval_data = self.evaluate_in_env(action_proposal_fn, num_episodes=num_episodes, policy_name=policy_name)
         return eval_data
 
+    def extract_obs_action_tuples(self, dataset, ego_player_id=0):
+        for ep in range(len(dataset)):
+            obs = dataset.observations[ep]
+            actions = dataset.actions[ep].squeeze(-1) # [T, num_players, 1] -> [T, num_players]
+            ep_len = obs.shape[0] - 1  # Last observation is not used for action prediction
+            for t in range(ep_len):
+                obs_t = obs[t]
+                obs_tp1 = obs[t+1]
+                action_t = actions[t, ego_player_id]
+                yield (obs_t, obs_tp1, action_t)
+    def run_ambiguity_analysis(self, dataset, ego_player_id=0):
+        tuples = self.extract_obs_action_tuples(dataset, ego_player_id=ego_player_id)
+        results = analyze_ambiguity_direct(tuples, True)
+        save_dir = self.base_dir / "ambiguity_analysis"
+        save_dir.mkdir(parents=True, exist_ok=True)
+        with open(save_dir / "ambiguity_analysis_results.json", "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"Ambiguity analysis results saved to {save_dir / 'ambiguity_analysis_results.json'}")
+
+    def load_diffusion_model(self, model_path, ema=True, num_classes=None):
+        """Load the diffusion model for evaluation only."""
+        print(f"Loading diffusion model from {model_path}, ema={ema}, num_classes={num_classes}")
+        if not osp.exists(model_path):
+            raise FileNotFoundError(f"Model path {model_path} does not exist.")
+        ckpt = th.load(model_path, map_location="cpu")
+        unet = UnetOvercooked(
+            horizon=self.args.horizon,
+            obs_dim=(self.H, self.W, self.C),
+            num_classes=num_classes,
+            num_actions=self.num_actions,
+            action_horizon=self.action_horizon,
+        ).to(self.device)
+        H,W,C = self.H, self.W, self.C
+        diffusion = GoalGaussianDiffusion(
+            model=unet,
+            channels=C * self.horizon,
+            image_size=(H,W),
+            timesteps=1 if self.args.debug else 1000,
+            sampling_timesteps=1 if self.args.debug else 100,
+            loss_type="l2",
+            objective="pred_v",
+            beta_schedule="cosine",
+            min_snr_loss_weight=True,
+            guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
+            auto_normalize=False,
+            num_actions=self.num_actions,
+            no_op_action=self.no_op_action
+        ).to(self.device)
+        if ema:
+            ema_wrap = EMA(diffusion,beta = 0.999,update_every=10)
+            ema_wrap.load_state_dict(ckpt['ema'])
+            return ema_wrap
+        else:
+            diffusion.load_state_dict(ckpt['model'])
+            return diffusion
+
+    def evaluate_world_model(self, obs, policy_id, actions=None):
+        predefined_actions = [
+            # [0]*8, # Move Up
+            # [1]*8, # Move Down
+            # [2]*8, # Move Right
+            # [3]*8, # Move Left
+            # [4]*8, # No Op Action
+            # [np.random.randint(0, self.num_actions) for _ in range(8)],
+            actions,
+        ]
+        print(predefined_actions)
+        if obs.ndim == 4:
+            obs = obs.squeeze(0)
+        obs = to_np(obs)
+        obs_print = np.transpose(obs, (1, 0, 2))
+        grid = self.renderer.extract_grid_from_obs(obs_print)
+        eval_path = self.base_dir / "world_model_eval" / f"policy_{policy_id}"
+        eval_path.mkdir(parents=True, exist_ok=True)
+        self.renderer.save_obs_image(
+            obs_print,
+            grid,
+            file_path=str(eval_path / "obs_image.png"),
+            normalize=True,
+        )
+        self.renderer.visualize_all_channels(
+                obs_print,  # First frame
+                output_dir=str(eval_path / f"x_cond_policy_{policy_id}.png"),
+            )
+        self.renderer.visualize_all_channels(
+            obs_print,  # First frame
+            output_dir=str(eval_path / f"x_cond_channels_policy_{policy_id}_action_channels.png"),
+        )
+        obs = to_torch(obs, device=self.device).float()
+        # obs = normalize_obs(obs)
+        obs = obs.view(self.C, self.H, self.W)
+        obs = obs.unsqueeze(0)  # Add batch dimension
+        for i, action_condition in enumerate(predefined_actions):
+            action_cond = th.tensor(action_condition, device=self.device).long()  # Add batch dimension
+            policy_id = th.tensor([policy_id], device=self.device).long()
+            trajectory = self.world_model.sample(
+                    x_cond=obs,
+                    action_embed=action_cond,
+                    batch_size=1,
+                    task_embed=policy_id)
+            trajectory = rearrange(trajectory, "b (f c) h w -> b f w h c", c=self.C, f=self.horizon)
+            self.renderer.render_trajectory_video(
+                to_np(trajectory[0]),
+                grid,
+                output_dir=eval_path,
+                video_path=str(eval_path / f"policy_{policy_id}_action_{i}.mp4"),
+                fps=1,
+                normalize=True,
+            )
+            first_frame = rearrange(trajectory, "b f w h c -> b f h w c")
+            self.renderer.visualize_all_channels(
+                to_np(first_frame[0, 0]),  # First frame
+                output_dir=str(eval_path / f"policy_{policy_id}_action_{i}_channels.png"),
+            )
             
     def plot_action_proposal_model_debug(self, metrics, title_prefix=""):
         summary = {}
@@ -1320,7 +1443,9 @@ class ModelTester:
     
     def run_dataset_evaluation(self):
         self.dataset = self._load_dataset(split="train")
-        self.plot_dataset_data(title_prefix="sp10_final_bc_test_")
+        # self.plot_dataset_data(title_prefix="sp10_final_bc_test_")
+        self.set_experiment_dir("dataset_evaluation")
+        self.run_ambiguity_analysis(self.dataset)
        
     def run_value_model_evaluation(self, title_prefix):
         self.value_model = self._load_value_model()
@@ -1344,15 +1469,147 @@ class ModelTester:
         # self.plot_action_proposal_model_debug(eval_results, title_prefix=title_prefix)
 
         # Evaluation
-        eval_data = self.evaluate_action_proposal_in_env(num_episodes=1, planning_horizon=32)
+        eval_data = self.evaluate_action_proposal_in_env(num_episodes=1, planning_horizon=2, policy_name="sp_best")
         episode_rewards_list = []
         for eval_run in eval_data:
             episode_reward = eval_run["episode_reward"]
             episode_rewards_list.append(episode_reward)
         summary = self.calculate_evaluation_summary(episode_rewards_list)
-        self.plot_base_model_results([summary])
+        self.plot_base_model_results([summary], agent_label="sp_best")
         print("Action proposal model evaluation completed and plots saved.")
+    
+    def run_world_model_evaluation_new_data(self, title_prefix):
+        self.world_model = self.load_diffusion_model(self.args.diffusion_model_path, num_classes=60)
+        if hasattr(self.world_model, 'ema_model'):
+            self.world_model = self.world_model.ema_model
+        num_samples = 1
+        # policy_ids = [35, 38, 47, 44, 41]
+        policy_ids = [0]
 
+        # Sample random episodes and timesteps for diverse obs
+        for sample_idx in range(num_samples):
+            # Sample a random episode and timestep
+            episode = random.choice(self.data)
+            obs_seq = episode["obs_t"]
+            action_seq = episode["actions"]
+
+            # Pick a random timestep
+            t = random.randint(0, len(obs_seq) - 1)
+            obs = obs_seq[t]
+            obs = np.array(obs[0])  # Convert to numpy array if needed
+            
+            # Evaluate for each policy_id
+            for policy_id in policy_ids:
+                print(f"Evaluating world model with sample {sample_idx}, timestep {t}, policy ID {policy_id}")
+                self.evaluate_world_model(obs, policy_id)
+    
+    def run_world_model_evaluation_with_dataset(self, title_prefix):
+        self.world_model = self.load_diffusion_model(self.args.diffusion_model_path, num_classes=60)
+        if hasattr(self.world_model, 'ema_model'):
+            self.world_model = self.world_model.ema_model
+        self.world_model.to(self.device)
+        dataset = self._load_dataset(split="train")
+        loader = th.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
+        num_samples = 5
+
+        # Sample random episodes and timesteps for diverse obs
+        for i, (x_org, x_cond, task_embed, _) in enumerate(loader):
+            actions = th.tensor([4]*8, dtype=th.long).unsqueeze(0)
+            x_cond = rearrange(x_cond, "b h w c -> b c h w")
+            x_cond = x_cond.to(self.device)
+            task_embed = task_embed.to(self.device)
+            actions = actions.to(self.device)
+            pred_traj = self.world_model.sample(
+                x_cond=x_cond,
+                task_embed=task_embed,
+                action_embed=actions,
+                batch_size=1,
+            )
+            pred_traj = rearrange(pred_traj, "b (f c) h w -> b f h w c", c=26, f=32)
+            pred_traj = rearrange(pred_traj, "b f h w c -> b f w h c")
+            pred_traj = pred_traj.cpu().numpy()
+            viz_output_path = self.base_dir / "world_model_eval"
+            pred_traj_path = self.base_dir / "world_model_eval" / f"{title_prefix}_pred_traj_{i}.mp4"
+            grid_obs = rearrange(x_org, "b f h w c -> b f w h c").cpu().numpy()[0, 0]
+            grid = self.renderer.extract_grid_from_obs(grid_obs)
+            self.renderer.render_trajectory_video(
+                    pred_traj[0],
+                    grid=grid,
+                    output_dir=str(viz_output_path),
+                    video_path=str(pred_traj_path),
+                    fps=1,
+                    normalize=True,
+                )
+            x_cond_print = rearrange(x_cond, "b c h w -> b w h c")
+            x_cond_path = self.base_dir / "world_model_eval" / f"{title_prefix}_x_cond_{i}.png"
+            self.renderer.save_obs_image(
+                x_cond_print.cpu().numpy()[0],
+                grid=grid,
+                file_path=x_cond_path,
+                normalize=True,
+            )
+            if i >= num_samples - 1:
+                break
+    def run_obs_roundtrip_test(self, title_prefix):
+        # Sample random episodes and timesteps for diverse obs
+        def consistent_norm(obs):
+            # Scaled down by 255 since data is scaled by 255
+            assert np.all(obs % 255 == 0)
+            obs = obs.astype(np.float32) / 255.0
+
+            HARDCODED_INDEX_TO_MAX_VAL = {
+                16: 3.0,  # onions_in_pot
+                17: 3.0,  # tomatoes_in_pot
+                18: 3.0,  # onions_in_soup
+                19: 3.0,  # tomatoes_in_soup
+                20: 20.0, # soup_cook_time_remaining
+            } 
+
+            normalized_obs = np.zeros_like(obs, dtype=np.float32)
+
+            for ch_idx in range(obs.shape[-1]):
+                ch_data = obs[..., ch_idx]
+                if ch_idx in HARDCODED_INDEX_TO_MAX_VAL:
+                    # Normalize from original game range [0, max_val] to [-1, 1]
+                    max_ch_val = HARDCODED_INDEX_TO_MAX_VAL[ch_idx]
+                    norm_ch = 2.0 * (ch_data / max_ch_val) - 1.0
+                else:
+                    # Assume binary channel (original game values are 0 or 1).
+                    norm_ch = 2.0 * ch_data - 1.0
+                normalized_obs[..., ch_idx] = norm_ch
+            return normalized_obs
+        num_samples = 1000000
+        num_pass = 0
+        num_fail = 0
+        max_diff = 0.0
+        for sample_idx in tqdm(range(num_samples), desc="Running Observation Roundtrip Test"):
+            # Sample a random episode and timestep
+            episode = random.choice(self.data)
+            obs_seq = episode["obs_t"]
+
+            # Pick a random timestep
+            t = random.randint(0, len(obs_seq) - 1)
+            obs = obs_seq[t]
+            obs = np.array(obs[0])  # Convert to numpy array if needed
+            obs = obs[0,...]
+            norm_obs = consistent_norm(obs)
+            assert norm_obs.min() >= -1.0 and norm_obs.max() <= 1.0
+            
+            denormalized_obs = self.renderer.unnormalize(norm_obs)
+            unscaled_obs = obs / 255.0
+            close = np.allclose(unscaled_obs, denormalized_obs, atol=1e-5)
+            if close:
+                num_pass += 1
+            else:
+                num_fail += 1
+                diff = np.abs(unscaled_obs - denormalized_obs).max()
+                max_diff = max(max_diff, diff)
+                print(f"Sample {sample_idx}: Max diff {diff:.6f} at timestep {t}")
+        print(f"[Obs Roundtrip Test] {num_pass}/{num_samples} passed, {num_fail} failed.")
+        if num_fail > 0:
+            print(f"Max difference in failed cases: {max_diff}")  
+                    
+               
     def set_experiment_dir(self, experiment_name, subfolder_name=None):
         """
         Set the base_dir to the experiment-specific subfolder, only if not already set.
@@ -1370,14 +1627,18 @@ class ModelTester:
         self.set_experiment_dir("sp10_bc", name)
         # self.run_idm_model_evaluation("sp10_bc_")
         # self.run_value_model_evaluation("sp10_bc_")
-        self.run_action_proposal_evaluation("sp10_bc_")
+        # self.run_action_proposal_evaluation("sp10_bc_")
+        # self.run_world_model_evaluation("world_model_eval_1")
+        self.run_world_model_evaluation_with_dataset("world_model_eval_2")
+        # self.run_obs_roundtrip_test("obs_roundtrip_test_1")
     
     def run_actor_best_bc(self, name=None):
         self.load_data("./model_tester/data/model_tester_actor_best_bc_train_100.pkl")
         self.set_experiment_dir("actor_best_bc", name)
         # self.run_idm_model_evaluation("actor_best_bc_")
         # self.run_value_model_evaluation("actor_best_bc_")
-        self.run_action_proposal_evaluation("actor_best_bc_")
+        # self.run_action_proposal_evaluation("actor_best_bc_")
+        # self.run_obs_roundtrip_test("obs_roundtrip_test_1")
     
             
 
@@ -1398,7 +1659,7 @@ def parse_args(args, parser):
     parser.add_argument('--chunk_length', type=int, default=None, help='Chunk length for HDF5Dataset (defaults to horizon if None, set via dataset_constructor_args)')
     parser.add_argument('--use_padding', type=bool, default=True, help='Whether to use padding for shorter sequences in dataset')
     
-    # parser.add_argument("--diffusion_model_path", type=str, required=True, help="Path to the diffusion model directory")
+    parser.add_argument("--diffusion_model_path", type=str, required=True, help="Path to the diffusion model directory")
     parser.add_argument("--n_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--max_steps", type=int, default=400, help="Maximum steps per episode")
     parser.add_argument("--idm_path", type=str, required=True, help="Path to the diffusion model directory")
@@ -1435,6 +1696,7 @@ if __name__ == "__main__":
     args.episode_length = 400
     tester = ModelTester(args=args)
     tester.run_sp10_ego()
+    # tester.run_dataset_evaluation()
     # tester.run_actor_best_bc()
     # tester.collect_data(num_episodes=100)
     # tester.save_data("model_tester_actor_best_bc_train.pkl")

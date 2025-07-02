@@ -68,6 +68,48 @@ class OvercookedTrainer:
                 self.trainer.load(milestone=args.resume_checkpoint_path)
             else:
                 print(f"Warning: Checkpoint path {args.resume_checkpoint_path} not found. Starting training from scratch.")
+    def get_architecture(self):
+        H,W,C = self.observation_dim
+        from torchview import draw_graph
+        dummy_x = torch.randn(1, 32 * C, H, W, device=self.device)
+        dummy_t = torch.randint(0, 1000, (1,), device=self.device)
+        dummy_x_cond = torch.randn(1, C, H, W, device=self.device)
+        dummy_action_embed = torch.randn(1, 8, 6, device=self.device)
+        dummy_task_embed = torch.ones(1, device=self.device).long()
+        model_inputs = {
+            'x': dummy_x,
+            'x_cond': dummy_x_cond,
+            't': dummy_t,
+            'task_embed': dummy_task_embed,
+            'action_embed': dummy_action_embed,
+        }
+        print("\nDrawing graph... (this may take a moment)")
+        model_graph = draw_graph(
+            self.unet,
+            input_data=model_inputs,
+            graph_name='UnetOvercooked_View_Cross',
+            save_graph=True, # This will save a PDF of the graph
+            depth=4, # Expand modules up to 5 levels deep
+            expand_nested=True, # Show nested modules
+            hide_inner_tensors=True, # Set to True for a cleaner but less detailed graph
+            hide_module_functions=True, # Shows functions like rearrange, cat, etc.
+            mode="train",
+            roll=True,
+        )
+        # onnx_file_path = "unet_overcooked_cross.onnx"
+        # onnx_input_tuple = tuple(model_inputs.values())
+        # input_names = list(model_inputs.keys())
+        
+        # torch.onnx.export(
+        #     self.unet,
+        #     onnx_input_tuple,  # Model inputs
+        #     onnx_file_path,    # Where to save the model
+        #     export_params=True,
+        #     opset_version=14,  # A standard version
+        #     do_constant_folding=True,
+        #     input_names=input_names,
+        #     output_names=['output'], # Give the output a name
+        # )
         
     def init_diffusion_trainer(self):
         H,W,C = self.observation_dim
@@ -80,10 +122,10 @@ class OvercookedTrainer:
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
             model=self.unet,
-            channels=C * 32, #TODO: Look into this Channels * Horizon
+            channels=C * self.horizon,
             image_size=(H,W),
-            timesteps=1 if self.args.debug else 1000,
-            sampling_timesteps=1 if self.args.debug else 100,
+            timesteps=1000,
+            sampling_timesteps=100,
             loss_type="l2",
             objective="pred_v",
             beta_schedule="cosine",

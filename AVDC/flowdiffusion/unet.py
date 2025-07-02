@@ -86,7 +86,7 @@ class UnetOvercooked(nn.Module):
             model_channels=128,
             out_channels=self.C,
             num_res_blocks=2,
-            attention_resolutions=(8, 16), # TODO: Change to 2,4; we're currently not using attention
+            attention_resolutions=(1, 2),
             dropout=0,
             channel_mult=(1, 2),
             conv_resample=True,
@@ -99,6 +99,8 @@ class UnetOvercooked(nn.Module):
             use_checkpoint=False,
             use_fp16=False,
             num_head_channels=32,
+            cross=True,
+            use_scale_shift_norm=True,
         )
     def pad_even(self, x):
         """Pads the Height and Width dimensions (dims 2 and 3 for 5D) to be even."""
@@ -148,9 +150,9 @@ class UnetOvercookedActionProposal(nn.Module):
             out_channels=self.num_actions,
             num_res_blocks=2,
             image_cond_dim=(self.C, self.H, self.W),
-            attention_resolutions=(4, 8),
+            attention_resolutions=(2, 4, 8, 16), # TODO: Changed to (2, 4, 8) was (4, 8)
             dropout=0,
-            channel_mult=(1, 2, 4),
+            channel_mult=(1, 2, 4, 8),
             conv_resample=True,
             dims=1,
             num_classes=None,

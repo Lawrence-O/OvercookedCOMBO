@@ -75,7 +75,7 @@ class ActionProposalTrainer:
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
             model=self.unet,
-            channels=self.num_actions * self.horizon, #TODO: Look into this Channels * Horizon
+            channels=self.num_actions * self.horizon,
             image_size=(1,1),
             timesteps=1 if self.args.debug else 1000,
             sampling_timesteps=1 if self.args.debug else 100,

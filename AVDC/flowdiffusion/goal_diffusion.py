@@ -1456,7 +1456,6 @@ class OvercookedEnvTrainer(Trainer):
             raise ValueError("no_op_action must be provided for OvercookedEnvTrainer")
         assert self.dummy_id == 0, "dummy_policy_id must be 0 for OvercookedEnvTrainer"
         self.no_op_action = no_op_action
-
         
         config_to_log = {
             # Trainer parameters
@@ -1481,10 +1480,20 @@ class OvercookedEnvTrainer(Trainer):
             "no_op_action": self.no_op_action,
             
             # Dataset parameters
-            "dataset_type": train_set.__class__.__name__,
-            "dataset_horizon": train_set.horizon if hasattr(train_set, 'horizon') else 'N/A',
-            "dataset_max_path_length": train_set.max_path_length if hasattr(train_set, 'max_path_length') else 'N/A',
-            "dataset_use_padding": train_set.use_padding if hasattr(train_set, 'use_padding') else 'N/A',
+            "dataset_type": train_set.dataset.__class__.__name__,
+            "dataset_horizon": getattr(train_set.dataset, 'horizon', 'N/A'),
+            "dataset_max_path_length": getattr(train_set.dataset, 'max_path_length', 'N/A'),
+            "dataset_use_padding": getattr(train_set.dataset, 'use_padding', 'N/A'),
+            "dataset_action_horizon": getattr(train_set.dataset, 'action_horizon', 'N/A'),
+            "dataset_observation_dim": getattr(train_set.dataset, 'observation_dim', 'N/A'),
+            "dataset_num_actions": getattr(train_set.dataset, 'num_actions', 'N/A'),
+            "dataset_no_op_action": getattr(train_set.dataset, 'no_op_action', 'N/A'),
+            "dataset_dummy_id": getattr(train_set.dataset, 'dummy_id', 'N/A'),
+            "dataset_num_partner_policies": getattr(train_set.dataset, 'num_partner_policies', 'N/A'),
+            "dataset_current_split": getattr(train_set.dataset, 'current_split', 'N/A'),
+            "dataset_valid_indices": len(getattr(train_set.dataset, 'valid_indices', [])) if hasattr(train_set, 'valid_indices') else 'N/A',
+            "dataset_policy_name_to_id": json.dumps(getattr(train_set.dataset, "policy_name_to_id", {})),
+            "dataset_policy_id_to_name": json.dumps(getattr(train_set.dataset, "policy_id_to_name", {})),
 
             # Diffusion model (GoalGaussianDiffusion) parameters
             "diffusion_model_type": diffusion_model.__class__.__name__,
@@ -1506,8 +1515,16 @@ class OvercookedEnvTrainer(Trainer):
             "unet_attention_resolutions": str(diffusion_model.model.unet.attention_resolutions) if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_channel_mult": str(diffusion_model.model.unet.channel_mult) if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_num_classes": diffusion_model.model.unet.num_classes if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_attention_resolutions": str(diffusion_model.model.unet.attention_resolutions) if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_cross_attention_enabled": diffusion_model.model.unet.cross if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_heads": diffusion_model.model.unet.num_heads if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_head_channels": diffusion_model.model.unet.num_head_channels if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_classes": diffusion_model.model.unet.num_classes if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_use_scale_shift_norm": diffusion_model.model.unet.use_scale_shift_norm if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_dropout": diffusion_model.model.unet.dropout if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_use_checkpointing": diffusion_model.model.unet.use_checkpoint if hasattr(diffusion_model.model, 'unet') else 'N/A',
         }
-        
+
         
         if cond_drop_chance > 0 and dummy_policy_id is None:
             raise ValueError("Must provide dummy_policy_id when cond_drop_chance > 0")
@@ -1561,6 +1578,8 @@ class OvercookedEnvTrainer(Trainer):
     
     def train_one_step(self):
         total_loss = 0
+        self.valid_one_step()
+        exit()
 
         for _ in range(self.gradient_accumulate_every):
             x, x_cond, policy_id, actions = next(self.dl)
@@ -1606,8 +1625,15 @@ class OvercookedEnvTrainer(Trainer):
             "predicted": None,
             "argmax": None,
             "reference": None,
-            "unconditional": None
+            "unconditional": None,
+            "no_op_test": None,
         }
+        wandb_images = {
+            "cond_image": None,
+            "predicted_channels": None,
+            "unconditional_channels": None,
+        }
+        cond_final_image_path = None
         for x_org, x_cond, policy_id, actions in self.valid_dl:
             B, *_ = x_org.shape
             x = rearrange(x_org, "b f h w c -> b (f c) h w")
@@ -1617,12 +1643,13 @@ class OvercookedEnvTrainer(Trainer):
             dummy_cond = torch.ones_like(policy_id)*self.dummy_id
             uncond_actions = torch.ones_like(actions) * self.no_op_action
             uncond_loss = self.model(x, x_cond, task_embed=dummy_cond, action_embed=uncond_actions)
+            
 
             total_valid_loss.append(loss)
             total_unconditional_loss.append(uncond_loss)
 
             horizon = self.model.model.horizon
-            C = self.model.model.C           
+            C = self.model.model.C       
             
             pred_traj = self.ema.ema_model.sample(
                 x_cond=x_cond,
@@ -1634,7 +1661,14 @@ class OvercookedEnvTrainer(Trainer):
             uncond_pred_traj = self.ema.ema_model.sample(
                 x_cond=x_cond,
                 task_embed=dummy_cond,
-                action_embed=actions,
+                action_embed=uncond_actions,
+                batch_size=B,
+            )
+
+            no_op_traj = self.ema.ema_model.sample(
+                x_cond=x_cond,
+                task_embed=policy_id,
+                action_embed=uncond_actions,
                 batch_size=B,
             )
             # Process conditional trajectory
@@ -1649,7 +1683,16 @@ class OvercookedEnvTrainer(Trainer):
             uncond_pred_traj = rearrange(uncond_pred_traj, "b f h w c -> b f w h c")
             uncond_pred_traj = uncond_pred_traj.cpu().numpy()
 
-            grid = self.renderer.extract_grid_from_obs(x_org.cpu().numpy()[0, 0])
+            #Process no-op trajectory
+            no_op_traj = rearrange(no_op_traj, "b (f c) h w -> b f h w c", c=C, f=horizon)
+            no_op_traj = rearrange(no_op_traj, "b f h w c -> b f w h c")
+            no_op_traj = no_op_traj.cpu().numpy()
+
+            grid_obs = rearrange(x_org, "b f h w c -> b f w h c").cpu().numpy()[0, 0]
+            grid = self.renderer.extract_grid_from_obs(grid_obs)
+            cond_img_path = os.path.join(viz_output_dir, f"cond_img_step_{self.step}.png")
+            x_cond_print = rearrange(x_cond, "b c h w -> b w h c")
+             
             for i in range(B):
                 pred_traj_path = os.path.join(viz_output_dir, f"pred_traj_step_{self.step}_batch_{i}.mp4")
                 self.renderer.render_trajectory_video(
@@ -1690,11 +1733,44 @@ class OvercookedEnvTrainer(Trainer):
                     normalize=True,
                 )
 
+                no_op_traj_path = os.path.join(viz_output_dir, f"no_op_traj_step_{self.step}_batch_{i}.mp4")
+                self.renderer.render_trajectory_video(
+                    no_op_traj[i],
+                    grid=grid,
+                    output_dir=viz_output_dir,
+                    video_path=no_op_traj_path,
+                    fps=1,
+                    normalize=True,
+                )
+
+                cond_img_path = os.path.join(viz_output_dir, f"cond_img_step_{self.step}_batch_{i}.png")
+                self.renderer.save_obs_image(
+                    x_cond_print.cpu().numpy()[i],
+                    grid=grid,
+                    file_path=cond_img_path,
+                    normalize=True,
+                )
+                # Save channels visualization
+                uncond_ch_path = os.path.join(ch_output_dir, f"uncond_channels_step_{self.step}_batch_{i}.png")
+                self.renderer.visualize_all_channels(
+                    obs=uncond_pred_traj[i, 0],
+                    output_dir=uncond_ch_path
+                )
+                pred_ch_path = os.path.join(ch_output_dir, f"pred_channels_step_{self.step}_batch_{i}.png")
+                self.renderer.visualize_all_channels(
+                    obs=pred_traj[i, 0],
+                    output_dir=pred_ch_path
+                )  
+
                 if i == 0:
                     wandb_videos["predicted"] = pred_traj_path
                     wandb_videos["argmax"] = arg_pred_traj_path
                     wandb_videos["reference"] = ref_traj_path
                     wandb_videos["unconditional"] = uncond_traj_path
+                    wandb_videos["no_op_test"] = no_op_traj_path
+                    wandb_images["cond_image"] = cond_img_path
+                    wandb_images["predicted_channels"] = pred_ch_path
+                    wandb_images["unconditional_channels"] = uncond_ch_path
 
                 if i + 1 == B:
                     ch_max = min(26, B)
@@ -1721,10 +1797,12 @@ class OvercookedEnvTrainer(Trainer):
                 if video_path and os.path.exists(video_path):
                     wandb_log_dict[f"evaluation/{video_type}_trajectory"] = wandb.Video(
                         video_path, 
-                        fps=2, 
+                        fps=1, 
                         format="mp4",
                         caption=f"{video_type.capitalize()} trajectory at step {self.step}"
                     )
+            if cond_final_image_path and os.path.exists(cond_final_image_path):
+                wandb_log_dict["evaluation/cond_img"] = wandb.Image(cond_final_image_path, caption=f"Conditioning image at step {self.step}")
             wandb.log(wandb_log_dict, step=self.step)
         return valid_loss 
 

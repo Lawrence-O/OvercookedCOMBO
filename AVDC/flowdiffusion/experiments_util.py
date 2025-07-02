@@ -42,7 +42,7 @@ def load_partner_policy(args, policy_name, device="cpu"):
     return policy, feat_type
 
 
-def normalize_obs(obs):
+def normalize_obs(obs): # TODO: Fix this
     if isinstance(obs, th.Tensor):
         # Assume obs shape is [T, H, W, C]
         obs_max = th.amax(obs, dim=(0, 1, 2), keepdim=True)

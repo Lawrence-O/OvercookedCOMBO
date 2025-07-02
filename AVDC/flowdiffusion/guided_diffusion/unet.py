@@ -20,7 +20,7 @@ from .nn import (
     timestep_embedding,
 )
 
-from .imagen import PerceiverResampler
+from .imagen import CrossAttention
 
 
 
@@ -74,10 +74,10 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
     support it as an extra input.
     """
 
-    def forward(self, x, emb):
+    def forward(self, x, emb, vis=None):
         for layer in self:
             if isinstance(layer, TimestepBlock):
-                x = layer(x, emb)
+                x = layer(x, emb, vis)
             else:
                 x = layer(x)
         return x
@@ -174,6 +174,8 @@ class ResBlock(TimestepBlock):
         use_checkpoint=False,
         up=False,
         down=False,
+        cross=False,
+        name="",
     ):
         super().__init__()
         self.channels = channels
@@ -183,12 +185,18 @@ class ResBlock(TimestepBlock):
         self.use_conv = use_conv
         self.use_checkpoint = use_checkpoint
         self.use_scale_shift_norm = use_scale_shift_norm
+        self.cross=cross
+        self.dims = dims
+        self.name = name
 
         self.in_layers = nn.Sequential(
             normalization(channels),
             nn.SiLU(),
             conv_nd(dims, channels, self.out_channels, 3, padding=1),
         )
+        
+        if self.cross:
+            self.cross_attn = CrossAttention(self.out_channels, context_dim=emb_channels, dim_head=32, heads=4)
 
         self.updown = up or down
 
@@ -224,7 +232,7 @@ class ResBlock(TimestepBlock):
         else:
             self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
 
-    def forward(self, x, emb):
+    def forward(self, x, emb, vis):
         """
         Apply the block to a Tensor, conditioned on a timestep embedding.
 
@@ -233,10 +241,11 @@ class ResBlock(TimestepBlock):
         :return: an [N x C x ...] Tensor of outputs.
         """
         return checkpoint(
-            self._forward, (x, emb), self.parameters(), self.use_checkpoint
+            self._forward, (x, emb, vis), self.parameters(), self.use_checkpoint
         )
 
-    def _forward(self, x, emb):
+    def _forward(self, x, emb, vis=None):
+        emb, latent, mask = emb
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_rest(x)
@@ -245,6 +254,33 @@ class ResBlock(TimestepBlock):
             h = in_conv(h)
         else:
             h = self.in_layers(x)
+        
+        if self.cross:
+            if self.dims == 3:
+                _, _, frames, height, width = h.size()
+                h = rearrange(h, 'b c f h w -> b (f h w) c')
+                if vis is not None:
+                    c, attn = self.cross_attn(h, latent, mask=mask, ret_score=True)
+                    attn = attn.mean(dim=1) # b (f h w) t
+                    vis.add_attn_map(rearrange(attn, 'b (f h w) t -> b f h w t', f=frames, h=height, w=width))
+                else:
+                    c = self.cross_attn(h, latent, mask=mask)
+                h = h + c
+                h = rearrange(h, 'b (f h w) c -> b c f h w', f=frames, h=height, w=width)
+            elif self.dims == 2:
+                _, _, height, width = h.size()
+                h = rearrange(h, 'b c h w -> b (h w) c')
+                h = self.cross_attn(h, latent) + h
+                h = rearrange(h, 'b (h w) c -> b c h w', h=height, w=width)
+            elif self.dims == 1:
+                # [B, num_actions, horizon
+                _, _, length = h.size()
+                h = rearrange(h, 'b c t -> b t c')
+                h = self.cross_attn(h, latent) + h
+                h = rearrange(h, 'b t c -> b c t', t=length)
+            else:
+                raise ValueError(f"Unsupported dimension in Cross Attention : {self.dims}. Only 1D, 2D, and 3D are supported.")
+        
         emb_out = self.emb_layers(emb).type(h.dtype)
         while len(emb_out.shape) < len(h.shape):
             emb_out = emb_out[..., None]
@@ -413,8 +449,25 @@ class QKVAttention(nn.Module):
     @staticmethod
     def count_flops(model, _x, y):
         return count_flops_attn(model, _x, y)
-    
 
+class ResidualConv1DBlock(nn.Module):
+    """ A residual block with a 1D convolution, normalization, and activation.""" 
+    def __init__(self, in_channels, out_channels, kernel_size=3):
+        super().__init__()
+        self.conv_block = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size // 2),
+            normalization(out_channels),
+            nn.SiLU(),
+            nn.Conv1d(out_channels, out_channels, kernel_size, padding=kernel_size // 2),
+        )
+        if in_channels != out_channels:
+            self.skip_connection = nn.Conv1d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.skip_connection = nn.Identity()
+    def forward(self, x):
+        residual = self.skip_connection(x)
+        out = self.conv_block(x)
+        return out + residual
 
 
 
@@ -475,6 +528,7 @@ class UNetModel(nn.Module):
         use_scale_shift_norm=False,
         resblock_updown=False,
         use_new_attention_order=False,
+        cross=False,
     ):
         super().__init__()
 
@@ -500,8 +554,12 @@ class UNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.image_cond_dim = image_cond_dim
+        self.cross = cross
+        self.use_scale_shift_norm = use_scale_shift_norm # Mostly here for wandb logging
 
         time_embed_dim = model_channels * 4
+        context_dim = time_embed_dim
+
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
             nn.SiLU(),
@@ -509,33 +567,27 @@ class UNetModel(nn.Module):
         )
 
         if self.num_classes is not None:
-            self.label_emb = nn.Embedding(num_classes, time_embed_dim)
+            self.label_emb = nn.Embedding(num_classes, context_dim)
 
-        if task_tokens:
-            self.task_attnpool = nn.Sequential(
-                PerceiverResampler(dim=task_token_channels, depth=2),
-                nn.Linear(task_token_channels, time_embed_dim),
-            )
 
         if self.num_actions is not None and self.action_horizon is not None:
-            self.action_cond = nn.Sequential(
-                nn.Linear(num_actions * action_horizon, time_embed_dim),
-                nn.SiLU(),
-                nn.Linear(time_embed_dim, time_embed_dim),
+            self.action_cond = ResidualConv1DBlock(
+                in_channels=self.num_actions,
+                out_channels=context_dim,
             )
         
         if image_cond_dim is not None:
             C, _, _ = image_cond_dim
             self.obs_encoder = nn.Sequential(
                 nn.Conv2d(C, 128, kernel_size=3, padding=1, stride=1), # [128, H, W]
-                nn.ReLU(),
+                nn.SiLU(),
                 nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=1), # [256, H, W]
-                nn.ReLU(),
+                nn.SiLU(),
                 nn.AdaptiveAvgPool2d((1, 1)), # [256, 1, 1]
                 nn.Flatten(), # [256]
-                nn.Linear(256, time_embed_dim), # [512]
-                nn.ReLU(),
-                nn.Linear(time_embed_dim, time_embed_dim) # [512]
+                nn.Linear(256, context_dim), # [512]
+                nn.SiLU(),
+                nn.Linear(context_dim, context_dim) # [512]
             )
 
         ch = input_ch = int(channel_mult[0] * model_channels)
@@ -546,7 +598,7 @@ class UNetModel(nn.Module):
         input_block_chans = [ch]
         ds = 1
         for level, mult in enumerate(channel_mult):
-            for _ in range(num_res_blocks):
+            for i in range(num_res_blocks):
                 layers = [
                     ResBlock(
                         ch,
@@ -556,6 +608,8 @@ class UNetModel(nn.Module):
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
+                        cross=self.cross,
+                        name=f'input_block_{level}_{i}'
                     )
                 ]
                 ch = int(mult * model_channels)
@@ -606,6 +660,8 @@ class UNetModel(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
+                cross=self.cross,
+                name=f'middle_block_1'
             ),
             AttentionBlock(
                 ch,
@@ -622,6 +678,8 @@ class UNetModel(nn.Module):
                 dims=dims,
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
+                cross=self.cross,
+                name=f'middle_block_2'
             ),
         )
         self._feature_size += ch
@@ -639,6 +697,7 @@ class UNetModel(nn.Module):
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
+                        cross=self.cross,
                     )
                 ]
                 ch = int(model_channels * mult)
@@ -695,7 +754,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y=None, action_embed=None, image_embed=None, mask=None):
+    def forward(self, x, timesteps, y=None, action_embed=None, image_embed=None, mask=None, vis=None):
         """
         Apply the model to an input batch.
 
@@ -710,36 +769,47 @@ class UNetModel(nn.Module):
 
         hs = []
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
+        context_list = []
 
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
-            emb = emb + self.label_emb(y)
+            label_latent = self.label_emb(y).unsqueeze(1) # [B, 1, C]
+            context_list.append(label_latent)
         
         if self.num_actions is not None and self.action_horizon is not None:
             B, K, A = action_embed.shape
             assert B == x.shape[0]
             assert K == self.action_horizon
             assert A == self.num_actions
-            action_embed_flat = action_embed.view(B, K * A)
-            emb = emb + self.action_cond(action_embed_flat)
+            action_embed = rearrange(action_embed, 'b k a -> b a k')
+            action_latent = self.action_cond(action_embed) # [B, C, K]
+            action_latent = rearrange(action_latent, 'b c k -> b k c')
+            context_list.append(action_latent)
         
+        # Primarily used for the action prediction task.
         if image_embed is not None and self.image_cond_dim is not None:
             assert image_embed.shape[0] == x.shape[0]
             assert image_embed.ndim == 4, f"Expected image_embed to be 4D, got {image_embed.ndim}D"
-            emb = emb + self.obs_encoder(image_embed)
+            image_latent = self.obs_encoder(image_embed).unsqueeze(1) # [B, 1, C]
+            context_list.append(self.obs_encoder(image_latent))
         
         if self.task_tokens:
-            label_emb = self.task_attnpool(y).mean(dim=1)
-            emb = emb + label_emb
+           raise NotImplementedError("Task tokens are not implemented in this version of UNetModel.")
+        
+        if len(context_list) > 0:
+            latent = th.cat(context_list, dim=1) # [B, len(context_list), C]
+            emb = emb + latent.mean(dim=1)
+        else:
+            latent = None
 
         h = x.type(self.dtype)
         for module in self.input_blocks:
-            h = module(h, emb)
+            h = module(h, (emb, latent, mask), vis)
             hs.append(h)
-        h = self.middle_block(h, emb)
+        h = self.middle_block(h, (emb, latent, mask), vis)
         for module in self.output_blocks:
             h = th.cat([h, hs.pop()], dim=1)
-            h = module(h, emb)
+            h = module(h, (emb, latent, mask), vis)
         h = h.type(x.dtype)
         return self.out(h)
 
