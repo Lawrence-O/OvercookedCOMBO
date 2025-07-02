@@ -125,7 +125,7 @@ class OvercookedTrainer:
             channels=C * self.horizon,
             image_size=(H,W),
             timesteps=1000,
-            sampling_timesteps=100,
+            sampling_timesteps=250,
             loss_type="l2",
             objective="pred_v",
             beta_schedule="cosine",
