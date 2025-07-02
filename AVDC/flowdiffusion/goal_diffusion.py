@@ -1578,8 +1578,6 @@ class OvercookedEnvTrainer(Trainer):
     
     def train_one_step(self):
         total_loss = 0
-        self.valid_one_step()
-        exit()
 
         for _ in range(self.gradient_accumulate_every):
             x, x_cond, policy_id, actions = next(self.dl)
@@ -1633,7 +1631,9 @@ class OvercookedEnvTrainer(Trainer):
             "predicted_channels": None,
             "unconditional_channels": None,
         }
-        cond_final_image_path = None
+        wandb_actions = {
+            "input_actions": None,
+        }
         for x_org, x_cond, policy_id, actions in self.valid_dl:
             B, *_ = x_org.shape
             x = rearrange(x_org, "b f h w c -> b (f c) h w")
@@ -1643,7 +1643,6 @@ class OvercookedEnvTrainer(Trainer):
             dummy_cond = torch.ones_like(policy_id)*self.dummy_id
             uncond_actions = torch.ones_like(actions) * self.no_op_action
             uncond_loss = self.model(x, x_cond, task_embed=dummy_cond, action_embed=uncond_actions)
-            
 
             total_valid_loss.append(loss)
             total_unconditional_loss.append(uncond_loss)
@@ -1714,8 +1713,9 @@ class OvercookedEnvTrainer(Trainer):
                     normalize=True,
                 )
                 ref_traj_path = os.path.join(viz_output_dir, f"reference_traj_step_{self.step}_batch_{i}.mp4")
+                x_org_reshape = rearrange(x_org, "b f h w c -> b f w h c")
                 self.renderer.render_trajectory_video(
-                        x_org.cpu().numpy()[i], 
+                        x_org_reshape.cpu().numpy()[i], 
                         grid=grid, 
                         output_dir=viz_output_dir, 
                         video_path=ref_traj_path,
@@ -1771,6 +1771,7 @@ class OvercookedEnvTrainer(Trainer):
                     wandb_images["cond_image"] = cond_img_path
                     wandb_images["predicted_channels"] = pred_ch_path
                     wandb_images["unconditional_channels"] = uncond_ch_path
+                    wandb_actions["input_actions"] = actions.cpu().numpy()[i]
 
                 if i + 1 == B:
                     ch_max = min(26, B)
@@ -1801,8 +1802,17 @@ class OvercookedEnvTrainer(Trainer):
                         format="mp4",
                         caption=f"{video_type.capitalize()} trajectory at step {self.step}"
                     )
-            if cond_final_image_path and os.path.exists(cond_final_image_path):
-                wandb_log_dict["evaluation/cond_img"] = wandb.Image(cond_final_image_path, caption=f"Conditioning image at step {self.step}")
+            for img_type, img_path in wandb_images.items():
+                if img_path and os.path.exists(img_path):
+                    wandb_log_dict[f"evaluation/{img_type}"] = wandb.Image(
+                        img_path, 
+                        caption=f"{img_type.replace('_', ' ').capitalize()} at step {self.step}"
+                    )
+            for action_type, actions_np in wandb_actions.items():
+                if actions_np is not None:
+                    columns = [f"Step {i+1}" for i in range(actions_np.shape[0])]
+                    data = [actions_np.tolist()]
+                    wandb_log_dict[f"evaluation/{action_type}"] = wandb.Table(columns=columns, data=data)
             wandb.log(wandb_log_dict, step=self.step)
         return valid_loss 
 
