@@ -296,7 +296,7 @@ class ResBlock(TimestepBlock):
         return self.skip_connection(x) + h
 
 
-class AttentionBlock(nn.Module):
+class AttentionBlock(TimestepBlock): # Only Declared As a TimestepBlock for Visualization Purposes
     """
     An attention block that allows spatial positions to attend to each other.
 
@@ -337,31 +337,42 @@ class AttentionBlock(nn.Module):
         self.proj_out = conv_nd(1, channels, channels, 1)
         self.dims = dims
 
-    def forward(self, x):
-        return checkpoint(self._forward, (x,), self.parameters(), True)
+    def forward(self, x, emb, vis=None):
+        # Unpack the tuple, but we only need 'x' for self-attention
+        # The 'emb' parameter (which contains latent, etc.) is for cross-attention
+        return checkpoint(self._forward, (x, vis), self.parameters(), True)
 
-    def _forward(self, x):
+    def _forward(self, x, vis=None):
         b, c, *spatial = x.shape
-        if self.dims == 1:
-            assert len(spatial) == 1, "1D attention requires 1 spatial dimension"
-            qkv = self.qkv(self.norm(x))
-            h = self.attention(qkv)
-            h = self.proj_out(h)
-            return x + h
+        if self.dims == 3:
+            assert len(spatial) == 3, "3D attention requires 3 spatial dimensions"
+            x = rearrange(x, "b c f x y -> (b f) c (x y)")
         elif self.dims == 2:
             assert len(spatial) == 2, "2D attention requires 2 spatial dimensions"
             x = rearrange(x, "b c x y -> b c (x y)")
-            qkv = self.qkv(self.norm(x))
+        elif self.dims == 1:
+            assert len(spatial) == 1, "1D attention requires 1 spatial dimension"
+        else:
+            raise ValueError(f"Unsupported dimension: {self.dims}. Only 1D, 2D, and 3D are supported.")
+        
+        qkv = self.qkv(self.norm(x))
+        attn_weights = None
+        if vis is not None:
+            h, attn_weights = self.attention(qkv, ret_score=True)
+        else:
             h = self.attention(qkv)
-            h = self.proj_out(h)
-            return rearrange((x + h), "b c (x y) -> b c x y", c=c, x=spatial[0], y=spatial[1])
-        elif self.dims == 3:
-            assert len(spatial) == 3, "3D attention requires 3 spatial dimensions"
-            x = rearrange(x, "b c f x y -> (b f) c (x y)")
-            qkv = self.qkv(self.norm(x))
-            h = self.attention(qkv)
-            h = self.proj_out(h)
+        
+        h = self.proj_out(h)
+        if vis is not None and attn_weights is not None:
+            vis.add_self_attn_map(attn_weights, self.name)
+        
+        if self.dims == 3:
             return rearrange((x + h), "(b f) c (x y) -> b c f x y", c=c, f=spatial[0], x=spatial[1], y=spatial[2])
+        elif self.dims == 2:
+            return rearrange((x + h), "b c (x y) -> b c x y", c=c, x=spatial[0], y=spatial[1])
+        elif self.dims == 1:
+            return x + h
+        
         else:
             raise ValueError(f"Unsupported dimension: {self.dims}. Only 1D, 2D, and 3D are supported.")
 def count_flops_attn(model, _x, y):
@@ -393,7 +404,7 @@ class QKVAttentionLegacy(nn.Module):
         super().__init__()
         self.n_heads = n_heads
 
-    def forward(self, qkv):
+    def forward(self, qkv, ret_score=False):
         """
         Apply QKV attention.
 
@@ -410,6 +421,8 @@ class QKVAttentionLegacy(nn.Module):
         )  # More stable with f16 than dividing afterwards
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = th.einsum("bts,bcs->bct", weight, v)
+        if ret_score:
+            return a.reshape(bs, -1, length), weight
         return a.reshape(bs, -1, length)
 
     @staticmethod
@@ -427,7 +440,7 @@ class QKVAttention(nn.Module):
         super().__init__()
         self.n_heads = n_heads
 
-    def forward(self, qkv):
+    def forward(self, qkv, ret_score=False):
         """
         Apply QKV attention.
 
@@ -446,6 +459,8 @@ class QKVAttention(nn.Module):
         )  # More stable with f16 than dividing afterwards
         weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
         a = th.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+        if ret_score:
+            return a.reshape(bs, -1, length), weight
         return a.reshape(bs, -1, length)
 
     @staticmethod

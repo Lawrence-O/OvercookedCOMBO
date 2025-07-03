@@ -131,7 +131,7 @@ class UnetOvercooked(nn.Module):
         x_cond = rearrange(x_cond, 'b h w c -> b c 1 h w')
         x_cond = repeat(x_cond, 'b c 1 h w -> b c f h w', f=self.horizon)
         x = torch.cat([x, x_cond], dim=1)
-        out = self.unet(x, t, task_embed, action_embed, **kwargs)
+        out = self.unet(x, t, task_embed, action_embed, vis=vis, **kwargs)
         out = rearrange(out, 'b c f h w -> b f h w c')
         out = out[:, :, :H, :W, :]
         out = rearrange(out, "b f h w c -> b (f c) h w")

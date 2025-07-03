@@ -1480,20 +1480,21 @@ class OvercookedEnvTrainer(Trainer):
             "no_op_action": self.no_op_action,
             
             # Dataset parameters
-            "dataset_type": train_set.dataset.__class__.__name__,
-            "dataset_horizon": getattr(train_set.dataset, 'horizon', 'N/A'),
-            "dataset_max_path_length": getattr(train_set.dataset, 'max_path_length', 'N/A'),
-            "dataset_use_padding": getattr(train_set.dataset, 'use_padding', 'N/A'),
-            "dataset_action_horizon": getattr(train_set.dataset, 'action_horizon', 'N/A'),
-            "dataset_observation_dim": getattr(train_set.dataset, 'observation_dim', 'N/A'),
-            "dataset_num_actions": getattr(train_set.dataset, 'num_actions', 'N/A'),
-            "dataset_no_op_action": getattr(train_set.dataset, 'no_op_action', 'N/A'),
-            "dataset_dummy_id": getattr(train_set.dataset, 'dummy_id', 'N/A'),
-            "dataset_num_partner_policies": getattr(train_set.dataset, 'num_partner_policies', 'N/A'),
-            "dataset_current_split": getattr(train_set.dataset, 'current_split', 'N/A'),
-            "dataset_valid_indices": len(getattr(train_set.dataset, 'valid_indices', [])) if hasattr(train_set, 'valid_indices') else 'N/A',
-            "dataset_policy_name_to_id": json.dumps(getattr(train_set.dataset, "policy_name_to_id", {})),
-            "dataset_policy_id_to_name": json.dumps(getattr(train_set.dataset, "policy_id_to_name", {})),
+            "dataset_type": train_set.__class__.__name__,
+            "dataset_path":             getattr(train_set.args, 'dataset_path', 'N/A'),
+            "dataset_split":            train_set.current_split,
+            "dataset_horizon":          train_set.horizon,
+            "dataset_max_path_length":  getattr(train_set.args, 'max_path_length', 'N/A'),
+            "dataset_episode_length":   getattr(train_set.args, 'episode_length', 'N/A'),
+            "dataset_chunk_length":     getattr(train_set.args, 'chunk_length', 'N/A'),
+            "dataset_use_padding":      getattr(train_set.args, 'use_padding', 'N/A'),
+            "dataset_action_horizon":   train_set.action_horizon,
+            "dataset_observation_dim":  train_set.observation_dim,
+            "dataset_num_partner_policies": train_set.num_partner_policies,
+            "dataset_dummy_policy_id":      train_set.dummy_id,
+            "dataset_num_episodes":         len(train_set),
+            "dataset_policy_name_to_id":    json.dumps(train_set.policy_name_to_id),
+            "dataset_policy_id_to_name":    json.dumps(train_set.policy_id_to_name),
 
             # Diffusion model (GoalGaussianDiffusion) parameters
             "diffusion_model_type": diffusion_model.__class__.__name__,
@@ -1585,6 +1586,9 @@ class OvercookedEnvTrainer(Trainer):
 
             x = rearrange(x, "b f h w c -> b (f c) h w")
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
+
+            print(f"Training with policy_id: {policy_id}, actions shape: {actions.shape}"
+                  f", x shape: {x.shape}, x_cond shape: {x_cond.shape}")
             
             if self.cond_drop_chance > 0: 
                 batch_size = policy_id.shape[0]

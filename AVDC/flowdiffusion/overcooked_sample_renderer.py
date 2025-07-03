@@ -1,4 +1,5 @@
 
+from einops import rearrange
 from overcooked_env.visualization.state_visualizer import StateVisualizer
 import pygame
 import os
@@ -702,6 +703,376 @@ class OvercookedSampleRenderer:
             print(f"Action logits plot saved to {save_path}")
         plt.show()
 
+class AttentionVisualizer:
+    """A hook to capture and visualize cross-attention maps from the U-Net."""
+    
+    def __init__(self):
+        # This dictionary will store attention maps, keyed by layer name.
+        self.attention_maps = {}
+        self.self_attention_maps = {} 
+        self.feature_map_shapes = {}
+
+    def add_attn_map(self, attn_map, layer_name="default_layer"):
+        """This method is called by the ResBlock to add an attention map."""
+        if layer_name not in self.attention_maps:
+            self.attention_maps[layer_name] = []
+        # Detach from graph and move to CPU to save memory.
+        self.attention_maps[layer_name].append(attn_map.cpu())
+    def add_self_attn_map(self, attn_map,  layer_name="default_layer"):
+        if layer_name not in self.self_attention_maps:
+            self.self_attention_maps[layer_name] = []
+        self.self_attention_maps[layer_name].append(attn_map.cpu())
+    
+    def visualize_and_save_blocks(self, x_cond_img, action_plan, output_dir, step):
+        """
+        Generates and saves interpretable attention maps for a model conditioned
+        on a policy ID and an action sequence.
+        """
+        if not self.attention_maps:
+            print("Warning: No attention maps were captured by the visualizer.")
+            return
+
+        num_actions = action_plan.shape[0]
+        action_names = ['N', 'S', 'E', 'W', 'Stay', 'Interact'] # For labeling
+
+        print(f"Generating visualizations for {len(self.attention_maps)} layers...")
+        for layer_name, maps in self.attention_maps.items():
+            if not maps: continue
+
+            # Average maps over all diffusion timesteps for a stable view
+            # Shape: [Frames, H_gen, W_gen, 1 (policy) + 8 (actions)]
+            avg_map = torch.stack(maps).mean(dim=0)[0]
+
+            # --- Isolate the different attention components ---
+            # The first token is the policy_id
+            policy_attn_map = avg_map[..., 0].numpy() # Shape: [Frames, H_gen, W_gen]
+            
+            # The next 8 tokens are the actions
+            actions_attn_map = avg_map[..., 1:].sum(dim=-1).numpy() # Sum attention over all 8 actions
+            
+            # --- Create a multi-panel plot ---
+            frames_to_viz = [0,1,2,3,4,5,6,7,15,31]  # Keyframes to visualize
+            # We will show: 1. Attn to Policy, 2. Attn to All Actions
+            fig, axes = plt.subplots(len(frames_to_viz), 2, 
+                                    figsize=(10, 5 * len(frames_to_viz)), 
+                                    squeeze=False)
+            
+            for i, frame_idx in enumerate(frames_to_viz):
+                # Panel 1: Attention to the Policy ID token
+                ax1 = axes[i, 0]
+                ax1.imshow(x_cond_img)
+                im1 = ax1.imshow(policy_attn_map[frame_idx], cmap='Blues', alpha=0.7)
+                ax1.set_title(f"Frame {frame_idx}: Attn to Partner Policy")
+                ax1.axis('off')
+                fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+                # Panel 2: Attention to the entire Action Plan
+                ax2 = axes[i, 1]
+                ax2.imshow(x_cond_img)
+                im2 = ax2.imshow(actions_attn_map[frame_idx], cmap='Reds', alpha=0.7)
+                ax2.set_title(f"Frame {frame_idx}: Attn to Action Plan")
+                ax2.axis('off')
+                fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+            action_plan_str = ", ".join([action_names[a] for a in action_plan])
+            fig.suptitle(f"Cross-Attention - Layer: {layer_name} - {step}\nAction Plan: [{action_plan_str}]", fontsize=16)
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            
+            save_path = os.path.join(output_dir, f"attn_viz_{layer_name}_{step}.png")
+            plt.savefig(save_path, dpi=120)
+            plt.close(fig)
+            print(f"Saved interpretable attention visualization to {save_path}")
+    def visualize_and_save_temporal(self, action_plan, output_dir, step):
+        """
+        Generates a detailed, interpretable attention map visualization that shows
+        the attention paid to EACH individual context token for several keyframes.
+        This is designed to diagnose temporal alignment issues.
+        """
+        if not self.attention_maps:
+            print("Warning: No attention maps were captured by the visualizer.")
+            return
+
+        # Define context labels for plotting
+        num_actions = action_plan.shape[0]
+        action_names = ['N', 'S', 'E', 'W', 'Stay', 'Interact']
+        context_labels = ['Partner\nPolicy'] + [f"Plan[{i}]\n{action_names[action_plan[i]]}" for i in range(num_actions)]
+
+        print(f"Generating temporal alignment visualizations for {len(self.attention_maps)} layers...")
+        for layer_name, maps in self.attention_maps.items():
+            if not maps: continue
+
+            # Average maps over all diffusion timesteps for a stable view
+            # Shape: [Frames, H_gen, W_gen, T_context=9]
+            avg_map = torch.stack(maps).mean(dim=0)[0]
+
+            # Define which generated frames we want to inspect
+            frames_to_viz = [0, 1, 2, 3, 4, 5, 6, 7] # The first 8 frames are most important
+
+            # The plot will have a row for each keyframe and a column for each context token
+            fig, axes = plt.subplots(
+                len(frames_to_viz),
+                num_actions + 1, # 1 for Policy + 8 for Actions
+                figsize=(2.5 * (num_actions + 1), 2.5 * len(frames_to_viz)),
+                squeeze=False
+            )
+            
+            for i, frame_idx in enumerate(frames_to_viz):
+                for token_idx in range(num_actions + 1):
+                    ax = axes[i, token_idx]
+                    
+                    # Isolate the attention paid to just this one context token
+                    # This shows where the model "looks" when considering this specific token.
+                    # Shape: [H_gen, W_gen]
+                    token_attn_map = avg_map[frame_idx, :, :, token_idx].numpy()
+                    
+                    # Plot the heatmap directly for clarity
+                    im = ax.imshow(token_attn_map, cmap='plasma')
+                    
+                    # --- Labeling and Highlighting ---
+                    
+                    # Add column headers on the top row
+                    if i == 0:
+                        ax.set_title(context_labels[token_idx], fontsize=10, rotation=20, ha='left')
+                    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                    cbar.set_label('Attention Weight', fontsize=9)
+                    
+                    # Add row headers on the first column
+                    if token_idx == 0:
+                        ax.set_ylabel(f"Generated\nFrame {frame_idx}", rotation=0, labelpad=40, fontsize=10, ha='right', va='center')
+                        
+                    # The most important part: Highlight the diagonal.
+                    # This is where we expect to see high attention.
+                    # e.g., when generating Frame 2, attention should be on Plan[2].
+                    # The action plan tokens start at index 1 of our context vector.
+                    if token_idx > 0 and (token_idx - 1) == frame_idx:
+                        # Highlight the border of the plot where attention should be highest
+                        for spine in ax.spines.values():
+                            spine.set_edgecolor('cyan')
+                            spine.set_linewidth(4)
+                    
+                    # Clean up the plot
+                    ax.set_xticks([])
+                    ax.set_yticks([])
+
+            fig.suptitle(f"Temporal Cross-Attention Breakdown - Layer: {layer_name} - {step}", fontsize=16, y=1.0)
+            plt.tight_layout(rect=[0, 0, 1, 0.97])
+            
+            save_path = os.path.join(output_dir, f"temporal_breakdown_{layer_name}_{step}.png")
+            plt.savefig(save_path, dpi=150)
+            plt.close(fig)
+            print(f"Saved temporal breakdown visualization to {save_path}")
+
+    def visualize_and_save(self, x_cond_img, action_plan, output_dir, step, T_context_split):
+        """
+        Generates an interpretable attention visualization focusing on the
+        distribution of attention across the context tokens.
+        """
+        import torch.nn.functional as F
+        if not self.attention_maps:
+            print("Warning: No attention maps were captured by the visualizer.")
+            return
+
+        # T_context_split is not needed for this version but we keep it for consistency
+        num_actions = action_plan.shape[0]
+        action_names = ['N', 'S', 'E', 'W', 'Stay', 'Interact']
+        context_labels = ['Partner Policy'] + [f'Plan[{i}]' for i in range(num_actions)]
+
+        print(f"Generating visualizations for {len(self.attention_maps)} layers...")
+        for layer_name, maps in self.attention_maps.items():
+            if not maps: continue
+
+            avg_map = torch.stack(maps).mean(dim=0)[0]
+            
+            frames_to_viz = [0,1,2,3,4,5,6,7,15,31]
+            
+            # Create a plot with a row for each keyframe
+            fig, axes = plt.subplots(len(frames_to_viz), 1, 
+                                    figsize=(12, 6 * len(frames_to_viz)), 
+                                    squeeze=False, constrained_layout=True)
+            
+            for i, frame_idx in enumerate(frames_to_viz):
+                ax = axes[i, 0]
+                
+                # --- Correctly Calculate Attention Distribution ---
+                # Get the map for the current frame
+                frame_attn_map = avg_map[frame_idx, :, :, :] # Shape: [H_gen, W_gen, T_context]
+                
+                # Sum over all the query pixels to get the total attention for each context token
+                total_attn_per_context_token = frame_attn_map.sum(dim=(0, 1)) # Shape: [T_context]
+                
+                # Normalize to a probability distribution (sums to 1) for easier comparison
+                attn_distribution = F.softmax(total_attn_per_context_token, dim=0).numpy()
+                
+                # --- Plot the Bar Chart ---
+                colors = ['skyblue'] + ['tomato'] * num_actions
+                bars = ax.bar(context_labels, attn_distribution, color=colors)
+                ax.set_title(f"Frame {frame_idx}: Attention Distribution Across Context Tokens", fontsize=12)
+                ax.set_ylabel("Attention Weight")
+                ax.tick_params(axis='x', rotation=45)
+                
+                # Add text labels on top of bars
+                for bar in bars:
+                    height = bar.get_height()
+                    ax.text(bar.get_x() + bar.get_width() / 2.0, height, f'{height:.2f}', ha='center', va='bottom')
+
+                # Highlight the action that *should* be most attended to for this frame
+                if frame_idx < len(action_plan):
+                    # The index in our context vector is frame_idx + 1 (since policy is at index 0)
+                    relevant_bar_idx = frame_idx + 1
+                    if relevant_bar_idx < len(bars):
+                        bars[relevant_bar_idx].set_edgecolor('cyan')
+                        bars[relevant_bar_idx].set_linewidth(3)
+
+            action_plan_str = ", ".join([f"{i}:{action_names[a]}" for i, a in enumerate(action_plan)])
+            fig.suptitle(f"Context Attention - Layer: {layer_name} - {step}\nAction Plan: [{action_plan_str}]", fontsize=16)
+            
+            save_path = os.path.join(output_dir, f"context_attn_viz_{layer_name}_{step}.png")
+            plt.savefig(save_path, dpi=120)
+            plt.close(fig)
+            print(f"Saved context attention visualization to {save_path}")
+    def visualize_self_attention_simple_and_save(self, output_dir, step):
+        print(f"Generating self-attention visualizations for {len(self.self_attention_maps)} layers...")
+        for layer_name, maps in self.self_attention_maps.items():
+            if not maps: continue
+            
+            # maps is a list of tensors of shape [(B*F)*Heads, SeqLen, SeqLen]
+            # Let's average over the timesteps and heads for a stable view
+            # This is complex due to the batch and frame reshaping.
+            # For a simple first pass, let's just look at the first map.
+            attn_matrix = maps[0][0].numpy() # Look at first head of first timestep/frame
+            
+            fig, ax = plt.subplots(figsize=(10, 10))
+            im = ax.imshow(attn_matrix, cmap='viridis')
+            ax.set_title(f"Self-Attention Matrix - Layer {layer_name} - {step}")
+            ax.set_xlabel("Key Positions (Pixels)")
+            ax.set_ylabel("Query Positions (Pixels)")
+            fig.colorbar(im, ax=ax)
+            
+            save_path = os.path.join(output_dir, f"self_attn_viz_{layer_name}_{step}.png")
+            plt.savefig(save_path, dpi=120)
+            plt.close(fig)
+            print(f"Saved self-attention visualization to {save_path}")
+    def _create_side_by_side_plot(self, grid, renderer, trajectory_frame, attn_map_2d, title):
+        """
+        (Helper) Creates a side-by-side image of the game state and its attention heatmap.
+        """
+        # 1. Render the game state for this frame into an RGB numpy array
+        bg_surf = renderer.render_frame(trajectory_frame, grid, normalize=True)
+        game_state_img = np.swapaxes(pygame.surfarray.array3d(bg_surf), 0, 1)
+
+        # 2. Create the side-by-side plot
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5), constrained_layout=True)
+        
+        # Left Panel: Game State
+        axes[0].imshow(game_state_img)
+        axes[0].set_title("Generated Game State", fontsize=10)
+        axes[0].axis('off')
+
+        # Right Panel: Attention Heatmap
+        im = axes[1].imshow(attn_map_2d, cmap='viridis', interpolation='nearest')
+        axes[1].set_title("Attention Focus", fontsize=10)
+        axes[1].set_xticks([])
+        axes[1].set_yticks([])
+        fig.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
+        
+        fig.suptitle(title, fontsize=12, fontweight='bold')
+        
+        # 3. Convert the entire plot canvas to an image and return
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
+        plot_img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8)
+        plot_img = plot_img.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+        plt.close(fig)
+        
+        return plot_img[..., :3] # Return RGB frame
+
+    def visualize_self_attention(
+        self,
+        grid,
+        renderer,          # An instance of your OvercookedSampleRenderer
+        pred_traj_np,      # The generated trajectory, shape [T, H_orig, W_orig, C]
+        output_dir,        # The directory to save the visualization
+        step               # A unique identifier for the filenames (e.g., "sample_42")
+    ):
+        """
+        Creates a separate diagnostic video for EACH self-attention layer,
+        showing what the agent is "looking at" in the scene at each step.
+        This version is robust to downsampling as it processes each layer's maps independently.
+        """
+        print("--- Generating Self-Attention Diagnostic Videos ---")
+        
+        if not self.self_attention_maps:
+            print("Warning: No self-attention maps were captured. Skipping visualization.")
+            return
+
+        H_orig, W_orig = pred_traj_np.shape[1:3]
+
+        # --- Iterate over each layer that has attention maps ---
+        for layer_name, maps_list in self.self_attention_maps.items():
+            if not maps_list: continue
+            
+            print(f"Processing self-attention for layer: {layer_name}")
+
+            # --- 1. Average the weights for THIS layer only ---
+            # All tensors in maps_list are from the same layer, so they have the same size.
+            # This will now work without a 'stack' error.
+            avg_weights = torch.stack(maps_list).mean(dim=0)
+            
+            # --- 2. Get Shapes Directly From the Tensor (as you suggested) ---
+            num_frames = pred_traj_np.shape[0]
+            num_heads = avg_weights.shape[0] // num_frames
+            SeqLen = avg_weights.shape[-1]
+            
+            # Reshape to separate frames and heads, then average over the heads.
+            # Final shape: [Frames, SeqLen, SeqLen]
+            avg_self_weights = rearrange(avg_weights, '(f h) q k -> f h q k', f=num_frames, h=num_heads).mean(dim=1)
+            
+            # Infer H_feat and W_feat from the known SeqLen and original aspect ratio
+            aspect_ratio = W_orig / H_orig
+            H_feat = int(math.sqrt(SeqLen / aspect_ratio))
+            W_feat = int(SeqLen / H_feat)
+
+            if H_feat * W_feat != SeqLen:
+                print(f"Warning for layer {layer_name}: Cannot infer HxW from SeqLen {SeqLen}. Using sqrt.")
+                H_feat = W_feat = int(math.sqrt(SeqLen))
+                if H_feat * W_feat != SeqLen:
+                    print(f"--> Cannot even use sqrt. Skipping layer {layer_name}.")
+                    continue
+            
+            # --- 3. Create the Video for THIS Layer ---
+            video_frames = []
+            for frame_idx, obs_frame in enumerate(pred_traj_np):
+                agent_pos = renderer.get_player_position(obs_frame)
+                if not agent_pos:
+                    title = f"Frame {frame_idx}: Agent Not Found"
+                    plot_img = self._create_side_by_side_plot(grid, renderer, obs_frame, np.zeros((H_feat, W_feat)), title)
+                    video_frames.append(plot_img)
+                    continue
+                    
+                # Map agent's screen position to the feature map index
+                agent_x, agent_y = agent_pos
+                scale_h = H_feat / H_orig
+                scale_w = W_feat / W_orig
+                agent_y_feat = int(agent_y * scale_h)
+                agent_x_feat = int(agent_x * scale_w)
+                query_idx = agent_y_feat * W_feat + agent_x_feat
+                
+                if query_idx >= SeqLen: continue # Safety check
+
+                # Get the attention FROM the agent TO everywhere else
+                attn_from_agent = avg_self_weights[frame_idx, query_idx, :]
+                attn_map_2d = attn_from_agent.reshape(H_feat, W_feat).numpy()
+
+                title = f"Frame {frame_idx}: Self-Attention FROM Agent"
+                plot_img = self._create_side_by_side_plot(grid, renderer, obs_frame, attn_map_2d, title)
+                video_frames.append(plot_img)
+            
+            # --- 4. Save the video ---
+            if video_frames:
+                video_path = os.path.join(output_dir, f"self_attention_{layer_name}_{step}.mp4")
+                clip = ImageSequenceClip(video_frames, fps=1)
+                clip.write_videofile(video_path, codec="libx264", logger=None, verbose=False)
+                print(f"Saved Self-Attention video for '{layer_name}' to {video_path}")
 
 
 

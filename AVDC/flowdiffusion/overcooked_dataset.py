@@ -220,32 +220,40 @@ from hdf5_dataset import HDF5Dataset
 #         assert actions.min() >= 0 and actions.max() < 6, f"Actions must be in [0, 6), got range [{actions.min()}, {actions.max()}]"
 
 #         return x, x_cond, task_emb, actions
-class OvercookedSequenceDataset(torch.utils.data.Dataset):
-    policies = ["sp1_final", "sp2_final", "sp3_final", "sp4_final", "sp5_final", "sp9_final", "bc_train"]
+        # def get_path_indexes_episode(self, policy_name):
+        #         """
+        #         Get a specific episode for a given policy name and episode index.
+        #         """
+        #         if policy_name in self.train_partner_policies:
+        #             policy_id = self.train_partner_policies[policy_name]
+        #         elif policy_name in self.test_partner_policies:
+        #             # Use Original Test Policies
+        #             policy_id = self.org_test_partner_policies[policy_name]
+        #         else:
+        #             raise ValueError(f"Policy name '{policy_name}' not found in dataset")
 
-    def __init__(self, args, split="train", allowed_policies=None):
+        #         matching_episodes = []
+        #         for path_idx, policy_ids in enumerate(self.policy_id):
+        #             if policy_ids[1] == policy_id: # Only check the partner policy ID
+        #                 matching_episodes.append(path_idx)
+                
+        #         print(f"Found {len(matching_episodes)} episodes for policy name '{policy_name}'")
+                
+        #         return matching_episodes
+class OvercookedSequenceDataset(torch.utils.data.Dataset):
+    def __init__(self, args, split="train"):
         self.args = args
         self.current_split = split
-        self.allowed_policies = allowed_policies if allowed_policies is not None else self.policies
         
         self.hdf5_dataset = HDF5Dataset(args, self.current_split)
+
+        self._discover_all_policies_and_create_mappings()
         
-        #
         self.dummy_id = 0 # Explicitly reserve 0
-        self.policy_name_to_id, self.policy_id_to_name = self._create_policy_mappings()
-        print(f"Policy Name to ID Mapping: {self.policy_name_to_id}")
-        
-        # The total number of classes will be the number of real policies + 1 for the dummy ID
         self.num_partner_policies = len(self.policy_name_to_id) + 1
-        
-        print(f"Created clean mapping for {len(self.policy_name_to_id)} policies (ID=0 reserved for dummy).")
-        print(f"Total policy classes (including dummy): {self.num_partner_policies}")
 
-        # --- Filtering Logic ---
-        self.valid_indices = self._filter_indices()
-        print(f"Found {len(self.valid_indices)} valid episodes for split '{split}' with allowed policies.")
+        print(f"Dataset split '{self.current_split}' using a GLOBAL vocabulary of {self.num_partner_policies} classes.")
 
-        # --- Other Parameters ---
         self.horizon = args.horizon
         self.action_horizon = 8
         assert self.action_horizon <= self.horizon
@@ -254,48 +262,50 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         *_, H, W, C = obs_sample.shape
         self.observation_dim = (H, W, C)
 
+    def _discover_all_policies_and_create_mappings(self):
+        """
+        Scans both train and test HDF5 splits to build one unified, global
+        mapping from policy name to a unique integer ID.
+        Reserves ID 0 for the dummy/unconditional case.
+        """
+        all_policy_names = set()
+        
+        # Scan the train split
+        try:
+            train_hdf5 = HDF5Dataset(self.args, "train")
+            for key in train_hdf5.dset['policy_id'].attrs.keys():
+                policy_name = key[key.find("[") + 1 : key.find("]")]
+                all_policy_names.add(policy_name)
+            del train_hdf5
+        except Exception as e:
+            print(f"Warning: Could not load or parse train split for vocab discovery: {e}")
+
+        # Scan the test split
+        try:
+            test_hdf5 = HDF5Dataset(self.args, "test")
+            for key in test_hdf5.dset['policy_id'].attrs.keys():
+                policy_name = key[key.find("[") + 1 : key.find("]")]
+                all_policy_names.add(policy_name)
+            del test_hdf5
+        except Exception as e:
+            print(f"Warning: Could not load or parse test split for vocab discovery: {e}")
+
+        # Create the single, sorted, global mapping
+        sorted_names = sorted(list(all_policy_names))
+        
+        self.dummy_id = 0
+        # Start real policy IDs from 1
+        self.policy_name_to_id = {name: i + 1 for i, name in enumerate(sorted_names)}
+        self.policy_id_to_name = {i + 1: name for i, name in enumerate(sorted_names)}
+
+        print(f"Discovered {len(sorted_names)} unique policies across all splits.")
+        print("Global Policy-ID Mapping:", self.policy_name_to_id)
+        
+        # We also need a way to get a policy name from its original ID in the HDF5 file
         self._original_id_to_name = {v: k[k.find("[") + 1 : k.find("]")] for k, v in self.hdf5_dataset.dset['policy_id'].attrs.items()}
 
-    def _create_policy_mappings(self):
-        """
-        Scans the HDF5 attributes to create a simple name -> id mapping.
-        Reserves ID 0 for a dummy/unconditional class.
-        """
-        policy_attrs = self.hdf5_dataset.dset['policy_id'].attrs
-        # Sort the names to ensure consistent mapping every time
-        all_policy_names = sorted([key[key.find("[") + 1 : key.find("]")] for key in policy_attrs.keys()])
-        
-        # Create mapping, starting real policy IDs from 1.
-        # This leaves 0 available for our dummy_id.
-        policy_name_to_id = {name: i + 1 for i, name in enumerate(all_policy_names)}
-        policy_id_to_name = {i + 1: name for i, name in enumerate(all_policy_names)}
-
-        return policy_name_to_id, policy_id_to_name
-
-    def _filter_indices(self):
-        """
-        Iterates through the dataset once to find all episode indices that match
-        the allowed policies for the partner agent.
-        """
-        valid_indices = []
-        policy_ids_from_dset = np.array(self.hdf5_dataset.dset["policy_id"])
-        
-        # Create a reverse mapping from original HDF5 policy ID to its string name
-        original_id_to_name = {v: k[k.find("[") + 1 : k.find("]")] for k, v in self.hdf5_dataset.dset['policy_id'].attrs.items()}
-
-        for i in range(len(self.hdf5_dataset)):
-            # policy_id has shape (2,) for (agent_0, agent_1)
-            original_agent1_id = policy_ids_from_dset[i][1]
-            
-            partner_policy_name = original_id_to_name.get(original_agent1_id)
-
-            if partner_policy_name and partner_policy_name in self.allowed_policies:
-                valid_indices.append(i)
-                
-        return valid_indices
-
     def __len__(self):
-        return len(self.valid_indices)
+        return len(self.hdf5_dataset)
 
     def _normalize_obs(self, obs):
         """ Normalizes a numpy observation array to [-1, 1]. """
@@ -326,33 +336,26 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         return normalized_obs
 
     def __getitem__(self, idx):
-        # 1. Get the real episode index from our pre-filtered list
-        episode_idx = self.valid_indices[idx]
         
-        # 2. Load data for this single episode
-        obs, actions, policy_id = self.hdf5_dataset[episode_idx]
-        
-        obs = obs.numpy()
-        actions = actions.numpy()
-        policy_id = policy_id.numpy()
+        obs, actions, policy_id = self.hdf5_dataset[idx]
+        obs, actions, policy_id = obs.numpy(), actions.numpy(), policy_id.numpy()
 
-        # 3. Normalize observation
         obs = self._normalize_obs(obs)
 
-        # 4. Randomly select a valid start time
         T = obs.shape[0]
         if T <= self.horizon:
-            raise IndexError(f"Episode {episode_idx} in split '{self.current_split}' is too short ({T} frames) for horizon {self.horizon}.")
+            raise ValueError(f"Episode length {T} is less than or equal to horizon {self.horizon}. Cannot sample valid trajectory.")
             
         start_t = random.randint(1, T - self.horizon)
         end_t = start_t + self.horizon
 
-        # 5. Extract data slices for the EGO agent (agent 0)
+        # Extract data slices for the EGO agent (agent 0)
+        # Fully observed so no agent dimension
         conditions_obs_np = obs[start_t - 1] 
         trajectories_np = obs[start_t:end_t]
         future_actions_np = actions[start_t : start_t + self.action_horizon, 0].squeeze(-1)
 
-        # 6. Get the partner policy ID for conditioning
+        # Get the partner policy ID for conditioning
         original_partner_id = policy_id[1]
 
         partner_name = self._original_id_to_name.get(original_partner_id)
@@ -362,33 +365,14 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         # Use our clean mapping (which starts at 1) to get the final task embedding ID
         task_emb = self.policy_name_to_id[partner_name]
 
-        # 7. Convert to Tensors
+        # Convert to Tensors
         x = torch.from_numpy(trajectories_np)
         x_cond = torch.from_numpy(conditions_obs_np)
         actions = torch.from_numpy(future_actions_np).long()
 
         return x, x_cond, task_emb, actions
     
-    def get_path_indexes_episode(self, policy_name):
-        """
-        Get a specific episode for a given policy name and episode index.
-        """
-        if policy_name in self.train_partner_policies:
-            policy_id = self.train_partner_policies[policy_name]
-        elif policy_name in self.test_partner_policies:
-            # Use Original Test Policies
-            policy_id = self.org_test_partner_policies[policy_name]
-        else:
-            raise ValueError(f"Policy name '{policy_name}' not found in dataset")
-
-        matching_episodes = []
-        for path_idx, policy_ids in enumerate(self.policy_id):
-            if policy_ids[1] == policy_id: # Only check the partner policy ID
-                matching_episodes.append(path_idx)
-        
-        print(f"Found {len(matching_episodes)} episodes for policy name '{policy_name}'")
-        
-        return matching_episodes
+    
     
 class SingleEpisodeOvercookedDataset(torch.utils.data.Dataset):    
     def __init__(self, base_dataset, policy_name, episode_idx=0):

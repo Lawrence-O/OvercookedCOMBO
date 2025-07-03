@@ -7,7 +7,7 @@ class ResidualConvBlock(nn.Module):
         super().__init__()
         self.conv_block = nn.Sequential(
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(channels),
+            nn.BatchNorm2d(channels), # TODO: Convert to GroupNorm 
             nn.ReLU(),
             nn.Conv2d(channels, channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(channels),

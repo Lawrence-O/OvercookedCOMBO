@@ -8,6 +8,7 @@ import pickle
 import random
 import sys
 
+import pygame
 from tqdm import tqdm
 
 mapbt_path = '/home/law/Workspace/repos/COMBO/mapbt_package'
@@ -1607,8 +1608,89 @@ class ModelTester:
                 print(f"Sample {sample_idx}: Max diff {diff:.6f} at timestep {t}")
         print(f"[Obs Roundtrip Test] {num_pass}/{num_samples} passed, {num_fail} failed.")
         if num_fail > 0:
-            print(f"Max difference in failed cases: {max_diff}")  
-                    
+            print(f"Max difference in failed cases: {max_diff}")
+    def visualize_attention(self, output_dir="attention_visualizations", sample_idx=42):
+        from overcooked_sample_renderer import AttentionVisualizer
+        self.world_model = self.load_diffusion_model(self.args.diffusion_model_path, num_classes=60)
+        if hasattr(self.world_model, 'ema_model'):
+            self.world_model = self.world_model.ema_model
+        self.world_model.eval()
+        self.world_model.to(self.device)
+        dataset = self._load_dataset(split="train")
+        
+        x_org, x_cond, task_embed, actions = dataset[sample_idx]
+        x_cond_standard = rearrange(x_cond, "h w c -> c h w")
+        x_cond_dev = x_cond_standard.unsqueeze(0).to(self.device)
+        task_embed_dev = th.tensor([task_embed], dtype=th.long, device=self.device)
+        actions_dev = actions.unsqueeze(0).to(self.device)
+
+
+        visualizer = AttentionVisualizer()
+        print("Running model sampling to collect attention maps...")
+        pred_traj = self.world_model.sample(
+            x_cond=x_cond_dev,
+            task_embed=task_embed_dev,
+            action_embed=actions_dev,
+            batch_size=1,
+            vis=visualizer,
+        )
+        pred_traj = rearrange(pred_traj, "b (f c) h w -> b f h w c", c=26, f=32)
+        pred_traj = pred_traj.cpu().numpy()[0]
+        output_dir = self.base_dir / "attention_visualization"
+        os.makedirs(output_dir, exist_ok=True)
+        x_cond_for_render = x_cond_standard.permute(1, 2, 0).cpu().numpy()
+        grid = self.renderer.extract_grid_from_obs(x_cond_for_render)
+
+        self.renderer.save_obs_image(
+            x_cond_for_render,
+            grid=grid,
+            file_path=output_dir / f"sample_{sample_idx}_x_cond.png",
+            normalize=True,
+        )
+        self.renderer.render_trajectory_video(
+            pred_traj,
+            grid=grid,
+            output_dir=str(output_dir / "sample_videos"),
+            video_path=str(output_dir / f"sample_{sample_idx}_pred_traj.mp4"),
+            fps=1,
+            normalize=True,
+        )
+        background_surface = self.renderer.render_frame(x_cond_for_render, grid, normalize=False)
+        background_img = pygame.surfarray.array3d(background_surface)
+        background_img = np.swapaxes(background_img, 0, 1)
+        action_plan_np = actions.cpu().numpy()
+        num_action_tokens = action_plan_np.shape[0]
+        context_split = (num_action_tokens, 8, 6)
+        # visualizer.visualize_and_save(
+        #     x_cond_img=background_img,
+        #     action_plan=action_plan_np,
+        #     output_dir=output_dir,
+        #     step=f"sample_{sample_idx}", # Use a unique identifier for the filename
+        #     T_context_split=context_split,
+        # )
+        # visualizer.visualize_and_save_blocks(
+        #     x_cond_img=background_img,
+        #     action_plan=action_plan_np,
+        #     output_dir=output_dir,
+        #     step=f"sample_{sample_idx}_blocks",
+        # )
+        # visualizer.visualize_and_save_temporal(
+        #     action_plan=action_plan_np,
+        #     output_dir=output_dir,
+        #     step=f"sample_{sample_idx}_temporal",
+        # )
+        visualizer.visualize_self_attention_simple_and_save(
+            output_dir=output_dir,
+            step=f"sample_{sample_idx}_self_attention_simple",
+        )
+        visualizer.visualize_self_attention(
+            grid=grid,
+            renderer=self.renderer,
+            pred_traj_np=pred_traj,
+            output_dir=output_dir,
+            step=f"sample_{sample_idx}_self_attention",
+        )
+        print(f"--- Attention visualization complete ---")
                
     def set_experiment_dir(self, experiment_name, subfolder_name=None):
         """
@@ -1639,6 +1721,10 @@ class ModelTester:
         # self.run_value_model_evaluation("actor_best_bc_")
         # self.run_action_proposal_evaluation("actor_best_bc_")
         # self.run_obs_roundtrip_test("obs_roundtrip_test_1")
+    
+    def run_debug_tests(self):
+        self.set_experiment_dir("debug_tests")
+        self.visualize_attention(output_dir="attention_visualizations", sample_idx=42)
     
             
 
@@ -1695,7 +1781,8 @@ if __name__ == "__main__":
     args = parse_args(args, parser)
     args.episode_length = 400
     tester = ModelTester(args=args)
-    tester.run_sp10_ego()
+    tester.run_debug_tests()
+    # tester.run_sp10_ego()
     # tester.run_dataset_evaluation()
     # tester.run_actor_best_bc()
     # tester.collect_data(num_episodes=100)
