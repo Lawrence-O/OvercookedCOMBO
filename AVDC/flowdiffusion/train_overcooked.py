@@ -130,7 +130,7 @@ class OvercookedTrainer:
                 train_set=self.train_dataset,
                 valid_set=self.valid_dataset,
                 train_lr=1e-4,
-                train_num_steps = 300000,
+                train_num_steps = 5000000,
                 save_and_sample_every = 2 if self.args.debug else self.args.save_and_sample_every,
                 ema_update_every = 10,
                 ema_decay = 0.999,
@@ -180,9 +180,9 @@ if __name__ == '__main__':
     parser.add_argument('--sampling_timesteps', type=int, default=100, help='Number of timesteps for DDIM sampling (if not debug)')
 
     # For OvercookedEnvTrainer 
-    parser.add_argument('--train_batch_size', type=int, default=64, help='Training batch size (if not debug)')
+    parser.add_argument('--train_batch_size', type=int, default=32, help='Training batch size (if not debug)')
     parser.add_argument('--num_validation_samples', type=int, default=16, help='Number of samples to generate during validation step')
-    parser.add_argument('--save_and_sample_every', type=int, default=2000, help='Frequency to save checkpoints and generate samples (if not debug)')
+    parser.add_argument('--save_and_sample_every', type=int, default=20000, help='Frequency to save checkpoints and generate samples (if not debug)')
     parser.add_argument('--cond_drop_prob', type=float, default=0.1, help='Probability of dropping condition for CFG during training')
     parser.add_argument('--split_batches', type=bool, default=True, help='Whether to split batches for Accelerator')
 

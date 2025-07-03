@@ -350,9 +350,10 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
         end_t = start_t + self.horizon
 
         # Extract data slices for the EGO agent (agent 0)
-        # Fully observed so no agent dimension
-        conditions_obs_np = obs[start_t - 1] 
-        trajectories_np = obs[start_t:end_t]
+        if obs.ndim == 4:
+            obs = np.expand_dims(obs, axis=1) 
+        conditions_obs_np = obs[start_t - 1, 0] 
+        trajectories_np = obs[start_t:end_t, 0]
         future_actions_np = actions[start_t : start_t + self.action_horizon, 0].squeeze(-1)
 
         # Get the partner policy ID for conditioning

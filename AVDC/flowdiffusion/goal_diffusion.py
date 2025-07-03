@@ -1587,8 +1587,6 @@ class OvercookedEnvTrainer(Trainer):
             x = rearrange(x, "b f h w c -> b (f c) h w")
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
 
-            print(f"Training with policy_id: {policy_id}, actions shape: {actions.shape}"
-                  f", x shape: {x.shape}, x_cond shape: {x_cond.shape}")
             
             if self.cond_drop_chance > 0: 
                 batch_size = policy_id.shape[0]
