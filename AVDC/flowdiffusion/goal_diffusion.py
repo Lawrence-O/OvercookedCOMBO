@@ -1696,7 +1696,7 @@ class OvercookedEnvTrainer(Trainer):
             cond_img_path = os.path.join(viz_output_dir, f"cond_img_step_{self.step}.png")
             x_cond_print = rearrange(x_cond, "b c h w -> b w h c")
              
-            for i in range(B):
+            for i in range(min(B, 4)):
                 pred_traj_path = os.path.join(viz_output_dir, f"pred_traj_step_{self.step}_batch_{i}.mp4")
                 self.renderer.render_trajectory_video(
                     pred_traj[i],
