@@ -41,10 +41,20 @@ class OvercookedTrainer:
 
         dataset_split = getattr(args, 'dataset_split', "train")
         print(f"Loading Overcooked dataset from {dataset_args.dataset_path} with split: {dataset_split}")
-        self.train_dataset = OvercookedSequenceDataset(args=dataset_args, split=dataset_split)
-        self.valid_dataset = OvercookedSequenceDataset(args=dataset_args, split="test")        
+        self.dataset = OvercookedSequenceDataset(args=dataset_args, split=dataset_split)   
 
-        self.observation_dim = self.train_dataset.observation_dim
+        dataset_size = len(self.dataset)
+        indices = list(range(dataset_size))
+        np.random.seed(seed)
+        np.random.shuffle(indices)
+        
+        split_idx = int(np.floor(args.valid_ratio * dataset_size))
+        train_indices, valid_indices = indices[split_idx:], indices[:split_idx]
+        
+        self.train_dataset = Subset(self.dataset, train_indices)
+        self.valid_dataset = Subset(self.dataset, valid_indices)
+             
+        self.observation_dim = self.dataset.observation_dim
         self.diffusion = None
         self.trainer = None
         self.unet = None
@@ -105,7 +115,7 @@ class OvercookedTrainer:
         self.unet = UnetOvercooked(
             horizon=self.horizon,
             obs_dim=self.observation_dim,
-            num_classes=self.train_dataset.num_partner_policies,
+            num_classes=self.dataset.num_partner_policies,
             num_actions=self.num_actions,
             action_horizon=self.action_horizon, 
         ).to(self.device)
@@ -130,7 +140,7 @@ class OvercookedTrainer:
                 train_set=self.train_dataset,
                 valid_set=self.valid_dataset,
                 train_lr=1e-4,
-                train_num_steps = 5000000,
+                train_num_steps = 200000,
                 save_and_sample_every = 2 if self.args.debug else self.args.save_and_sample_every,
                 ema_update_every = 10,
                 ema_decay = 0.999,
@@ -182,7 +192,7 @@ if __name__ == '__main__':
     # For OvercookedEnvTrainer 
     parser.add_argument('--train_batch_size', type=int, default=32, help='Training batch size (if not debug)')
     parser.add_argument('--num_validation_samples', type=int, default=16, help='Number of samples to generate during validation step')
-    parser.add_argument('--save_and_sample_every', type=int, default=20000, help='Frequency to save checkpoints and generate samples (if not debug)')
+    parser.add_argument('--save_and_sample_every', type=int, default=4000, help='Frequency to save checkpoints and generate samples (if not debug)')
     parser.add_argument('--cond_drop_prob', type=float, default=0.1, help='Probability of dropping condition for CFG during training')
     parser.add_argument('--split_batches', type=bool, default=True, help='Whether to split batches for Accelerator')
 
