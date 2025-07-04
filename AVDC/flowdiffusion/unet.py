@@ -83,7 +83,7 @@ class UnetOvercooked(nn.Module):
         self.unet = UNetModel(
             image_size=(8, 6), # TODO: Make this configurable
             in_channels=self.C * 2,
-            model_channels=128,
+            model_channels=256, # Increased from 128 -> 256
             out_channels=self.C,
             num_res_blocks=2,
             attention_resolutions=(1, 2),
