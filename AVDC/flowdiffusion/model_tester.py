@@ -449,7 +449,7 @@ class ModelTester:
             use_padding=self.args.use_padding,
         )
         return OvercookedSequenceDataset(
-            args=dataset_args, split=split, allowed_policies=None,
+            args=dataset_args, split=split,
         )
     def _load_action_proposal_model(self,ema=True):
         """Load the action proposal model."""
@@ -656,7 +656,7 @@ class ModelTester:
             json.dump(results, f, indent=2)
         print(f"Ambiguity analysis results saved to {save_dir / 'ambiguity_analysis_results.json'}")
 
-    def load_diffusion_model(self, model_path, ema=True, num_classes=None):
+    def load_diffusion_model(self, model_path, ema=True, num_classes=None, guidance_weight=1.0):
         """Load the diffusion model for evaluation only."""
         print(f"Loading diffusion model from {model_path}, ema={ema}, num_classes={num_classes}")
         if not osp.exists(model_path):
@@ -675,12 +675,12 @@ class ModelTester:
             channels=C * self.horizon,
             image_size=(H,W),
             timesteps=1 if self.args.debug else 1000,
-            sampling_timesteps=1 if self.args.debug else 100,
+            sampling_timesteps=100,
             loss_type="l2",
             objective="pred_v",
             beta_schedule="cosine",
             min_snr_loss_weight=True,
-            guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
+            guidance_weight=guidance_weight,
             auto_normalize=False,
             num_actions=self.num_actions,
             no_op_action=self.no_op_action
@@ -693,17 +693,17 @@ class ModelTester:
             diffusion.load_state_dict(ckpt['model'])
             return diffusion
 
-    def evaluate_world_model(self, obs, policy_id, actions=None):
+    def evaluate_world_model(self, obs, policy_id):
         predefined_actions = [
-            # [0]*8, # Move Up
-            # [1]*8, # Move Down
-            # [2]*8, # Move Right
-            # [3]*8, # Move Left
-            # [4]*8, # No Op Action
-            # [np.random.randint(0, self.num_actions) for _ in range(8)],
-            actions,
+            [0]*8, # Move Up
+            [1]*8, # Move Down
+            [2]*8, # Move Right
+            [3]*8, # Move Left
+            [4]*8, # No Op Action
+            [0, 1]*4, # Up, Down, Up, Down
+            [2, 3]*4, # Right, Left, Right, Left
+            [np.random.randint(0, self.num_actions) for _ in range(8)],
         ]
-        print(predefined_actions)
         if obs.ndim == 4:
             obs = obs.squeeze(0)
         obs = to_np(obs)
@@ -715,7 +715,7 @@ class ModelTester:
             obs_print,
             grid,
             file_path=str(eval_path / "obs_image.png"),
-            normalize=True,
+            normalize=False,
         )
         self.renderer.visualize_all_channels(
                 obs_print,  # First frame
@@ -725,12 +725,13 @@ class ModelTester:
             obs_print,  # First frame
             output_dir=str(eval_path / f"x_cond_channels_policy_{policy_id}_action_channels.png"),
         )
+        print(obs.max(), obs.min())
+        obs = normalize_obs(obs)
         obs = to_torch(obs, device=self.device).float()
-        # obs = normalize_obs(obs)
         obs = obs.view(self.C, self.H, self.W)
         obs = obs.unsqueeze(0)  # Add batch dimension
         for i, action_condition in enumerate(predefined_actions):
-            action_cond = th.tensor(action_condition, device=self.device).long()  # Add batch dimension
+            action_cond = th.tensor(action_condition, device=self.device).long().unsqueeze(0)
             policy_id = th.tensor([policy_id], device=self.device).long()
             trajectory = self.world_model.sample(
                     x_cond=obs,
@@ -1479,13 +1480,14 @@ class ModelTester:
         self.plot_base_model_results([summary], agent_label="sp_best")
         print("Action proposal model evaluation completed and plots saved.")
     
-    def run_world_model_evaluation_new_data(self, title_prefix):
-        self.world_model = self.load_diffusion_model(self.args.diffusion_model_path, num_classes=60)
+    def run_world_model_evaluation_new_data(self):
+        # TODO: Data is probably not correctly formatted for world model evaluation
+        self.world_model = self.load_diffusion_model(self.args.diffusion_model_path, num_classes=68)
         if hasattr(self.world_model, 'ema_model'):
             self.world_model = self.world_model.ema_model
         num_samples = 1
-        # policy_ids = [35, 38, 47, 44, 41]
-        policy_ids = [0]
+        # policy_ids = [40, 38, 1, 3] # Sp1, sp10, actor_best_bc, bc_train
+        policy_ids = [40]
 
         # Sample random episodes and timesteps for diverse obs
         for sample_idx in range(num_samples):
@@ -1495,27 +1497,39 @@ class ModelTester:
             action_seq = episode["actions"]
 
             # Pick a random timestep
-            t = random.randint(0, len(obs_seq) - 1)
+            # t = random.randint(0, len(obs_seq) - 1)
+            t = 10
             obs = obs_seq[t]
             obs = np.array(obs[0])  # Convert to numpy array if needed
             
             # Evaluate for each policy_id
             for policy_id in policy_ids:
                 print(f"Evaluating world model with sample {sample_idx}, timestep {t}, policy ID {policy_id}")
-                self.evaluate_world_model(obs, policy_id)
+                self.evaluate_world_model(obs[0], policy_id)
     
-    def run_world_model_evaluation_with_dataset(self, title_prefix):
-        self.world_model = self.load_diffusion_model(self.args.diffusion_model_path, num_classes=60)
+    def run_world_model_evaluation_with_dataset(self, title_prefix, actions=None, idx=[0]):
+        self.world_model = self.load_diffusion_model(self.args.diffusion_model_path, num_classes=68)
         if hasattr(self.world_model, 'ema_model'):
             self.world_model = self.world_model.ema_model
         self.world_model.to(self.device)
         dataset = self._load_dataset(split="train")
-        loader = th.utils.data.DataLoader(dataset, batch_size=1, shuffle=False)
-        num_samples = 5
-
-        # Sample random episodes and timesteps for diverse obs
-        for i, (x_org, x_cond, task_embed, _) in enumerate(loader):
+        data = []
+        for i in idx:
+            data.append(dataset.__getitem__(i, start_t=1))
+        
+        if actions is None:
+            print(f"Using default actions for world model evaluation: {title_prefix}")
             actions = th.tensor([4]*8, dtype=th.long).unsqueeze(0)
+        else:
+            actions = th.tensor(actions, dtype=th.long).unsqueeze(0) 
+        
+        # Sample random episodes and timesteps for diverse obs
+        for i, (x_org, x_cond, task_embed, _) in enumerate(data):
+            x_org = x_org.unsqueeze(0).to(self.device)  # Add batch dimension
+            x_cond = x_cond.unsqueeze(0).to(self.device)  # Add batch dimension
+            task_embed = th.tensor([task_embed], dtype=th.long, device=self.device)
+            
+            print(x_cond.shape, task_embed.shape, actions.shape)
             x_cond = rearrange(x_cond, "b h w c -> b c h w")
             x_cond = x_cond.to(self.device)
             task_embed = task_embed.to(self.device)
@@ -1549,8 +1563,6 @@ class ModelTester:
                 file_path=x_cond_path,
                 normalize=True,
             )
-            if i >= num_samples - 1:
-                break
     def run_obs_roundtrip_test(self, title_prefix):
         # Sample random episodes and timesteps for diverse obs
         def consistent_norm(obs):
@@ -1723,8 +1735,11 @@ class ModelTester:
         # self.run_obs_roundtrip_test("obs_roundtrip_test_1")
     
     def run_debug_tests(self):
-        self.set_experiment_dir("debug_tests")
-        self.visualize_attention(output_dir="attention_visualizations", sample_idx=42)
+        self.set_experiment_dir("debug_tests_2", "world_model_eval")
+        self.run_world_model_evaluation_with_dataset("no_op", actions=[4]*8, idx=[0, 32])
+        self.run_world_model_evaluation_with_dataset("up_down", actions=[0,1]*4, idx=[0, 32])
+        self.run_world_model_evaluation_with_dataset("left_right", actions=[2,3]*4,  idx=[0, 32])
+        # self.visualize_attention(output_dir="attention_visualizations", sample_idx=42)
     
             
 
@@ -1748,13 +1763,13 @@ def parse_args(args, parser):
     parser.add_argument("--diffusion_model_path", type=str, required=True, help="Path to the diffusion model directory")
     parser.add_argument("--n_envs", type=int, default=4, help="Number of parallel environments")
     parser.add_argument("--max_steps", type=int, default=400, help="Maximum steps per episode")
-    parser.add_argument("--idm_path", type=str, required=True, help="Path to the diffusion model directory")
-    parser.add_argument("--action_proposal_model_path", type=str, required=True, help="Path to the action proposal (diffusion) model checkpoint")
-    parser.add_argument("--value_model_path", type=str, required=True, help="Path to the reward/value model checkpoint")
+    # parser.add_argument("--idm_path", type=str, required=True, help="Path to the diffusion model directory")
+    # parser.add_argument("--action_proposal_model_path", type=str, required=True, help="Path to the action proposal (diffusion) model checkpoint")
+    # parser.add_argument("--value_model_path", type=str, required=True, help="Path to the reward/value model checkpoint")
     parser.add_argument('--dataset_path', type=str, required=True, help='Path to the Overcooked HDF5 dataset')
 
     # Mapt Package Args  
-    parser.add_argument("--old_dynamics", default=False, action='store_true', help="old_dynamics in mdp")
+    parser.add_argument("--old_dynamics", default=True, action='store_true', help="old_dynamics in mdp")
     parser.add_argument("--layout_name", type=str, default='counter_circuit_o_1order', help="Name of Submap, 40+ in choice. See /src/data/layouts/.")
     parser.add_argument('--num_agents', type=int, default=1, help="number of players")
     parser.add_argument("--initial_reward_shaping_factor", type=float, default=1.0, help="Shaping factor of potential dense reward.")

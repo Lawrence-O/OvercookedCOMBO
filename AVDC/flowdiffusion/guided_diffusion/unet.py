@@ -629,8 +629,14 @@ class UNetModel(nn.Module):
         self._feature_size = ch
         input_block_chans = [ch]
         ds = 1
+        action_proposal = not (self.num_actions is not None and self.action_horizon is not None)
+        print(f"Action only first: {action_proposal}")
         for level, mult in enumerate(channel_mult):
             for i in range(num_res_blocks):
+                if action_proposal:
+                    use_cross = self.cross and (i == 0)
+                else:
+                    use_cross = self.cross
                 layers = [
                     ResBlock(
                         ch,
@@ -640,7 +646,7 @@ class UNetModel(nn.Module):
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
-                        cross=self.cross,
+                        cross=use_cross,
                         name=f'input_block_{level}_{i}'
                     )
                 ]
@@ -722,6 +728,10 @@ class UNetModel(nn.Module):
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
+                if action_proposal:
+                    use_cross = self.cross and (i == 0)
+                else:
+                    use_cross = self.cross
                 ich = input_block_chans.pop()
                 layers = [
                     ResBlock(
@@ -732,7 +742,7 @@ class UNetModel(nn.Module):
                         dims=dims,
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
-                        cross=self.cross,
+                        cross=use_cross,
                         name=f'output_block_{level}_{i}'
                     )
                 ]

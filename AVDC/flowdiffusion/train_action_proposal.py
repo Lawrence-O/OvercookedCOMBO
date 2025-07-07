@@ -65,7 +65,7 @@ class ActionProposalTrainer:
                 self.trainer.load(milestone=args.resume_checkpoint_path)
             else:
                 print(f"Warning: Checkpoint path {args.resume_checkpoint_path} not found. Starting training from scratch.")
-        
+    
     def init_diffusion_trainer(self):
         H,W,C = self.observation_dim
         self.unet = UnetOvercookedActionProposal(
@@ -148,7 +148,7 @@ if __name__ == '__main__':
 
     # Wandb arguments
     parser.add_argument('--wandb', action='store_true', default=False, help='Enable Weights & Biases logging.')
-    parser.add_argument('--wandb_project', type=str, default="combo_overcooked_diffuser", help='Wandb project name.')
+    parser.add_argument('--wandb_project', type=str, default="action_proposal_diffusion", help='Wandb project name.')
     parser.add_argument('--wandb_entity', type=str, default="social-rl", help='Wandb entity (username or team).')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='Wandb run name. Defaults to dataset_datetime.')
     config = parser.parse_args()

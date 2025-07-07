@@ -150,7 +150,7 @@ class UnetOvercookedActionProposal(nn.Module):
             out_channels=self.num_actions,
             num_res_blocks=2,
             image_cond_dim=(self.C, self.H, self.W),
-            attention_resolutions=(2, 4, 8, 16), # TODO: Changed to (2, 4, 8) was (4, 8)
+            attention_resolutions=(4, 8), # TODO: Changed to (2, 4, 8) was (4, 8)
             dropout=0,
             channel_mult=(1, 2, 4, 8),
             conv_resample=True,
@@ -160,21 +160,18 @@ class UnetOvercookedActionProposal(nn.Module):
             use_checkpoint=False,
             use_fp16=False,
             num_head_channels=32,
+            cross=True,
         )
     def forward(self, x, x_cond, t, task_embed=None, action_embed=None, vis=None, **kwargs):
         # x shape: [B, (horizon * num_actions), 1, 1]
         B = x.shape[0]
-        
         # Reshape to [B, num_actions, horizon] for 1D processing
         x = x.view(B, self.horizon, self.num_actions)
         x = x.permute(0, 2, 1)  # [B, num_actions, horizon]
-
         out = self.unet(x, t, image_embed=x_cond, **kwargs)
-        
         # Reshape back to expected format
         out = out.permute(0, 2, 1)  # [B, horizon, num_actions]
         out = out.reshape(B, self.horizon * self.num_actions, 1, 1)
-        
         return out
 
       

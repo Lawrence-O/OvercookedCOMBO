@@ -42,7 +42,7 @@ def load_partner_policy(args, policy_name, device="cpu"):
     return policy, feat_type
 
 
-def normalize_obs(obs): # TODO: Fix this
+def max_normalize_obs(obs): # TODO: Fix this
     if isinstance(obs, th.Tensor):
         # Assume obs shape is [T, H, W, C]
         obs_max = th.amax(obs, dim=(0, 1, 2), keepdim=True)
@@ -56,6 +56,36 @@ def normalize_obs(obs): # TODO: Fix this
     else:
         raise ValueError("Unsupported observation type. Must be numpy array or PyTorch tensor.")
     return obs_norm.astype(np.float32)
+
+def normalize_obs(obs):
+        """ Normalizes a numpy observation array to [-1, 1]. """
+        # Scaled down by 255 since data is scaled by 255
+        if isinstance(obs, th.Tensor):
+            obs = to_np(obs)
+        assert np.all(obs % 255 == 0)
+        obs = obs.astype(np.float32) / 255.0
+
+        HARDCODED_INDEX_TO_MAX_VAL = {
+            16: 3.0,  # onions_in_pot
+            17: 3.0,  # tomatoes_in_pot
+            18: 3.0,  # onions_in_soup
+            19: 3.0,  # tomatoes_in_soup
+            20: 20.0, # soup_cook_time_remaining
+        } 
+
+        normalized_obs = np.zeros_like(obs, dtype=np.float32)
+
+        for ch_idx in range(obs.shape[-1]):
+            ch_data = obs[..., ch_idx]
+            if ch_idx in HARDCODED_INDEX_TO_MAX_VAL:
+                # Normalize from original game range [0, max_val] to [-1, 1]
+                max_ch_val = HARDCODED_INDEX_TO_MAX_VAL[ch_idx]
+                norm_ch = 2.0 * (ch_data / max_ch_val) - 1.0
+            else:
+                # Assume binary channel (original game values are 0 or 1).
+                norm_ch = 2.0 * ch_data - 1.0
+            normalized_obs[..., ch_idx] = norm_ch
+        return normalized_obs
 
 def convert_to_binary_obs(obs):
     if isinstance(obs, np.ndarray):

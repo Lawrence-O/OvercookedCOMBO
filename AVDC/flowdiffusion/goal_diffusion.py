@@ -2135,7 +2135,7 @@ class OvercookedActionProposal(Trainer):
                  debug=False,
                  dummy_policy_id=None,
                  wandb_enabled=False,
-                 wandb_project="overcooked-action-proposal-diffusion",
+                 wandb_project="action_proposal_diffusion",
                  wandb_entity="social-rl",
                  wandb_run_name=None
                 ):
