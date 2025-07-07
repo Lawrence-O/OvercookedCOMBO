@@ -85,7 +85,7 @@ class UnetOvercooked(nn.Module):
             in_channels=self.C * 2,
             model_channels=256, # Increased from 128 -> 256
             out_channels=self.C,
-            num_res_blocks=2,
+            num_res_blocks=3,
             attention_resolutions=(1, 2),
             dropout=0,
             channel_mult=(1, 2),
