@@ -120,7 +120,7 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
             obs = np.expand_dims(obs, axis=1) 
         conditions_obs_np = obs[start_t - 1, 0] 
         trajectories_np = obs[start_t:end_t, 0]
-        future_actions_np = actions[start_t : start_t + self.action_horizon, 0].squeeze(-1)
+        future_actions_np = actions[start_t - 1: start_t + self.action_horizon - 1, 0].squeeze(-1)
 
         # Get the partner policy ID for conditioning
         original_partner_id = policy_id[1]
