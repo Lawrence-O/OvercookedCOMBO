@@ -57,13 +57,17 @@ def max_normalize_obs(obs): # TODO: Fix this
         raise ValueError("Unsupported observation type. Must be numpy array or PyTorch tensor.")
     return obs_norm.astype(np.float32)
 
-def normalize_obs(obs):
-        """ Normalizes a numpy observation array to [-1, 1]. """
+def normalize_obs(obs, divide=True):
+        """ Normalizes a numpy observation array to [-1, 1]. 
+        If `divide` is True, it un-scales the observation by 255.0.
+        """
         # Scaled down by 255 since data is scaled by 255
         if isinstance(obs, th.Tensor):
             obs = to_np(obs)
-        assert np.all(obs % 255 == 0)
-        obs = obs.astype(np.float32) / 255.0
+        
+        if divide:
+            assert np.all(obs % 255 == 0)
+            obs = obs.astype(np.float32) / 255.0
 
         HARDCODED_INDEX_TO_MAX_VAL = {
             16: 3.0,  # onions_in_pot
@@ -86,6 +90,59 @@ def normalize_obs(obs):
                 norm_ch = 2.0 * ch_data - 1.0
             normalized_obs[..., ch_idx] = norm_ch
         return normalized_obs
+
+def unnormalize_obs(obs, eps=5e-1):
+    # Assume obs is in range [-1, 1]; just directly un-normalize back
+    assert obs.min() >= -1.0 - eps and obs.max() <= 1.0 + eps, "Observation must be in range [-1, 1]" \
+    " current min: {}, max: {}".format(obs.min(), obs.max())
+    if isinstance(obs, th.Tensor):
+        obs = obs.detach().cpu().numpy()
+
+    FEATURE_CHANNEL_MAP = [
+        "player_0_loc", "player_1_loc", 
+        "player_0_orientation_0", "player_0_orientation_1", "player_0_orientation_2", "player_0_orientation_3",
+        "player_1_orientation_0", "player_1_orientation_1", "player_1_orientation_2", "player_1_orientation_3",
+        "pot_loc", "counter_loc", "onion_disp_loc", "tomato_disp_loc", "dish_disp_loc", "serve_loc",
+        "onions_in_pot", "tomatoes_in_pot",
+        "onions_in_soup", "tomatoes_in_soup", 
+        "soup_cook_time_remaining", "soup_done",
+        "dishes", "onions", "tomatoes",
+        "urgency"
+    ]
+    CHANNEL_FEATURE_MAP = {name: i for i, name in enumerate(FEATURE_CHANNEL_MAP)}
+    
+
+    # obs = np.clip(obs, -1.0, 1.0)
+    unnorm_obs = np.zeros_like(obs, dtype=np.float32)
+    max_values = {
+        "onions_in_pot": 3.0,
+        "tomatoes_in_pot": 3.0,
+        "onions_in_soup": 3.0,
+        "tomatoes_in_soup": 3.0,
+        "soup_cook_time_remaining": 20.0
+    }
+
+    idx_to_max = {}
+    for ch_name, max_val in max_values.items():
+        if ch_name in CHANNEL_FEATURE_MAP:
+            ch_idx = CHANNEL_FEATURE_MAP[ch_name]
+            idx_to_max[ch_idx] = max_val
+
+    for ch_idx in range(obs.shape[-1]):
+        channel_data = obs[:, :, ch_idx]
+        if ch_idx in idx_to_max:
+            max_val = idx_to_max[ch_idx]
+            # Rescale [-1, 1] to [0, 1];  Rescale [0, 1] to [0, max_val]
+            channel_data = ((channel_data + 1.0) / 2.0 )* max_val
+        else:
+            # Rescale from [-1, 1] to [0, 1]
+            channel_data = (channel_data + 1.0) / 2.0
+        
+        channel_data = np.round(channel_data).astype(np.int32)
+        unnorm_obs[...,ch_idx] = channel_data
+    unnorm_obs = unnorm_obs.clip(0)
+    
+    return unnorm_obs
 
 def convert_to_binary_obs(obs):
     if isinstance(obs, np.ndarray):

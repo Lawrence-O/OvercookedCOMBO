@@ -140,7 +140,7 @@ class OvercookedSampleRenderer:
 
                 if self._is_player_location(obs, y, x):
                     continue
-
+                
                 if grid[y][x] == 'P': # POT
                     onions_in_pot = self.get_feature(obs, "onions_in_pot", y, x)
                     tomatoes_in_pot = self.get_feature(obs, "tomatoes_in_pot", y, x)
@@ -156,11 +156,27 @@ class OvercookedSampleRenderer:
                     
                         num_onions = int(onions_in_pot + onions_in_soup)
                         num_tomatoes = int(tomatoes_in_pot + tomatoes_in_soup)
-                        soup_frame = self._soup_frame_name(num_onions,num_tomatoes, status)
+                        soup_frame = self._soup_frame_name(num_onions, num_tomatoes, status)
                         try:
                             self.SOUPS_IMG.blit_on_surface(surface, pos, soup_frame)
                         except KeyError:
                             print(f"Soup frame '{soup_frame}' not found")
+                # First, soup plates on counter
+                onions_in_soup   = self.get_feature(obs, "onions_in_soup", y, x)
+                tomatoes_in_soup = self.get_feature(obs, "tomatoes_in_soup", y, x)
+                soup_done        = self.get_feature(obs, "soup_done", y, x) > 0
+                if onions_in_soup > 0 or tomatoes_in_soup > 0 or soup_done:
+                    status = "cooked" if soup_done else "idle"
+                    num_onions  = int(onions_in_soup)
+                    num_tomatoes = int(tomatoes_in_soup)
+                    if num_onions > num_tomatoes and np.ceil(num_onions) >= 2.5:
+                        soup_obj = "soup-onion-dish"
+                    else:
+                        soup_obj = "soup-tomato-dish"
+                    try:
+                        self.OBJECTS_IMG.blit_on_surface(surface, pos, soup_obj)
+                    except KeyError:
+                        print(f"Soup frame '{soup_frame}' not found on counter")
                 elif self.get_feature(obs, "dishes", y, x) >= (1 - eps):
                     self.OBJECTS_IMG.blit_on_surface(surface, pos, "dish")
                 elif self.get_feature(obs, "onions", y, x) >= (1 - eps):
@@ -234,7 +250,7 @@ class OvercookedSampleRenderer:
         surface.fill((155,101,0))
 
         if normalize:
-            obs = self.normalize_obs(obs)
+            obs = self.unnormalize(obs)
         else:
             obs = obs.astype(np.float32) / 255.0
         
@@ -245,14 +261,14 @@ class OvercookedSampleRenderer:
 
         return surface
     
-    def render_trajectory_frames(self, trajectory, grid, output_dir=None, normalize=False):
+    def render_trajectory_frames(self, trajectory, grid, output_dir=None, normalize=False, eps=5e-2):
         if output_dir is None:
             output_dir = os.path.join(os.getcwd(), "trajectory_viz_output")
         os.makedirs(output_dir, exist_ok=True)
         img_paths = []
         for i, obs in enumerate(trajectory):
             file_path = os.path.join(output_dir, f"viz_frame_{i:04d}.png")
-            self.save_obs_image(obs, grid, file_path, normalize=normalize)
+            self.save_obs_image(obs, grid, file_path, normalize=normalize, eps=eps)
             img_paths.append(file_path)
         return img_paths
     
@@ -289,8 +305,8 @@ class OvercookedSampleRenderer:
                 grid[grid_height-1][x] = 'X'
         return grid
     
-    def render_trajectory_video(self, trajectory, grid, output_dir=None, video_path=None, fps=30, scale=4, normalize=False):
-        img_paths = self.render_trajectory_frames(trajectory, grid, output_dir, normalize=normalize)
+    def render_trajectory_video(self, trajectory, grid, output_dir=None, video_path=None, fps=30, scale=4, normalize=False, eps=5e-2):
+        img_paths = self.render_trajectory_frames(trajectory, grid, output_dir, normalize=normalize, eps=eps)
         if video_path is None:
             video_path = os.path.join(output_dir, "trajectory_viz_video.mp4")
         clip = ImageSequenceClip(img_paths, fps=fps)
@@ -433,12 +449,13 @@ class OvercookedSampleRenderer:
             else:
                 # Rescale from [-1, 1] to [0, 1]
                 channel_data = (channel_data + 1.0) / 2.0
+            channel_data = np.round(channel_data).astype(np.int32)
             unnorm_obs[...,ch_idx] = channel_data
         
         return unnorm_obs
 
-    def save_obs_image(self, obs, grid, file_path, scale=4, normalize=False):
-        surface = self.render_frame(obs, grid, normalize=normalize)
+    def save_obs_image(self, obs, grid, file_path, scale=4, normalize=False, eps=1e-4):
+        surface = self.render_frame(obs, grid, normalize=normalize, eps=eps)
         if scale != 1:
             surface = scale_surface_by_factor(surface, scale)
         pygame.image.save(surface, file_path)

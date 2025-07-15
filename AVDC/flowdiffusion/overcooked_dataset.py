@@ -220,10 +220,10 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         self.use_padding = args.use_padding
         
         *_, H, W, C = self.observations.shape
-        self.observation_dim = self.obs_cond_dim = (H, W, C)
+        self.obs_history_len = 16
+        self.observation_dim = self.obs_cond_dim = (self.obs_history_len, H, W, C)
         self.reward_threshold = 18.0
         self.filtered_indices = self._filter_high_reward_trajectories()
-        # self._plot_reward_histogram()
           
     
     def _normalize_obs(self, obs):
@@ -254,33 +254,17 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
             normalized_obs[..., ch_idx] = norm_ch
         return normalized_obs
     
-    def _plot_reward_histogram(self):
-        plt.figure(figsize=(16, 18))
-        plt.hist(self._reward_sums_all, bins=30, color='teal', alpha=0.8)
-        plt.axvline(self.reward_threshold, color='red', linestyle='--', label=f"Threshold = {self.reward_threshold}")
-        plt.title("Reward Distribution of Sub-Trajectories")
-        plt.xlabel("Sum of Rewards over Horizon")
-        plt.ylabel("Count")
-        plt.xticks(range(0,60,2), fontsize=10, rotation=45)
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig("reward_histogram.png")
-        plt.close()
-    
     def _filter_high_reward_trajectories(self):
         filtered = []
-        reward_sums = []
         for traj_idx in range(len(self.dataset)):
             rewards = self.rewards[traj_idx]  # [T, 2, 1]
             traj_len = rewards.shape[0]
-            for start in range(1, traj_len - self.horizon):
+            for start in range(traj_len - self.horizon):
                 end = start + self.horizon
                 reward_sum = rewards[start:end, 0].sum()  # agent 0
                 reward_val = reward_sum.item() if hasattr(reward_sum, "item") else reward_sum
-                reward_sums.append(reward_val)
                 if reward_val >= self.reward_threshold:
                     filtered.append((traj_idx, start))
-        # self._reward_sums_all = reward_sums
         print(f"Filtered {len(filtered)} sub-trajectories with rewards ≥ {self.reward_threshold}")
         return filtered
     
@@ -290,22 +274,49 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
         traj_idx, start = self.filtered_indices[idx]
-        obs = self.observations[traj_idx]  # shape: [T+1, 2, H, W, C]
-        actions = self.actions[traj_idx]   # shape: [T, 2, 1]
+        obs_trajectory = self.observations[traj_idx]  # shape: [T+1, 2, H, W, C]
+        actions_trajectory = self.actions[traj_idx]   # shape: [T, 2, 1]
 
-        obs = self._normalize_obs(obs)
+        if obs_trajectory.ndim == 4:
+            obs_trajectory = np.expand_dims(obs_trajectory, axis=1)
+        
+        start_idx = start - self.obs_history_len
+        end_idx = start
 
-        if obs.ndim == 4:
-            obs = np.expand_dims(obs, axis=1)
+        # Extract the observation history slice
+        obs_history_slice = obs_trajectory[max(0, start_idx):end_idx, 0]
 
-        conditions_obs = obs[start - 1, 0]  # ego agent
-        future_actions = actions[start:start + self.horizon, 0]
+        # If obs_history_slice is empty, we need to pad it with the first frame
+        if len(obs_history_slice) == 0:
+            # Case: The history is entirely before t=0.
+            first_frame = obs_trajectory[0, 0]
+            obs_history = np.repeat(
+                np.expand_dims(first_frame, axis=0), 
+                repeats=self.obs_history_len, 
+                axis=0
+            )
+        else:
+            # Case: We have at least one real frame.
+            num_missing_frames = self.obs_history_len - len(obs_history_slice)
+            if num_missing_frames > 0:
+                # Pad the existing slice with the edge value --> [frame_0....frame_0, frame_1, frame_n]
+                pad_width = ((num_missing_frames, 0), (0, 0), (0, 0), (0, 0))
+                obs_history = np.pad(obs_history_slice, pad_width, mode='edge')
+            else:
+                # No padding was needed
+                obs_history = obs_history_slice
+        
+        obs_history = self._normalize_obs(obs_history)
+        future_actions = actions_trajectory[start:start + self.horizon, 0]
 
         x = torch.from_numpy(future_actions)  # shape: [horizon, 1]
-        x_cond = torch.from_numpy(conditions_obs)  # shape: [H, W, C]
+        x_cond = torch.from_numpy(obs_history)  # shape: [F, H, W, C]
 
         assert x.min() >= 0 and x.max() < 6, f"Actions must be in [0, 6), got range [{x.min()}, {x.max()}]"
         assert x_cond.min() >= -1.0 and x_cond.max() <= 1.0
+        assert x_cond.shape == (self.obs_history_len, self.H, self.W, self.C), \
+            f"x_cond shape is incorrect. Expected [F,H,W,C] = [{self.obs_history_len},{self.H},{self.W},{self.C}], " \
+            f"but got shape {x_cond.shape}"
 
         return x, x_cond
 

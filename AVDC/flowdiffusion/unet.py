@@ -160,7 +160,7 @@ class UnetOvercookedActionProposal(nn.Module):
             use_checkpoint=False,
             use_fp16=False,
             num_head_channels=32,
-            cross=True,
+            cross=True, #TODO: Enable Scale Shift Norm
         )
     def forward(self, x, x_cond, t, task_embed=None, action_embed=None, vis=None, **kwargs):
         # x shape: [B, (horizon * num_actions), 1, 1]

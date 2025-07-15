@@ -1515,7 +1515,7 @@ class ModelTester:
         dataset = self._load_dataset(split="train")
         data = []
         for i in idx:
-            data.append(dataset.__getitem__(i, start_t=1))
+            data.append(dataset.__getitem__(0, start_t=i))
         
         if actions is None:
             print(f"Using default actions for world model evaluation: {title_prefix}")
@@ -1735,10 +1735,10 @@ class ModelTester:
         # self.run_obs_roundtrip_test("obs_roundtrip_test_1")
     
     def run_debug_tests(self):
-        self.set_experiment_dir("debug_tests_2", "world_model_eval")
-        self.run_world_model_evaluation_with_dataset("no_op", actions=[4]*8, idx=[0, 32])
-        self.run_world_model_evaluation_with_dataset("up_down", actions=[0,1]*4, idx=[0, 32])
-        self.run_world_model_evaluation_with_dataset("left_right", actions=[2,3]*4,  idx=[0, 32])
+        # self.set_experiment_dir("debug_tests_2", "world_model_eval")
+        # self.run_world_model_evaluation_with_dataset("no_op", actions=[4]*8, idx=[0, 32])
+        # self.run_world_model_evaluation_with_dataset("up_down", actions=[0,1]*4, idx=[0, 32])
+        # self.run_world_model_evaluation_with_dataset("left_right", actions=[2,3]*4,  idx=[0, 32])
         # self.visualize_attention(output_dir="attention_visualizations", sample_idx=42)
     
             

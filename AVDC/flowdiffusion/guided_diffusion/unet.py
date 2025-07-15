@@ -194,7 +194,7 @@ class ResBlock(TimestepBlock):
             nn.SiLU(),
             conv_nd(dims, channels, self.out_channels, 3, padding=1),
         )
-        
+        # TODO: Make this configurable
         if self.cross:
             self.cross_attn = CrossAttention(self.out_channels, context_dim=emb_channels, dim_head=32, heads=4)
 
@@ -357,6 +357,7 @@ class AttentionBlock(nn.Module):
             return rearrange((x + h), "b c (x y) -> b c x y", c=c, x=spatial[0], y=spatial[1])
         elif self.dims == 3:
             assert len(spatial) == 3, "3D attention requires 3 spatial dimensions"
+            # TODO: Perhaps we should do (b, c, f, x, y) -> (b c (f x y)
             x = rearrange(x, "b c f x y -> (b f) c (x y)")
             qkv = self.qkv(self.norm(x))
             h = self.attention(qkv)
@@ -490,6 +491,28 @@ class ResidualConv2DBlock(nn.Module):
         residual = self.skip_connection(x)
         out = self.conv_block(x)
         return out + residual
+    
+class ResidualConv3DBlock(nn.Module):
+    """ A residual block with a 3D convolution, normalization, and activation."""
+    def __init__(self, in_channels, out_channels, kernel_size=3):
+        super().__init__()
+        if isinstance(kernel_size, int):
+            kernel_size = (kernel_size, kernel_size, kernel_size)
+        padding = (kernel_size[0] // 2, kernel_size[1] // 2, kernel_size[2] // 2)
+        self.conv_block = nn.Sequential(
+            nn.Conv3d(in_channels, out_channels, kernel_size, padding=padding),
+            normalization(out_channels),
+            nn.SiLU(),
+            nn.Conv3d(out_channels, out_channels, kernel_size, padding=padding),
+        )
+        if in_channels != out_channels:
+            self.skip_connection = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.skip_connection = nn.Identity()
+    def forward(self, x):
+        residual = self.skip_connection(x)
+        out = self.conv_block(x)
+        return out + residual
 
 class SpatialObservationEncoder(nn.Module):
     """
@@ -506,6 +529,33 @@ class SpatialObservationEncoder(nn.Module):
         )
     def forward(self, x):
         out = self.feature_extractor(x)
+        return out
+
+class VideoObservationEncoder(nn.Module):
+    def __init__(self, in_channels, context_dim):
+        super().__init__()
+        assert context_dim % 2 == 0, "context_dim must be even for ResidualConv3DBlock"
+        self.initial_feature_extractor = nn.Sequential(
+            ResidualConv3DBlock(in_channels, context_dim // 2),
+            Downsample(context_dim // 2, True, dims=3),
+            ResidualConv3DBlock(context_dim // 2, context_dim),
+            Downsample(context_dim, True, dims=3),
+            ResidualConv3DBlock(context_dim, context_dim),
+        )
+        self.attention = AttentionBlock(
+            channels=context_dim,
+            num_heads=8,
+            num_head_channels=-1,
+            dims=3,
+        )
+        self.end_layers = nn.Sequential(
+            ResidualConv3DBlock(context_dim, context_dim)
+        )
+    def forward(self, x):
+        x = self.initial_feature_extractor(x)
+        x = self.attention(x)
+        out = self.end_layers(x)
+        out = rearrange(out, 'b d f h w -> b (f h w) d')
         return out
     
 
@@ -630,7 +680,6 @@ class UNetModel(nn.Module):
         input_block_chans = [ch]
         ds = 1
         action_proposal = not (self.num_actions is not None and self.action_horizon is not None)
-        print(f"Action only first: {action_proposal}")
         for level, mult in enumerate(channel_mult):
             for i in range(num_res_blocks):
                 if action_proposal:

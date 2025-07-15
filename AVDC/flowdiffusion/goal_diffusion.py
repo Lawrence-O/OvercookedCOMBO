@@ -2224,6 +2224,14 @@ class OvercookedActionProposal(Trainer):
             "unet_attention_resolutions": str(diffusion_model.model.unet.attention_resolutions) if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_channel_mult": str(diffusion_model.model.unet.channel_mult) if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_num_classes": diffusion_model.model.unet.num_classes if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_attention_resolutions": str(diffusion_model.model.unet.attention_resolutions) if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_cross_attention_enabled": diffusion_model.model.unet.cross if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_heads": diffusion_model.model.unet.num_heads if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_head_channels": diffusion_model.model.unet.num_head_channels if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_num_classes": diffusion_model.model.unet.num_classes if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_use_scale_shift_norm": diffusion_model.model.unet.use_scale_shift_norm if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_dropout": diffusion_model.model.unet.dropout if hasattr(diffusion_model.model, 'unet') else 'N/A',
+            "unet_use_checkpointing": diffusion_model.model.unet.use_checkpoint if hasattr(diffusion_model.model, 'unet') else 'N/A',
         }
         
         
