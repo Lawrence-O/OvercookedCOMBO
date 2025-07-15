@@ -31,6 +31,7 @@ class HDF5Dataset(Dataset):
         obs = self.dset["obs"][idx]
         actions = self.dset["actions"][idx]
         policy_id = self.dset["policy_id"][idx]
+        rewards = self.dset["rewards"][idx]
 
         chunk_start = self.inp_seq_start[idx]
         chunk_end = chunk_start + self.chunk_length

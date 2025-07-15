@@ -176,6 +176,8 @@ class ResBlock(TimestepBlock):
         down=False,
         cross=False,
         name="",
+        cross_attention_heads=4,
+        cross_attention_dim_head=32
     ):
         super().__init__()
         self.channels = channels
@@ -194,9 +196,8 @@ class ResBlock(TimestepBlock):
             nn.SiLU(),
             conv_nd(dims, channels, self.out_channels, 3, padding=1),
         )
-        # TODO: Make this configurable
         if self.cross:
-            self.cross_attn = CrossAttention(self.out_channels, context_dim=emb_channels, dim_head=32, heads=4)
+            self.cross_attn = CrossAttention(self.out_channels, context_dim=emb_channels, dim_head=cross_attention_dim_head, heads=cross_attention_heads)
 
         self.updown = up or down
 
@@ -312,7 +313,8 @@ class AttentionBlock(nn.Module):
         use_checkpoint=False,
         use_new_attention_order=False,
         dims=3,
-        name=""
+        name="",
+        enable_spatiotemporal_attention=False,
     ):
         super().__init__()
         self.channels = channels
@@ -336,6 +338,7 @@ class AttentionBlock(nn.Module):
 
         self.proj_out = conv_nd(1, channels, channels, 1)
         self.dims = dims
+        self.enable_spatiotemporal_attention = enable_spatiotemporal_attention
 
     def forward(self, x):
         return checkpoint(self._forward, (x,), self.parameters(), True)
@@ -357,12 +360,18 @@ class AttentionBlock(nn.Module):
             return rearrange((x + h), "b c (x y) -> b c x y", c=c, x=spatial[0], y=spatial[1])
         elif self.dims == 3:
             assert len(spatial) == 3, "3D attention requires 3 spatial dimensions"
-            # TODO: Perhaps we should do (b, c, f, x, y) -> (b c (f x y)
-            x = rearrange(x, "b c f x y -> (b f) c (x y)")
-            qkv = self.qkv(self.norm(x))
-            h = self.attention(qkv)
-            h = self.proj_out(h)
-            return rearrange((x + h), "(b f) c (x y) -> b c f x y", c=c, f=spatial[0], x=spatial[1], y=spatial[2])
+            if self.enable_spatiotemporal_attention:
+                x = rearrange(x, "b c f x y -> b c (f x y)")
+                qkv = self.qkv(self.norm(x))
+                h = self.attention(qkv)
+                h = self.proj_out(h)
+                return rearrange((x + h), "b c (f x y) -> b c f x y", c=c, f=spatial[0], x=spatial[1], y=spatial[2])
+            else:
+                x = rearrange(x, "b c f x y -> (b f) c (x y)")
+                qkv = self.qkv(self.norm(x))
+                h = self.attention(qkv)
+                h = self.proj_out(h)
+                return rearrange((x + h), "(b f) c (x y) -> b c f x y", c=c, f=spatial[0], x=spatial[1], y=spatial[2])
         else:
             raise ValueError(f"Unsupported dimension: {self.dims}. Only 1D, 2D, and 3D are supported.")
 def count_flops_attn(model, _x, y):
@@ -453,7 +462,7 @@ class QKVAttention(nn.Module):
     def count_flops(model, _x, y):
         return count_flops_attn(model, _x, y)
 
-#TODO: Combine ResidualConv1DBlock and ResidualConv2DBlock into a single class with a `dims` parameter.
+#TODO: Here for backwards compatibility, remove later
 class ResidualConv1DBlock(nn.Module):
     """ A residual block with a 1D convolution, normalization, and activation.""" 
     def __init__(self, in_channels, out_channels, kernel_size=3):
@@ -492,21 +501,22 @@ class ResidualConv2DBlock(nn.Module):
         out = self.conv_block(x)
         return out + residual
     
-class ResidualConv3DBlock(nn.Module):
-    """ A residual block with a 3D convolution, normalization, and activation."""
-    def __init__(self, in_channels, out_channels, kernel_size=3):
+class ResidualConvBlock(nn.Module):
+    """ A residual block with an N-dimensional convolution, normalization, and activation."""
+    def __init__(self, in_channels, out_channels, kernel_size=3, dims=2):
         super().__init__()
         if isinstance(kernel_size, int):
-            kernel_size = (kernel_size, kernel_size, kernel_size)
-        padding = (kernel_size[0] // 2, kernel_size[1] // 2, kernel_size[2] // 2)
+            pad = kernel_size // 2
+        else:
+            pad = tuple(k // 2 for k in kernel_size)
         self.conv_block = nn.Sequential(
-            nn.Conv3d(in_channels, out_channels, kernel_size, padding=padding),
+            conv_nd(dims, in_channels, out_channels, kernel_size, padding=pad),
             normalization(out_channels),
             nn.SiLU(),
-            nn.Conv3d(out_channels, out_channels, kernel_size, padding=padding),
+            conv_nd(dims, out_channels, out_channels, kernel_size, padding=pad),
         )
         if in_channels != out_channels:
-            self.skip_connection = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+            self.skip_connection = conv_nd(dims, in_channels, out_channels, 1)
         else:
             self.skip_connection = nn.Identity()
     def forward(self, x):
@@ -532,24 +542,25 @@ class SpatialObservationEncoder(nn.Module):
         return out
 
 class VideoObservationEncoder(nn.Module):
-    def __init__(self, in_channels, context_dim):
+    def __init__(self, in_channels, context_dim, enable_spatiotemporal_attention=True):
         super().__init__()
         assert context_dim % 2 == 0, "context_dim must be even for ResidualConv3DBlock"
         self.initial_feature_extractor = nn.Sequential(
-            ResidualConv3DBlock(in_channels, context_dim // 2),
+            ResidualConvBlock(in_channels, context_dim // 2, dims=3),
             Downsample(context_dim // 2, True, dims=3),
-            ResidualConv3DBlock(context_dim // 2, context_dim),
+            ResidualConvBlock(context_dim // 2, context_dim, dims=3),
             Downsample(context_dim, True, dims=3),
-            ResidualConv3DBlock(context_dim, context_dim),
+            ResidualConvBlock(context_dim, context_dim, dims=3),
         )
         self.attention = AttentionBlock(
             channels=context_dim,
             num_heads=8,
             num_head_channels=-1,
             dims=3,
+            enable_spatiotemporal_attention=enable_spatiotemporal_attention,
         )
         self.end_layers = nn.Sequential(
-            ResidualConv3DBlock(context_dim, context_dim)
+            ResidualConvBlock(context_dim, context_dim, dims=3)
         )
     def forward(self, x):
         x = self.initial_feature_extractor(x)
@@ -604,11 +615,10 @@ class UNetModel(nn.Module):
         conv_resample=True,
         dims=2,
         num_classes=None,
-        task_tokens=True,
         num_actions=None,
         image_cond_dim=None,
         action_horizon=None,
-        task_token_channels=512,
+        reward_dim=None,
         use_checkpoint=False,
         use_fp16=False,
         num_heads=1,
@@ -618,6 +628,9 @@ class UNetModel(nn.Module):
         resblock_updown=False,
         use_new_attention_order=False,
         cross=False,
+        cross_attention_heads=4,
+        cross_attention_dim_head=32,
+        use_spatiotemporal_attention=False,
     ):
         super().__init__()
 
@@ -636,7 +649,6 @@ class UNetModel(nn.Module):
         self.num_classes = num_classes
         self.num_actions = num_actions
         self.action_horizon = action_horizon
-        self.task_tokens = task_tokens
         self.use_checkpoint = use_checkpoint
         self.dtype = th.float16 if use_fp16 else th.float32
         self.num_heads = num_heads
@@ -645,10 +657,12 @@ class UNetModel(nn.Module):
         self.image_cond_dim = image_cond_dim
         self.cross = cross
         self.use_scale_shift_norm = use_scale_shift_norm # Mostly here for wandb logging
+        self.cross_attention_heads = cross_attention_heads
+        self.cross_attention_dim_head = cross_attention_dim_head
+        self.use_spatiotemporal_attention = use_spatiotemporal_attention
 
         time_embed_dim = model_channels * 4
         context_dim = time_embed_dim
-
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
             nn.SiLU(),
@@ -657,7 +671,13 @@ class UNetModel(nn.Module):
 
         if self.num_classes is not None:
             self.label_emb = nn.Embedding(num_classes, context_dim)
-
+        
+        if self.reward_dim is not None:
+            self.reward_emb = nn.Sequential(
+                linear(self.reward_dim, context_dim),
+                nn.SiLU(),
+                linear(context_dim, context_dim),
+            )
 
         if self.num_actions is not None and self.action_horizon is not None:
             self.action_cond = ResidualConv1DBlock(
@@ -696,7 +716,9 @@ class UNetModel(nn.Module):
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
                         cross=use_cross,
-                        name=f'input_block_{level}_{i}'
+                        name=f'input_block_{level}_{i}',
+                        cross_attention_heads=self.cross_attention_heads,
+                        cross_attention_dim_head=self.cross_attention_dim_head
                     )
                 ]
                 ch = int(mult * model_channels)
@@ -709,7 +731,8 @@ class UNetModel(nn.Module):
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
                             dims=dims,
-                            name=f'input_block_{level}_attn'
+                            name=f'input_block_{level}_attn',
+                            enable_spatiotemporal_attention=use_spatiotemporal_attention,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -750,7 +773,9 @@ class UNetModel(nn.Module):
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
                 cross=self.cross,
-                name=f'middle_block_1'
+                name=f'middle_block_1',
+                cross_attention_heads=self.cross_attention_heads,
+                cross_attention_dim_head=self.cross_attention_dim_head
             ),
             AttentionBlock(
                 ch,
@@ -759,7 +784,8 @@ class UNetModel(nn.Module):
                 num_head_channels=num_head_channels,
                 use_new_attention_order=use_new_attention_order,
                 dims=dims,
-                name=f'middle_block_self_attn'
+                name=f'middle_block_self_attn',
+                use_spatiotemporal_attention=use_spatiotemporal_attention,
             ),
             ResBlock(
                 ch,
@@ -769,7 +795,9 @@ class UNetModel(nn.Module):
                 use_checkpoint=use_checkpoint,
                 use_scale_shift_norm=use_scale_shift_norm,
                 cross=self.cross,
-                name=f'middle_block_2'
+                name=f'middle_block_2',
+                cross_attention_heads=self.cross_attention_heads,
+                cross_attention_dim_head=self.cross_attention_dim_head
             ),
         )
         self._feature_size += ch
@@ -792,7 +820,9 @@ class UNetModel(nn.Module):
                         use_checkpoint=use_checkpoint,
                         use_scale_shift_norm=use_scale_shift_norm,
                         cross=use_cross,
-                        name=f'output_block_{level}_{i}'
+                        name=f'output_block_{level}_{i}',
+                        cross_attention_heads=self.cross_attention_heads,
+                        cross_attention_dim_head=self.cross_attention_dim_head
                     )
                 ]
                 ch = int(model_channels * mult)
@@ -805,7 +835,8 @@ class UNetModel(nn.Module):
                             num_head_channels=num_head_channels,
                             use_new_attention_order=use_new_attention_order,
                             dims=dims,
-                            name=f'output_block_{level}_self_attn'
+                            name=f'output_block_{level}_self_attn',
+                            enable_spatiotemporal_attention=use_spatiotemporal_attention,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -820,7 +851,10 @@ class UNetModel(nn.Module):
                             use_checkpoint=use_checkpoint,
                             use_scale_shift_norm=use_scale_shift_norm,
                             up=True,
-                            name=f'output_block_{level}_{i}_upsample'
+                            name=f'output_block_{level}_{i}_upsample',
+                            cross=self.cross,
+                            cross_attention_heads=self.cross_attention_heads,
+                            cross_attention_dim_head=self.cross_attention_dim_head,
                         )
                         if resblock_updown
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
@@ -851,7 +885,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y=None, action_embed=None, image_embed=None, mask=None, vis=None):
+    def forward(self, x, timesteps, y=None, action_embed=None, image_embed=None, reward_embed=None, mask=None, vis=None):
         """
         Apply the model to an input batch.
 
@@ -861,7 +895,7 @@ class UNetModel(nn.Module):
         :return: an [N x C x ...] Tensor of outputs.
         """
         assert (y is not None) == (
-            self.num_classes is not None or self.task_tokens
+            self.num_classes is not None
         ), "must specify y if and only if the model is class-conditional"
 
         hs = []
@@ -891,8 +925,13 @@ class UNetModel(nn.Module):
             image_latent = rearrange(image_latent, 'b d h w -> b (h w) d')
             context_list.append(image_latent)
         
-        if self.task_tokens:
-           raise NotImplementedError("Task tokens are not implemented in this version of UNetModel.")
+        if reward_embed is not None and self.reward_dim is not None:
+            assert reward_embed.shape[0] == x.shape[0]
+            assert reward_embed.ndim == 1, f"Expected reward_embed to be 1D, got {reward_embed.ndim}D"
+            reward_latent = self.reward_emb(reward_embed)
+            reward_latent = rearrange(reward_latent, 'b d -> b 1 d')
+            context_list.append(reward_latent)
+        
         
         if len(context_list) > 0:
             latent = th.cat(context_list, dim=1) # [B, len(context_list), C]

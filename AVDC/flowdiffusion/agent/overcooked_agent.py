@@ -259,6 +259,8 @@ class DiffusionPlannerAgent:
         policy_id_th = th.from_numpy(policy_id_np).to(self.device, dtype=th.int64)
         current_obs_rearranged = rearrange(current_obs_th, 'b h w c -> b c h w')
         candidate_trajectories = []
+        # TODO: Decouple the action proposal model from the world model
+        # plan_i simulate x futures; take average to get expected reward for this plan_i instead of just one possible trajectory
         for _ in range(self.num_candidates):
             # action_proposal = self.action_proposal_model.sample(
             #     x_cond=current_obs_rearranged, batch_size=batch_size
