@@ -37,10 +37,10 @@ class UnetOvercooked(nn.Module):
             use_fp16=False,
             num_head_channels=32,
             cross=True,
-            cross_attention_dim_head=64,  # Increased from 32 -> 64
+            cross_attention_dim_head=32,
             cross_attention_heads=8,  # Increased from 4 -> 8
             use_scale_shift_norm=True,
-            enable_spatiotemporal_attention=True,  # Enable spatiotemporal attention
+            spatiotemporal_attention={1},  # Enable spatiotemporal attention in level 1
         )
     def pad_even(self, x):
         """Pads the Height and Width dimensions (dims 2 and 3 for 5D) to be even."""
@@ -61,7 +61,7 @@ class UnetOvercooked(nn.Module):
 
         x_padded = F.pad(x, pad_tuple, mode='constant', value=0)
         return x_padded
-    def forward(self, x, x_cond, t, task_embed=None, action_embed=None, reward_embed=None, vis=None, **kwargs):
+    def forward(self, x, x_cond, t, task_embed=None, action_embed=None, reward_embed=None, image_embed=None, history_embed=None, vis=None, **kwargs):
         *_, H, W = x.shape
         x = rearrange(x, "b (f c) h w -> b f h w c", f=self.horizon, c=self.C)
         x = self.pad_even(x) 
@@ -78,10 +78,11 @@ class UnetOvercooked(nn.Module):
         return out
 
 class UnetOvercookedActionProposal(nn.Module):
-    def __init__(self, horizon, obs_dim, num_actions):
+    def __init__(self, horizon, obs_dim, history_horizon, num_actions):
         super(UnetOvercookedActionProposal, self).__init__()
         self.horizon = horizon
         self.H, self.W, self.C  = obs_dim
+        self.history_horizon = history_horizon
         self.num_actions = num_actions
         self.unet = UNetModel(
             image_size=(horizon,),
@@ -92,11 +93,10 @@ class UnetOvercookedActionProposal(nn.Module):
             image_cond_dim=(self.C, self.H, self.W),
             attention_resolutions=(4, 8), # TODO: Can Be Increased to (2, 4, 8) 
             dropout=0,
-            channel_mult=(1, 2, 4, 8),
+            channel_mult=(1, 2, 4, 8), # TODO: Perhaps we can add one more channel mult
             conv_resample=True,
             dims=1,
             num_classes=None,
-            task_tokens=False,
             use_checkpoint=False,
             use_fp16=False,
             num_head_channels=32,
@@ -105,14 +105,16 @@ class UnetOvercookedActionProposal(nn.Module):
             cross_attention_heads=16,
             use_scale_shift_norm=True,
             reward_dim=1,
+            video_cond_dim=(self.history_horizon, self.C, self.H, self.W),
         )
-    def forward(self, x, x_cond, t, task_embed=None, action_embed=None, reward_embed=None, vis=None, **kwargs):
+    def forward(self, x, x_cond, t, task_embed=None, action_embed=None, reward_embed=None, image_embed=None, history_embed=None, vis=None, **kwargs):
+        assert x_cond is None, "x_cond should be None for action proposal"
         # x shape: [B, (horizon * num_actions), 1, 1]
         B = x.shape[0]
         # Reshape to [B, num_actions, horizon] for 1D processing
         x = x.view(B, self.horizon, self.num_actions)
         x = x.permute(0, 2, 1)  # [B, num_actions, horizon]
-        out = self.unet(x, t, image_embed=x_cond, reward_embed=reward_embed, **kwargs)
+        out = self.unet(x, t, image_embed=image_embed, reward_embed=reward_embed, history_embed=history_embed, **kwargs)
         # Reshape back to expected format
         out = out.permute(0, 2, 1)  # [B, horizon, num_actions]
         out = out.reshape(B, self.horizon * self.num_actions, 1, 1)

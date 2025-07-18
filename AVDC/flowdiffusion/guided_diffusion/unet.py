@@ -533,39 +533,28 @@ class SpatialObservationEncoder(nn.Module):
         super().__init__()
         assert context_dim % 2 == 0, "context_dim must be even for ResidualConv2DBlock"
         self.feature_extractor = nn.Sequential(
-            ResidualConv2DBlock(in_channels, context_dim // 2),
-            ResidualConv2DBlock(context_dim // 2, context_dim),
-            ResidualConv2DBlock(context_dim, context_dim),
+            ResidualConvBlock(in_channels, context_dim // 2, dims=2),
+            ResidualConvBlock(context_dim // 2, context_dim, dims=2),
+            ResidualConvBlock(context_dim, context_dim, dims=2),
         )
     def forward(self, x):
         out = self.feature_extractor(x)
         return out
 
 class VideoObservationEncoder(nn.Module):
-    def __init__(self, in_channels, context_dim, enable_spatiotemporal_attention=True):
+    def __init__(self, in_channels, context_dim):
         super().__init__()
         assert context_dim % 2 == 0, "context_dim must be even for ResidualConv3DBlock"
-        self.initial_feature_extractor = nn.Sequential(
+        self.feature_extractor = nn.Sequential(
             ResidualConvBlock(in_channels, context_dim // 2, dims=3),
             Downsample(context_dim // 2, True, dims=3),
             ResidualConvBlock(context_dim // 2, context_dim, dims=3),
             Downsample(context_dim, True, dims=3),
             ResidualConvBlock(context_dim, context_dim, dims=3),
         )
-        self.attention = AttentionBlock(
-            channels=context_dim,
-            num_heads=8,
-            num_head_channels=-1,
-            dims=3,
-            enable_spatiotemporal_attention=enable_spatiotemporal_attention,
-        )
-        self.end_layers = nn.Sequential(
-            ResidualConvBlock(context_dim, context_dim, dims=3)
-        )
+        
     def forward(self, x):
-        x = self.initial_feature_extractor(x)
-        x = self.attention(x)
-        out = self.end_layers(x)
+        out = self.feature_extractor(x)
         out = rearrange(out, 'b d f h w -> b (f h w) d')
         return out
     
@@ -617,6 +606,7 @@ class UNetModel(nn.Module):
         num_classes=None,
         num_actions=None,
         image_cond_dim=None,
+        video_cond_dim=None,
         action_horizon=None,
         reward_dim=None,
         use_checkpoint=False,
@@ -630,7 +620,7 @@ class UNetModel(nn.Module):
         cross=False,
         cross_attention_heads=4,
         cross_attention_dim_head=32,
-        use_spatiotemporal_attention=False,
+        spatiotemporal_attention={},
     ):
         super().__init__()
 
@@ -655,11 +645,13 @@ class UNetModel(nn.Module):
         self.num_head_channels = num_head_channels
         self.num_heads_upsample = num_heads_upsample
         self.image_cond_dim = image_cond_dim
+        self.video_cond_dim = video_cond_dim
         self.cross = cross
         self.use_scale_shift_norm = use_scale_shift_norm # Mostly here for wandb logging
         self.cross_attention_heads = cross_attention_heads
         self.cross_attention_dim_head = cross_attention_dim_head
-        self.use_spatiotemporal_attention = use_spatiotemporal_attention
+        self.spatiotemporal_attention = spatiotemporal_attention
+        self.reward_dim = reward_dim
 
         time_embed_dim = model_channels * 4
         context_dim = time_embed_dim
@@ -691,6 +683,13 @@ class UNetModel(nn.Module):
                 in_channels=C,
                 context_dim=context_dim,
             )
+        
+        if video_cond_dim is not None:
+            *_, C, _, _ = video_cond_dim
+            self.video_encoder = VideoObservationEncoder(
+                in_channels=C,
+                context_dim=context_dim,
+            )
 
         ch = input_ch = int(channel_mult[0] * model_channels)
         self.input_blocks = nn.ModuleList(
@@ -706,6 +705,8 @@ class UNetModel(nn.Module):
                     use_cross = self.cross and (i == 0)
                 else:
                     use_cross = self.cross
+                enable_spatio_temporal = (level in self.spatiotemporal_attention)
+                print(f"Input block {level} with mult {mult}, use_cross: {use_cross}, enable_spatio_temporal: {enable_spatio_temporal}")
                 layers = [
                     ResBlock(
                         ch,
@@ -732,7 +733,7 @@ class UNetModel(nn.Module):
                             use_new_attention_order=use_new_attention_order,
                             dims=dims,
                             name=f'input_block_{level}_attn',
-                            enable_spatiotemporal_attention=use_spatiotemporal_attention,
+                            enable_spatiotemporal_attention=enable_spatio_temporal,
                         )
                     )
                 self.input_blocks.append(TimestepEmbedSequential(*layers))
@@ -785,7 +786,7 @@ class UNetModel(nn.Module):
                 use_new_attention_order=use_new_attention_order,
                 dims=dims,
                 name=f'middle_block_self_attn',
-                use_spatiotemporal_attention=use_spatiotemporal_attention,
+                enable_spatiotemporal_attention=True,
             ),
             ResBlock(
                 ch,
@@ -809,6 +810,8 @@ class UNetModel(nn.Module):
                     use_cross = self.cross and (i == 0)
                 else:
                     use_cross = self.cross
+                enable_spatio_temporal = (level in self.spatiotemporal_attention)
+                print(f"Output block {level} with mult {mult}, use_cross: {use_cross}, enable_spatio_temporal: {enable_spatio_temporal}")
                 ich = input_block_chans.pop()
                 layers = [
                     ResBlock(
@@ -836,7 +839,7 @@ class UNetModel(nn.Module):
                             use_new_attention_order=use_new_attention_order,
                             dims=dims,
                             name=f'output_block_{level}_self_attn',
-                            enable_spatiotemporal_attention=use_spatiotemporal_attention,
+                            enable_spatiotemporal_attention=enable_spatio_temporal,
                         )
                     )
                 if level and i == num_res_blocks:
@@ -885,7 +888,7 @@ class UNetModel(nn.Module):
         self.middle_block.apply(convert_module_to_f32)
         self.output_blocks.apply(convert_module_to_f32)
 
-    def forward(self, x, timesteps, y=None, action_embed=None, image_embed=None, reward_embed=None, mask=None, vis=None):
+    def forward(self, x, timesteps, y=None, action_embed=None, reward_embed=None, image_embed=None, history_embed=None, mask=None, vis=None):
         """
         Apply the model to an input batch.
 
@@ -902,6 +905,8 @@ class UNetModel(nn.Module):
         emb = self.time_embed(timestep_embedding(timesteps, self.model_channels))
         context_list = []
 
+        # ---- World Model Context Embeddings ----
+
         if self.num_classes is not None:
             assert y.shape == (x.shape[0],)
             label_latent = self.label_emb(y).unsqueeze(1) # [B, 1, C]
@@ -909,15 +914,14 @@ class UNetModel(nn.Module):
         
         if self.num_actions is not None and self.action_horizon is not None:
             B, K, A = action_embed.shape
-            assert B == x.shape[0]
-            assert K == self.action_horizon
-            assert A == self.num_actions
+            assert (B, K, A) == (x.shape[0], self.action_horizon, self.num_actions), \
+                f"Expected action_embed shape {(x.shape[0], self.action_horizon, self.num_actions)}, got {action_embed.shape}"
             action_embed = rearrange(action_embed, 'b k a -> b a k')
             action_latent = self.action_cond(action_embed) # [B, C, K]
             action_latent = rearrange(action_latent, 'b c k -> b k c')
             context_list.append(action_latent)
         
-        # Primarily used for the action prediction task.
+        # ---- Action Proposal Embeddings ----
         if image_embed is not None and self.image_cond_dim is not None:
             assert image_embed.shape[0] == x.shape[0]
             assert image_embed.ndim == 4, f"Expected image_embed to be 4D, got {image_embed.ndim}D"
@@ -927,10 +931,17 @@ class UNetModel(nn.Module):
         
         if reward_embed is not None and self.reward_dim is not None:
             assert reward_embed.shape[0] == x.shape[0]
-            assert reward_embed.ndim == 1, f"Expected reward_embed to be 1D, got {reward_embed.ndim}D"
+            assert reward_embed.ndim == 2 and reward_embed.shape[1] == self.reward_dim, \
+                f"Expected reward_embed to be 2D of shape [B, {self.reward_dim}], got {reward_embed.shape}"
             reward_latent = self.reward_emb(reward_embed)
             reward_latent = rearrange(reward_latent, 'b d -> b 1 d')
             context_list.append(reward_latent)
+        
+        if history_embed is not None and self.video_cond_dim is not None:
+            assert history_embed.shape[0] == x.shape[0]
+            assert history_embed.ndim == 5, f"Expected history_embed to be 5D, got {history_embed.ndim}D"
+            history_latent = self.video_encoder(history_embed)
+            context_list.append(history_latent)
         
         
         if len(context_list) > 0:

@@ -16,14 +16,14 @@ def main():
     args.n_envs = 2
     args.population_yaml_path = "AVDC/flowdiffusion/Overcooked_Population_Data/custom/sp_vs_best_r_sp_config.yml"
     args.dataset_path = "./data/sp_vs_combined_dataset_old_dynamics.hdf5"
-    # args.action_proposal_model_path = "/mnt/linux_space/action_proposal_cross_1/modl-100.pt"
-    # action_proposal_tester = ActionProposalTester(args)
-    # action_proposal_tester.run_online_evaluation(
-    #     num_episodes=10,
-    #     planning_horizon=32,
-    #     partner_policy="bc_train",
-    #     subfolder_name="bc_train_eval_cross_1_horizon_32_increased_sampling_500"
-    # )
+    args.action_proposal_model_path = "/mnt/linux_space/action_proposal_cross_1/modl-100.pt"
+    action_proposal_tester = ActionProposalTester(args)
+    action_proposal_tester.run_online_evaluation(
+        num_episodes=10,
+        planning_horizon=32,
+        partner_policy="bc_train",
+        subfolder_name="bc_train_vs_random"
+    )
     
     # dataset_tester = DatasetTester(args)
     # dataset_tester.plot_dataset_data()
@@ -43,17 +43,17 @@ def main():
     # world_model_tester.run_offline_divergence_test(num_samples=300, rollout_horizon=32, num_candidates=10)
     # world_model_tester.run_controllability_test(num_samples=100)
 
-    args.action_proposal_model_path = "/mnt/linux_space/action_proposal_cross_1/modl-100.pt"
-    args.diffusion_model_path = "/mnt/linux_space/full_expert_4/modl-73.pt"
-    agent_tester = DiffusionAgentTester(args,
-                                        run_name="random_vs_sp1_final_test_1", 
-                                        num_classes=68, 
-                                        num_actions=6, 
-                                        guidance_weight=1.0, 
-                                        num_candidates=10, 
-                                        num_processes=12,
-                                        planning_horizon=32)
-    agent_tester.run_evaluation(num_episodes=3, partner_policy_name="sp1_final")
+    # args.action_proposal_model_path = "/mnt/linux_space/action_proposal_cross_1/modl-100.pt"
+    # args.diffusion_model_path = "/mnt/linux_space/full_expert_4/modl-73.pt"
+    # agent_tester = DiffusionAgentTester(args,
+    #                                     run_name="random_vs_sp1_final_test_1", 
+    #                                     num_classes=68, 
+    #                                     num_actions=6, 
+    #                                     guidance_weight=1.0, 
+    #                                     num_candidates=10, 
+    #                                     num_processes=12,
+    #                                     planning_horizon=32)
+    # agent_tester.run_evaluation(num_episodes=3, partner_policy_name="sp1_final")
 
 
 

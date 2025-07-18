@@ -86,9 +86,9 @@ class OvercookedTrainer:
         model_graph = draw_graph(
             self.unet,
             input_data=model_inputs,
-            graph_name='UnetOvercooked_View_Cross',
+            graph_name='UnetOvercooked_7_17_2',
             save_graph=True, # This will save a PDF of the graph
-            depth=4, # Expand modules up to 5 levels deep
+            depth=3, # Expand modules up to 5 levels deep
             expand_nested=True, # Show nested modules
             hide_inner_tensors=True, # Set to True for a cleaner but less detailed graph
             hide_module_functions=True, # Shows functions like rearrange, cat, etc.

@@ -209,7 +209,7 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
     def __init__(self, args, split="train"):
 
         self.args = args
-        self.current_split = split
+        self.split = split
     
         # Load dataset from HDF5
         self.hdf5_path = args.dataset_path
@@ -220,11 +220,11 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         self.max_path_length = args.max_path_length
         self.use_padding = args.use_padding
         
-        *_, H, W, C = self.dset["obs"].shape
+        *_, self.H, self.W, self.C = self.dset["obs"].shape
         self.valid_indices = self._create_full_index()
 
-        self.obs_history_len = 16 + 1 # 16 frames of history + 1 current frame
-        self.observation_dim = self.obs_cond_dim = (self.obs_history_len, H, W, C)
+        self.obs_history_len = 16 # 16 frames of history
+        self.observation_dim = self.obs_cond_dim = (self.H, self.W, self.C)
     
     def _create_full_index(self):
         """
@@ -278,53 +278,64 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         return len(self.valid_indices)
     
     def __getitem__(self, idx):
+        idx = idx % 10
         traj_idx, start_t = self.valid_indices[idx]
         
-        obs_trajectory = self.observations[traj_idx]  # shape: [T+1, 2, H, W, C]
-        actions_trajectory = self.actions[traj_idx]   # shape: [T, 2, 1]
-        rewards_trajectory = self.rewards[traj_idx]   # shape: [T, 2, 1]
+        obs_trajectory = self.dset["obs"][traj_idx]  # shape: [T+1, 2, H, W, C]
+        actions_trajectory = self.dset["actions"][traj_idx]   # shape: [T, 2, 1]
+        rewards_trajectory = self.dset["rewards"][traj_idx]   # shape: [T, 2, 1]
 
         if obs_trajectory.ndim == 4:
             obs_trajectory = np.expand_dims(obs_trajectory, axis=1)
         
-        history_end_idx = start_t + 1
-        history_start_idx = history_end_idx - self.obs_history_len      
+        # We need a total of `obs_history_len` past frames + 1 current frame.
+        window_len = self.obs_history_len + 1
+        window_end_idx = start_t + 1
+        window_start_idx = window_end_idx - window_len   
 
         # Extract the observation history slice
-        obs_history_slice = obs_trajectory[max(0, history_start_idx):history_end_idx, 0]
-       
-        num_missing_frames = self.obs_history_len - len(obs_history_slice)
+        obs_window_slice = obs_trajectory[max(0, window_start_idx):window_end_idx, 0]
+        
+        num_missing_frames = window_len - len(obs_window_slice)
         if num_missing_frames > 0:
-            # Pad the existing slice with the edge value --> [frame_0....frame_0, frame_1, frame_n]
             pad_block = np.repeat(
-                obs_history_slice[0:1],
+                obs_window_slice[0:1],
                 repeats=num_missing_frames,
                 axis=0
             )
-            obs_history = np.concatenate([pad_block, obs_history_slice], axis=0)
+            obs_window_padded = np.concatenate([pad_block, obs_window_slice], axis=0)
         else:
-            # No padding was needed
-            obs_history = obs_history_slice
+            obs_window_padded = obs_window_slice
+
+        # Remove the current frame from the history
+        # Doing it this way ensures that the start frame is replicated in the history at t=0
+        obs_history = obs_window_padded[:-1]  # shape: [F, H, W, C]
         
-        obs_history = self._normalize_obs(obs_history)
+        obs_history = self._normalize_obs(obs_history)  # shape: [F, H, W, C]
         actions_end_idx = start_t + self.horizon
         future_actions = actions_trajectory[start_t:actions_end_idx, 0]
 
         future_team_rewards = np.sum(rewards_trajectory[start_t:], axis=1).squeeze()
         reward_to_go = np.cumsum(future_team_rewards[::-1])[::-1][0]
+        current_frame = self._normalize_obs(obs_trajectory[start_t, 0])
 
-        x = torch.from_numpy(future_actions).long()  # shape: [horizon, 1]
-        x_cond = torch.from_numpy(obs_history).float()  # shape: [F, H, W, C]
+        future_actions = torch.from_numpy(future_actions).long()  # shape: [horizon, 1]
+        current_frame = torch.from_numpy(current_frame).float()
+        obs_history = torch.from_numpy(obs_history).float()  # shape: [F, H, W, C]
         reward_to_go = torch.tensor([reward_to_go]).float() # Shape [1]
 
-        assert x.min() >= 0 and x.max() < 6, f"Actions must be in [0, 6), got range [{x.min()}, {x.max()}]"
-        assert x_cond.min() >= -1.0 and x_cond.max() <= 1.0
-        assert x_cond.shape == (self.obs_history_len, self.H, self.W, self.C), \
-            f"x_cond shape is incorrect. Expected [F,H,W,C] = [{self.obs_history_len},{self.H},{self.W},{self.C}], " \
-            f"but got shape {x_cond.shape}"
-        assert reward_to_go.dim() == 1, f"reward_to_go should be a scalar, got shape {reward_to_go.shape}"
+        assert future_actions.shape == (self.horizon, 1), \
+        f"future_actions shape is wrong. Expected ({self.horizon},), got {future_actions.shape}"
+        
+        assert current_frame.shape == (self.H, self.W, self.C), \
+            f"current_frame shape is wrong. Expected ({self.H},{self.W},{self.C}), got {current_frame.shape}"
+            
+        assert obs_history.shape == (self.obs_history_len, self.H, self.W, self.C), \
+            f"obs_history shape is wrong. Expected ({self.obs_history_len},{self.H},{self.W},{self.C}), got {obs_history.shape}"
+            
+        assert reward_to_go.shape == (1,), f"rtg should have shape [1], got {reward_to_go.shape}"
 
-        return x, x_cond, reward_to_go
+        return future_actions, current_frame, obs_history, reward_to_go
 
 def to_np(x):
 	if torch.is_tensor(x):

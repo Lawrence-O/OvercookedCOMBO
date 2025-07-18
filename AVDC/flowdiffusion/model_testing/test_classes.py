@@ -248,6 +248,44 @@ class BaseTester:
         """Calculate summary statistics from episode rewards."""
         all_ep_rewards_np = np.array(episode_rewards_list)
         
+        print(f"Shape of all_ep_rewards_np: {all_ep_rewards_np.shape}")
+
+        # Agent 0 statistics
+        # Extract all total rewards for Agent 0 across all episodes and environments
+        agent0_all_rewards = all_ep_rewards_np[:, :, 0] # Shape: (num_episodes, self.n_envs)
+        mean_reward_agent0 = agent0_all_rewards.mean()
+        std_reward_agent0 = agent0_all_rewards.std()
+        
+        # Agent 1 statistics
+        # Extract all total rewards for Agent 1 across all episodes and environments
+        agent1_all_rewards = all_ep_rewards_np[:, :, 1] # Shape: (num_episodes, self.n_envs)
+        mean_reward_agent1 = agent1_all_rewards.mean()
+        std_reward_agent1 = agent1_all_rewards.std()
+
+        # Team statistics
+        # Sum rewards of both agents for each (episode, environment) pair
+        team_all_rewards = all_ep_rewards_np.sum(axis=2) # Shape: (num_episodes, self.n_envs)
+        mean_team_reward = team_all_rewards.mean()
+        std_team_reward = team_all_rewards.std()
+        
+        # Log results
+        print(f"Agent 0 (Diffusion) mean reward: {mean_reward_agent0:.2f} ± {std_reward_agent0:.2f}")
+        print(f"Agent 1 (Partner) mean reward: {mean_reward_agent1:.2f} ± {std_reward_agent1:.2f}")
+        print(f"Team mean reward: {mean_team_reward:.2f} ± {std_team_reward:.2f}")
+        
+        # Create summary dictionary
+        return {
+            'agent0_mean_reward': mean_reward_agent0,
+            'agent0_std_reward': std_reward_agent0,
+            'agent1_mean_reward': mean_reward_agent1,
+            'agent1_std_reward': std_reward_agent1,
+            'team_mean_reward': mean_team_reward,
+            'team_std_reward': std_team_reward,
+        }
+    def old_calculate_evaluation_summary(self, episode_rewards_list):
+        """Calculate summary statistics from episode rewards."""
+        all_ep_rewards_np = np.array(episode_rewards_list)
+        
         print(all_ep_rewards_np.shape)
 
         # Agent 0 statistics
@@ -365,10 +403,10 @@ class ActionProposalTester(BaseTester):
     """
     def __init__(self, args):
         super().__init__(args)
-        self.action_proposal_model = self._load_action_proposal_model()
-        if hasattr(self.action_proposal_model, 'ema_model'):
-            self.action_proposal_model = self.action_proposal_model.ema_model
-        self.action_proposal_model.to(self.device)
+        # self.action_proposal_model = self._load_action_proposal_model()
+        # if hasattr(self.action_proposal_model, 'ema_model'):
+        #     self.action_proposal_model = self.action_proposal_model.ema_model
+        # self.action_proposal_model.to(self.device)
 
     def _load_action_proposal_model(self,ema=True):
         """Load the action proposal model."""
@@ -403,21 +441,24 @@ class ActionProposalTester(BaseTester):
     
     @th.no_grad()
     def evaluate_action_proposal_in_env(self, num_episodes=10, planning_horizon=32, policy_name="bc_train"):
-        self.action_proposal_model.eval()
+        # self.action_proposal_model.eval()
         def action_proposal_fn(obs, policy_name=None):
             """
             Given an observation, use the action proposal model to predict the next action.
             """
-            obs = normalize_obs(obs)
-            obs_tensor = to_torch(obs, device=self.device)
-            obs_tensor = obs_tensor.view(self.n_envs, self.C, self.H, self.W)
-            pred = self.action_proposal_model.sample(
-                x_cond=obs_tensor,
-                batch_size=self.n_envs,
-            )
-            pred = pred.view(self.n_envs, self.horizon, self.num_actions)
-            pred = th.argmax(pred, dim=-1)  # [N, L]
-            action = pred[:, :planning_horizon].cpu().numpy()  # Use only the first `planning_horizon` actions
+            # obs = normalize_obs(obs)
+            # obs_tensor = to_torch(obs, device=self.device)
+            # obs_tensor = obs_tensor.view(self.n_envs, self.C, self.H, self.W)
+            # pred = self.action_proposal_model.sample(
+            #     x_cond=obs_tensor,
+            #     batch_size=self.n_envs,
+            # )
+            # pred = pred.view(self.n_envs, self.horizon, self.num_actions)
+            # pred = th.argmax(pred, dim=-1)  # [N, L]
+            # action = pred[:, :planning_horizon].cpu().numpy()  # Use only the first `planning_horizon` actions
+            # return action
+            action = th.randint(0, self.num_actions, (self.n_envs, 8), device=self.device).cpu().numpy()
+            print(f"Action proposal model generated actions: {action}")
             return action
         # Evaluate in environment
         eval_data = self.evaluate_in_env(action_proposal_fn, num_episodes=num_episodes, policy_name=policy_name)

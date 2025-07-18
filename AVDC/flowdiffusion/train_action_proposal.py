@@ -53,6 +53,7 @@ class ActionProposalTrainer:
 
         self.observation_dim = self.dataset.observation_dim
         self.num_actions = 6
+        self.obs_history_len = 16  # Number of frames in the observation history
         self.diffusion = None
         self.trainer = None
         self.unet = None
@@ -71,6 +72,7 @@ class ActionProposalTrainer:
         self.unet = UnetOvercookedActionProposal(
             horizon=self.horizon,
             obs_dim=self.observation_dim,
+            history_horizon=self.obs_history_len,
             num_actions=self.num_actions, 
         ).to(self.device)
         self.diffusion = GoalGaussianDiffusion(
@@ -83,7 +85,7 @@ class ActionProposalTrainer:
             objective="pred_v",
             beta_schedule="cosine",
             min_snr_loss_weight=True,
-            guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
+            guidance_weight=1.0,
             auto_normalize=False,
         ).to(self.device)
         self.trainer = OvercookedActionProposal(
@@ -104,7 +106,7 @@ class ActionProposalTrainer:
                 fp16 =True,
                 amp=True,
                 save_milestone=self.args.save_milestone,
-                cond_drop_chance=0.0,
+                cond_drop_chance=0.1, # Changed from 0.0 to 0.1 for action proposal
                 split_batches=getattr(self.args, 'split_batches', True),
                 debug=self.args.debug,
                 # Wandb arguments
