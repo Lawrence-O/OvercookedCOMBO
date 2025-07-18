@@ -2306,7 +2306,6 @@ class OvercookedActionProposal(Trainer):
                  cond_drop_chance=0.0,
                  save_milestone=True,
                  debug=False,
-                 dummy_policy_id=None,
                  wandb_enabled=False,
                  wandb_project="action_proposal_diffusion",
                  wandb_entity="social-rl",
@@ -2436,9 +2435,6 @@ class OvercookedActionProposal(Trainer):
     def train_one_step(self):
         total_loss = 0
 
-        self.valid_one_step()
-        exit()
-
         for _ in range(self.gradient_accumulate_every):
             future_actions, current_obs, obs_history, rtg = next(self.dl) 
             x, image_cond, history_cond, rtg_cond = future_actions.to(self.device), current_obs.to(self.device), obs_history.to(self.device), rtg.to(self.device)
@@ -2512,21 +2508,21 @@ class OvercookedActionProposal(Trainer):
             low_reward_actions = self.ema.ema_model.sample(
                 image_embed=current_frame_rearranged,
                 history_embed=obs_history_rearranged,
-                reward_embed=torch.zeros_like(rtg),
+                reward_embed=torch.ones_like(rtg)*50,
                 batch_size=B,
             )
 
             high_reward_actions = self.ema.ema_model.sample(
                 image_embed=current_frame_rearranged,
                 history_embed=obs_history_rearranged,
-                reward_embed=torch.ones_like(rtg)*28,
+                reward_embed=torch.ones_like(rtg)*150,
                 batch_size=B,
             )
 
             medium_reward_actions = self.ema.ema_model.sample(
                 image_embed=current_frame_rearranged,
                 history_embed=obs_history_rearranged,
-                reward_embed=torch.ones_like(rtg)*14,
+                reward_embed=torch.ones_like(rtg)*100,
                 batch_size=B,
             )
             
@@ -2623,10 +2619,11 @@ class OvercookedActionProposal(Trainer):
                 obs_history_video_path = os.path.join(
                     viz_output_dir, f"obs_history_step_{self.step}_batch_{i}.mp4"
                 )
-                self.renderer.render_trajectory_frames(
+                self.renderer.render_trajectory_video(
                     obs_history[i].cpu().numpy(),
                     grid=self.renderer.extract_grid_from_obs(obs_history[i, 0]),
-                    output_dir=obs_history_video_path,
+                    video_path=obs_history_video_path,
+                    output_dir=viz_output_dir,
                     normalize=True,
                 )
                 

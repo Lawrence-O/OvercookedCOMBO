@@ -10,8 +10,10 @@ class OvercookedSequenceDataset(torch.utils.data.Dataset):
     def __init__(self, args, split="train"):
         self.args = args
         self.current_split = split
-        
-        self.hdf5_dataset = HDF5Dataset(args, self.current_split)
+
+        # Truncating the maximum episode length to 399, the last frame is corrupted.
+        self.args.chunk_length = self.args.episode_length = 399
+        self.hdf5_dataset = HDF5Dataset(self.args, self.current_split)
 
         self._discover_all_policies_and_create_mappings()
         
@@ -217,14 +219,14 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         self.dset = self.hdf5_file[self.split]
         
         self.horizon = args.horizon
-        self.max_path_length = args.max_path_length
-        self.use_padding = args.use_padding
+        self.max_path_length = 399
         
         *_, self.H, self.W, self.C = self.dset["obs"].shape
         self.valid_indices = self._create_full_index()
 
         self.obs_history_len = 16 # 16 frames of history
         self.observation_dim = self.obs_cond_dim = (self.H, self.W, self.C)
+        
     
     def _create_full_index(self):
         """
@@ -237,6 +239,9 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         for traj_idx in tqdm(range(num_trajectories), desc=f"Indexing '{self.split}' split"):
             traj_len = self.dset["actions"][traj_idx].shape[0]
             
+            # We truncate the trajectory length to max_path_length since the last frame is corrupted.
+            traj_len = min(traj_len, self.max_path_length)
+
             max_start_t = traj_len - self.horizon
             if max_start_t < 0:
                 continue # Trajectory is too short

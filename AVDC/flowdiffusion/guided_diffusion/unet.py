@@ -274,7 +274,6 @@ class ResBlock(TimestepBlock):
                 h = self.cross_attn(h, latent) + h
                 h = rearrange(h, 'b (h w) c -> b c h w', h=height, w=width)
             elif self.dims == 1:
-                # [B, num_actions, horizon
                 _, _, length = h.size()
                 h = rearrange(h, 'b c t -> b t c')
                 h = self.cross_attn(h, latent) + h
@@ -461,45 +460,6 @@ class QKVAttention(nn.Module):
     @staticmethod
     def count_flops(model, _x, y):
         return count_flops_attn(model, _x, y)
-
-#TODO: Here for backwards compatibility, remove later
-class ResidualConv1DBlock(nn.Module):
-    """ A residual block with a 1D convolution, normalization, and activation.""" 
-    def __init__(self, in_channels, out_channels, kernel_size=3):
-        super().__init__()
-        self.conv_block = nn.Sequential(
-            nn.Conv1d(in_channels, out_channels, kernel_size, padding=kernel_size // 2),
-            normalization(out_channels),
-            nn.SiLU(),
-            nn.Conv1d(out_channels, out_channels, kernel_size, padding=kernel_size // 2),
-        )
-        if in_channels != out_channels:
-            self.skip_connection = nn.Conv1d(in_channels, out_channels, kernel_size=1)
-        else:
-            self.skip_connection = nn.Identity()
-    def forward(self, x):
-        residual = self.skip_connection(x)
-        out = self.conv_block(x)
-        return out + residual
-
-class ResidualConv2DBlock(nn.Module):
-    """ A residual block with a 2D convolution, normalization, and activation."""
-    def __init__(self, in_channels, out_channels, kernel_size=3):
-        super().__init__()
-        self.conv_block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size, padding=kernel_size // 2),
-            normalization(out_channels),
-            nn.SiLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size, padding=kernel_size // 2),
-        )
-        if in_channels != out_channels:
-            self.skip_connection = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        else:
-            self.skip_connection = nn.Identity()
-    def forward(self, x):
-        residual = self.skip_connection(x)
-        out = self.conv_block(x)
-        return out + residual
     
 class ResidualConvBlock(nn.Module):
     """ A residual block with an N-dimensional convolution, normalization, and activation."""
@@ -542,6 +502,10 @@ class SpatialObservationEncoder(nn.Module):
         return out
 
 class VideoObservationEncoder(nn.Module):
+    """
+    Encodes a video observation into a sequence of spatial tokens
+    to be used as context in a cross-attention layer.
+    """
     def __init__(self, in_channels, context_dim):
         super().__init__()
         assert context_dim % 2 == 0, "context_dim must be even for ResidualConv3DBlock"
@@ -556,6 +520,26 @@ class VideoObservationEncoder(nn.Module):
     def forward(self, x):
         out = self.feature_extractor(x)
         out = rearrange(out, 'b d f h w -> b (f h w) d')
+        return out
+
+class ActionConditionEncoder(nn.Module):
+    """
+    Encodes a sequence of actions into a context vector.
+    This is used to condition the model on the actions taken in the environment.
+    """
+    def __init__(self, num_actions, context_dim):
+        super().__init__()
+        assert context_dim % 2 == 0, "context_dim must be even for ResidualConv1DBlock"
+        self.feature_extractor = nn.Sequential(
+            ResidualConvBlock(num_actions, context_dim // 2, dims=1),
+            ResidualConvBlock(context_dim // 2, context_dim, dims=1),
+            ResidualConvBlock(context_dim, context_dim, dims=1),
+        )
+
+    def forward(self, x):
+        x = rearrange(x, 'b k a -> b a k')
+        out = self.feature_extractor(x)
+        out = rearrange(out, 'b c k -> b k c')
         return out
     
 
@@ -672,9 +656,9 @@ class UNetModel(nn.Module):
             )
 
         if self.num_actions is not None and self.action_horizon is not None:
-            self.action_cond = ResidualConv1DBlock(
-                in_channels=self.num_actions,
-                out_channels=context_dim,
+            self.action_cond = ActionConditionEncoder(
+                num_actions=self.num_actions,
+                context_dim=context_dim,
             )
         
         if image_cond_dim is not None:
@@ -916,9 +900,7 @@ class UNetModel(nn.Module):
             B, K, A = action_embed.shape
             assert (B, K, A) == (x.shape[0], self.action_horizon, self.num_actions), \
                 f"Expected action_embed shape {(x.shape[0], self.action_horizon, self.num_actions)}, got {action_embed.shape}"
-            action_embed = rearrange(action_embed, 'b k a -> b a k')
             action_latent = self.action_cond(action_embed) # [B, C, K]
-            action_latent = rearrange(action_latent, 'b c k -> b k c')
             context_list.append(action_latent)
         
         # ---- Action Proposal Embeddings ----
