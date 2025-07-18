@@ -1,1 +1,7 @@
 data/*.hdf5
+*.pyc
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
