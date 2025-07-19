@@ -1544,7 +1544,7 @@ class SuperResTrainer(Trainer):
         
         return valid_loss
     
-from overcooked_sample_renderer import OvercookedSampleRenderer
+from overcooked.utils.overcooked_sample_renderer import OvercookedSampleRenderer
 class OvercookedEnvTrainer(Trainer):
     def __init__(self,
                  diffusion_model,
@@ -2653,5 +2653,3 @@ class OvercookedActionProposal(Trainer):
             wandb.log(wandb_log_dict, step=self.step)
         
         return valid_loss
-    
-        

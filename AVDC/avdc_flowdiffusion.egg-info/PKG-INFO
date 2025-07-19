@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: avdc-flowdiffusion
+Version: 0.1.0
+Summary: AVDC Flow Diffusion Model.
+Home-page: https://github.com/path/to/AVDC
+Author: AVDC Author
+Author-email: author@example.com
+Requires-Python: >=3.6
+License-File: LICENSE
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: license-file
+Dynamic: requires-python
+Dynamic: summary

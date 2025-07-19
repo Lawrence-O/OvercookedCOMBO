@@ -1,7 +1,0 @@
-*
-!.gitignore
-!*.py
-!*.pyc
-!*.pkl
-!*.pt
-!*.json
