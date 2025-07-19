@@ -638,7 +638,7 @@ class UNetModel(nn.Module):
         self.reward_dim = reward_dim
 
         time_embed_dim = model_channels * 4
-        context_dim = time_embed_dim
+        self.context_dim = time_embed_dim
         self.time_embed = nn.Sequential(
             linear(model_channels, time_embed_dim),
             nn.SiLU(),
@@ -646,33 +646,33 @@ class UNetModel(nn.Module):
         )
 
         if self.num_classes is not None:
-            self.label_emb = nn.Embedding(num_classes, context_dim)
+            self.label_emb = nn.Embedding(num_classes, self.context_dim)
         
         if self.reward_dim is not None:
             self.reward_emb = nn.Sequential(
-                linear(self.reward_dim, context_dim),
+                linear(self.context_dim, self.context_dim),
                 nn.SiLU(),
-                linear(context_dim, context_dim),
+                linear(self.context_dim, self.context_dim),
             )
 
         if self.num_actions is not None and self.action_horizon is not None:
             self.action_cond = ActionConditionEncoder(
                 num_actions=self.num_actions,
-                context_dim=context_dim,
+                context_dim=self.context_dim,
             )
         
         if image_cond_dim is not None:
             C, _, _ = image_cond_dim
             self.obs_encoder = SpatialObservationEncoder(
                 in_channels=C,
-                context_dim=context_dim,
+                context_dim=self.context_dim,
             )
         
         if video_cond_dim is not None:
             *_, C, _, _ = video_cond_dim
             self.video_encoder = VideoObservationEncoder(
                 in_channels=C,
-                context_dim=context_dim,
+                context_dim=self.context_dim,
             )
 
         ch = input_ch = int(channel_mult[0] * model_channels)
@@ -915,7 +915,8 @@ class UNetModel(nn.Module):
             assert reward_embed.shape[0] == x.shape[0]
             assert reward_embed.ndim == 2 and reward_embed.shape[1] == self.reward_dim, \
                 f"Expected reward_embed to be 2D of shape [B, {self.reward_dim}], got {reward_embed.shape}"
-            reward_latent = self.reward_emb(reward_embed)
+            rtg_embed = timestep_embedding(reward_embed.squeeze(-1), self.context_dim)
+            reward_latent = self.reward_emb(rtg_embed)
             reward_latent = rearrange(reward_latent, 'b d -> b 1 d')
             context_list.append(reward_latent)
         
