@@ -2524,14 +2524,14 @@ class OvercookedActionProposal(Trainer):
             high_reward_actions = self.ema.ema_model.sample(
                 image_embed=current_frame_rearranged,
                 history_embed=obs_history_rearranged,
-                reward_embed=torch.ones_like(rtg)*150,
+                reward_embed=torch.ones_like(rtg)*100,
                 batch_size=B,
             )
 
             medium_reward_actions = self.ema.ema_model.sample(
                 image_embed=current_frame_rearranged,
                 history_embed=obs_history_rearranged,
-                reward_embed=torch.ones_like(rtg)*100,
+                reward_embed=torch.ones_like(rtg)*75,
                 batch_size=B,
             )
             
