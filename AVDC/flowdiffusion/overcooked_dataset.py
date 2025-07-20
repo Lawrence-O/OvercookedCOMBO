@@ -226,6 +226,9 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
 
         self.obs_history_len = 16 # 16 frames of history
         self.observation_dim = self.obs_cond_dim = (self.H, self.W, self.C)
+        self.max_rtg = self._compute_max_rtg()
+        self.rtg_normalization_factor = 100.0
+        print(f"Loaded {len(self.valid_indices)} valid indices for split '{self.split}' with max RTG: {self.max_rtg}")
         
     
     def _create_full_index(self):
@@ -278,6 +281,15 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
                 norm_ch = 2.0 * ch_data - 1.0
             normalized_obs[..., ch_idx] = norm_ch
         return normalized_obs
+    
+    def _compute_max_rtg(self):
+        max_rtg = 0.0
+        for traj_idx, start_t in tqdm(self.valid_indices, desc="Computing max RTG"):
+            rewards_trajectory = self.dset["rewards"][traj_idx]  # shape: [T, 2, 1]
+            future_team_rewards = np.sum(rewards_trajectory[start_t:], axis=1).squeeze()
+            reward_to_go = np.cumsum(future_team_rewards[::-1])[::-1][0]
+            max_rtg = max(max_rtg, reward_to_go)
+        return max_rtg
 
     def __len__(self):
         return len(self.valid_indices)
@@ -322,6 +334,7 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
 
         future_team_rewards = np.sum(rewards_trajectory[start_t:], axis=1).squeeze()
         reward_to_go = np.cumsum(future_team_rewards[::-1])[::-1][0]
+        reward_to_go = (reward_to_go / self.max_rtg) * self.rtg_normalization_factor
         current_frame = self._normalize_obs(obs_trajectory[start_t, 0])
 
         future_actions = torch.from_numpy(future_actions).long()  # shape: [horizon, 1]

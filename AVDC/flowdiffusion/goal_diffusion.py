@@ -2377,6 +2377,9 @@ class OvercookedActionProposal(Trainer):
             "dataset_horizon": train_set.horizon if hasattr(train_set, 'horizon') else 'N/A',
             "dataset_max_path_length": train_set.max_path_length if hasattr(train_set, 'max_path_length') else 'N/A',
             "dataset_use_padding": train_set.use_padding if hasattr(train_set, 'use_padding') else 'N/A',
+            "dataset_max_rtg": train_set.max_rtg if hasattr(train_set, 'max_rtg') else 'N/A',
+            "dataset_rtg_normalization_factor": train_set.rtg_normalization_factor if hasattr(train_set, 'rtg_normalization_factor') else 'N/A',
+            "dataset_length": len(train_set),
 
             # Diffusion model (GoalGaussianDiffusion) parameters
             "diffusion_model_type": diffusion_model.__class__.__name__,
@@ -2457,6 +2460,12 @@ class OvercookedActionProposal(Trainer):
                 total_loss += loss.item()
 
                 self.accelerator.backward(loss)
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any():
+                            print(f"WARNING: NaN found in gradient of {name}")
+                        if torch.isinf(param.grad).any():
+                            print(f"WARNING: Inf found in gradient of {name}")
         
         if self.accelerator.is_local_main_process and not self.debug and self.wandb_enabled:
             wandb.log({
