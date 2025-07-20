@@ -295,7 +295,6 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         return len(self.valid_indices)
     
     def __getitem__(self, idx):
-        idx = idx % 10
         traj_idx, start_t = self.valid_indices[idx]
         
         obs_trajectory = self.dset["obs"][traj_idx]  # shape: [T+1, 2, H, W, C]

@@ -2634,6 +2634,7 @@ class OvercookedActionProposal(Trainer):
                     video_path=obs_history_video_path,
                     output_dir=viz_output_dir,
                     normalize=True,
+                    fps=1,
                 )
                 
                 if i == 0:
