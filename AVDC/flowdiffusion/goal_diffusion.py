@@ -1544,7 +1544,7 @@ class SuperResTrainer(Trainer):
         
         return valid_loss
     
-from overcooked.utils.overcooked_sample_renderer import OvercookedSampleRenderer
+from overcooked.utils.overcooked_visualizer import OvercookedVisualizer as OvercookedSampleRenderer
 class OvercookedEnvTrainer(Trainer):
     def __init__(self,
                  diffusion_model,
@@ -1690,7 +1690,7 @@ class OvercookedEnvTrainer(Trainer):
             "unet_use_checkpointing": diffusion_model.model.unet.use_checkpoint if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_cross_attention_heads": diffusion_model.model.unet.cross_attention_heads if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_cross_attention_dim_head": diffusion_model.model.unet.cross_attention_dim_head if hasattr(diffusion_model.model, 'unet') else 'N/A',
-            "unet_spatiotemporal_attention": diffusion_model.model.unet.spatiotemporal_attention if hasattr(diffusion_model.model, 'unet') else 'N/A', 
+            "unet_spatiotemporal_attention": list(diffusion_model.model.unet.spatiotemporal_attention) if hasattr(diffusion_model.model, 'unet') else 'N/A', 
             "unet_video_cond_dim":str(diffusion_model.model.unet.video_cond_dim) if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_image_cond_dim": str(diffusion_model.model.unet.image_cond_dim) if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_reward_dim": diffusion_model.model.unet.reward_dim if hasattr(diffusion_model.model, 'unet') else 'N/A',
@@ -2406,7 +2406,7 @@ class OvercookedActionProposal(Trainer):
             "unet_use_checkpointing": diffusion_model.model.unet.use_checkpoint if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_cross_attention_heads": diffusion_model.model.unet.cross_attention_heads if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_cross_attention_dim_head": diffusion_model.model.unet.cross_attention_dim_head if hasattr(diffusion_model.model, 'unet') else 'N/A',
-            "unet_spatiotemporal_attention": diffusion_model.model.unet.spatiotemporal_attention if hasattr(diffusion_model.model, 'unet') else 'N/A', 
+            "unet_spatiotemporal_attention": list(diffusion_model.model.unet.spatiotemporal_attention) if hasattr(diffusion_model.model, 'unet') else 'N/A', 
             "unet_video_cond_dim":str(diffusion_model.model.unet.video_cond_dim) if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_image_cond_dim": str(diffusion_model.model.unet.image_cond_dim) if hasattr(diffusion_model.model, 'unet') else 'N/A',
             "unet_reward_dim": diffusion_model.model.unet.reward_dim if hasattr(diffusion_model.model, 'unet') else 'N/A',

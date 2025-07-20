@@ -18,7 +18,7 @@ warnings.filterwarnings("ignore")
 from overcooked.diffusion.goal_diffusion import GoalGaussianDiffusion
 from overcooked.diffusion.unet import UnetOvercooked
 from overcooked.utils.experiments_util import managed_environment, unnormalize_obs, normalize_obs, make_eval_env, to_torch, load_partner_policy, max_normalize_obs, convert_to_binary_obs
-from overcooked.utils.overcooked_sample_renderer import OvercookedSampleRenderer
+from overcooked.utils.overcooked_visualizer import OvercookedVisualizer
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -28,7 +28,7 @@ from overcooked.agent.idm.inverse_dynamics import InverseDynamicsModel
 from overcooked.agent.idm.ground_truth_idm import GroundTruthInverseDynamics
 from overcooked.agent.reward.state_reward_model import RewardCalculator as GroundTruthRewardCalculator
 from overcooked.agent.reward.reward_model import RewardPredictor
-from overcooked.agent.overcooked_agent import DiffusionPlannerAgent
+from overcooked.agent.diffusion_agent import DiffusionPlannerAgent
 from overcooked.dataset.overcooked_dataset import OvercookedSequenceDataset
 from overcooked.diffusion.unet import UnetOvercooked, UnetOvercookedActionProposal
 from ema_pytorch import EMA
@@ -47,7 +47,7 @@ class BaseTester:
     def __init__(self, args):
         self.args = args
         self.device = th.device("cuda" if th.cuda.is_available() else "cpu")
-        self.renderer = OvercookedSampleRenderer()
+        self.renderer = OvercookedVisualizer()
         self.n_envs = args.n_envs
         self.max_steps = args.max_steps
         self.horizon = args.horizon

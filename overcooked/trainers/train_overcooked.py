@@ -7,9 +7,9 @@ import numpy as np
 import os
 
 # Workspace imports
-from goal_diffusion import GoalGaussianDiffusion, OvercookedEnvTrainer
-from unet import UnetOvercooked 
-from overcooked_dataset import OvercookedSequenceDataset
+from flowdiffusion.goal_diffusion import GoalGaussianDiffusion, OvercookedEnvTrainer
+from overcooked.diffusion.unet import UnetOvercooked 
+from overcooked.dataset.overcooked_dataset import OvercookedSequenceDataset
 
 
 class OvercookedTrainer:

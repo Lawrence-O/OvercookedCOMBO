@@ -91,6 +91,46 @@ def normalize_obs(obs, divide=True):
             normalized_obs[..., ch_idx] = norm_ch
         return normalized_obs
 
+def normalize_obs_vectorized(obs, divide=True, num_channels=26):
+    """
+    Vectorized function to normalize a numpy observation array to [-1, 1].
+    Args:
+        obs (np.ndarray): The observation tensor. Can be of any shape as long as
+                          the last dimension is the channel dimension.
+        divide (bool): If True, un-scales the observation from [0, 255] to [0, 1].
+        num_channels (int): The total number of channels in the observation.
+    Returns:
+        np.ndarray: The normalized observation array.
+    """
+    if isinstance(obs, th.Tensor):
+        obs = to_np(obs)
+    
+    if divide:
+        assert np.all(obs % 255 == 0)
+        obs = obs.astype(np.float32) / 255.0
+
+
+    # 1. Define the mapping from channel index to its original maximum value.
+    #    Default to 1.0 for all binary channels.
+    HARDCODED_INDEX_TO_MAX_VAL = {
+        16: 3.0,  # onions_in_pot
+        17: 3.0,  # tomatoes_in_pot
+        18: 3.0,  # onions_in_soup
+        19: 3.0,  # tomatoes_in_soup
+        20: 20.0, # soup_cook_time_remaining
+    }
+    
+    # This vector will contain the max value for each channel.
+    max_vals = np.ones(num_channels, dtype=np.float32)
+    for idx, max_val in HARDCODED_INDEX_TO_MAX_VAL.items():
+        if idx < num_channels:
+            max_vals[idx] = max_val
+
+    scale = 2.0 / max_vals
+    shift = -1.0
+    normalized_obs = obs * scale + shift
+    return normalized_obs.astype(np.float32)
+
 def unnormalize_obs(obs, eps=5e-1):
     # Assume obs is in range [-1, 1]; just directly un-normalize back
     assert obs.min() >= -1.0 - eps and obs.max() <= 1.0 + eps, "Observation must be in range [-1, 1]" \

@@ -1,13 +1,4 @@
-import sys
-from pathlib import Path
-
-# Get the current directory of file.py
-current_dir = Path(__file__).resolve().parent
-
-# Add the current directory to sys.path
-sys.path.append(str(current_dir))
-
-from guided_diffusion.unet import UNetModel, SuperResModel
+from flowdiffusion.guided_diffusion.unet import UNetModel
 from torch import nn
 import torch
 from einops import repeat, rearrange

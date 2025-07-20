@@ -4,7 +4,7 @@ import torch
 import random
 import numpy as np
 from tqdm import tqdm
-from hdf5_dataset import HDF5Dataset
+from overcooked.dataset.hdf5_dataset import HDF5Dataset
 
 class OvercookedSequenceDataset(torch.utils.data.Dataset):
     def __init__(self, args, split="train"):
@@ -283,7 +283,6 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         return len(self.valid_indices)
     
     def __getitem__(self, idx):
-        idx = idx % 10
         traj_idx, start_t = self.valid_indices[idx]
         
         obs_trajectory = self.dset["obs"][traj_idx]  # shape: [T+1, 2, H, W, C]
