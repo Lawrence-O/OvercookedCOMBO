@@ -1,7 +1,15 @@
+# Ignore HDF5 dataset files
 data/*.hdf5
+
+# Python bytecode
+__pycache__/
 *.pyc
+
+# Images & media assets
 *.png
 *.jpg
 *.jpeg
 *.gif
 *.mp4
+
+# Jupyter notebook checkpoints
