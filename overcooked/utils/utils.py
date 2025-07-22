@@ -353,17 +353,18 @@ def load_world_model(self, model_path, ema=True, num_classes=None, guidance_weig
             diffusion.load_state_dict(ckpt['model'])
             return diffusion
         
-def load_world_model(self, model_path, ema=True, guidance_weight=1.0, H=8, W=5, C=26,
-                     horizon=32, 
-                     num_actions=6, sampling_timesteps=500, device=None,):
+def load_action_proposal_model(self, model_path, ema=True, guidance_weight=1.0, H=8, W=5, C=26,
+                     horizon=32, history_horizon=16, 
+                     num_actions=6, sampling_timesteps=500, device=None):
         """Load the action proposal model."""
-        
+        device = device or th.device("cuda" if th.cuda.is_available() else "cpu")
         ckpt = th.load(model_path, map_location="cpu")
         unet = UnetOvercookedActionProposal(
             horizon=horizon,
             obs_dim=(H, W, C),
             num_actions=num_actions,
-        ).to(self.device)
+            history_horizon=16
+        ).to(device)
         diffusion = GoalGaussianDiffusion(
             model=unet,
             channels=num_actions * horizon,
@@ -376,7 +377,7 @@ def load_world_model(self, model_path, ema=True, guidance_weight=1.0, H=8, W=5, 
             min_snr_loss_weight=True,
             guidance_weight=guidance_weight,
             auto_normalize=False,
-        ).to(self.device)
+        ).to(device)
         if ema:
             ema_wrap = EMA(diffusion,beta = 0.999,update_every=10)
             ema_wrap.load_state_dict(ckpt['ema'])

@@ -22,12 +22,9 @@ from overcooked.utils.overcooked_visualizer import OvercookedVisualizer
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from overcooked.agent.reward.reward_model import RewardPredictor
 import os.path as osp
-from overcooked.agent.idm.inverse_dynamics import InverseDynamicsModel
 from overcooked.agent.idm.ground_truth_idm import GroundTruthInverseDynamics
 from overcooked.agent.reward.state_reward_model import RewardCalculator as GroundTruthRewardCalculator
-from overcooked.agent.reward.reward_model import RewardPredictor
 from overcooked.agent.diffusion_agent import DiffusionPlannerAgent
 from overcooked.dataset.overcooked_dataset import OvercookedSequenceDataset
 from overcooked.diffusion.unet import UnetOvercooked, UnetOvercookedActionProposal
