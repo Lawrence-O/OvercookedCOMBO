@@ -1309,7 +1309,7 @@ class Trainer(object):
                 if exists(self.accelerator.scaler):
                     scale = self.accelerator.scaler.get_scale()
                 else:
-                    scale = None
+                    scale = 0.0
                 
                 pbar.set_description(f'loss: {total_loss:.4E}, loss scale: {scale:.1E}')
                 

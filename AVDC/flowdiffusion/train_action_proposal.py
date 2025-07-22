@@ -103,8 +103,8 @@ class ActionProposalTrainer:
                 gradient_accumulate_every = 1,
                 num_samples=self.args.num_validation_samples, 
                 results_folder = str(self.results_folder),
-                fp16 =True,
-                amp=True,
+                fp16 =False,
+                amp=False,
                 save_milestone=self.args.save_milestone,
                 cond_drop_chance=0.1, # Changed from 0.0 to 0.1 for action proposal
                 split_batches=getattr(self.args, 'split_batches', True),

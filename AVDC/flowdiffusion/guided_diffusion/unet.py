@@ -915,8 +915,7 @@ class UNetModel(nn.Module):
             assert reward_embed.shape[0] == x.shape[0]
             assert reward_embed.ndim == 2 and reward_embed.shape[1] == self.reward_dim, \
                 f"Expected reward_embed to be 2D of shape [B, {self.reward_dim}], got {reward_embed.shape}"
-            rtg_embed = timestep_embedding(reward_embed.squeeze(-1), self.context_dim)
-            reward_latent = self.reward_emb(rtg_embed)
+            reward_latent = self.reward_emb(reward_embed)
             reward_latent = rearrange(reward_latent, 'b d -> b 1 d')
             context_list.append(reward_latent)
         
