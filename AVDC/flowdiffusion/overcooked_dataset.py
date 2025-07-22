@@ -224,7 +224,7 @@ class ActionOvercookedSequenceDataset(torch.utils.data.Dataset):
         *_, self.H, self.W, self.C = self.dset["obs"].shape
         self.valid_indices = self._create_full_index()
 
-        self.obs_history_len = 16 # 16 frames of history
+        self.obs_history_len = 8 # 16 frames of history
         self.observation_dim = self.obs_cond_dim = (self.H, self.W, self.C)
         # self.max_rtg = self._compute_max_rtg()
         self.max_rtg = None
