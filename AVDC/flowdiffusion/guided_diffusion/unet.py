@@ -650,7 +650,7 @@ class UNetModel(nn.Module):
         
         if self.reward_dim is not None:
             self.reward_emb = nn.Sequential(
-                linear(self.context_dim, self.context_dim),
+                linear(self.reward_dim, self.context_dim),
                 nn.SiLU(),
                 linear(self.context_dim, self.context_dim),
             )
