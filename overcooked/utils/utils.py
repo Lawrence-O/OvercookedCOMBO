@@ -5,22 +5,16 @@ from copy import deepcopy
 import datetime
 from pathlib import Path
 import sys
-mapbt_path = '/home/law/Workspace/repos/COMBO/mapbt_package/mapbt'
-if mapbt_path not in sys.path:
-    sys.path.append(mapbt_path)
-overcooked_ai_py_src_path = '/home/law/Workspace/repos/COMBO/mapbt_package/mapbt/envs/overcooked/overcooked_berkeley/src/overcooked_ai_py'
-if overcooked_ai_py_src_path not in sys.path:
-    sys.path.append(overcooked_ai_py_src_path)
 import numpy as np
 import torch as th
 import os.path as osp
 import warnings
 import torch.nn.functional as F
 warnings.filterwarnings("ignore")
-from mapbt_package.mapbt.envs.overcooked.Overcooked_Env import Overcooked
-from mapbt_package.mapbt.envs.env_wrappers import ChooseSubprocVecEnv
+from mapbt.envs.overcooked.Overcooked_Env import Overcooked
+from mapbt.envs.env_wrappers import ChooseSubprocVecEnv
 from einops.einops import rearrange
-from mapbt_package.mapbt.algorithms.population.policy_pool import PolicyPool as Policy
+from mapbt.algorithms.population.policy_pool import PolicyPool as Policy
 from overcooked.diffusion.unet import UnetOvercooked, UnetOvercookedActionProposal
 from ema_pytorch import EMA
 from flowdiffusion.goal_diffusion import GoalGaussianDiffusion
@@ -319,35 +313,38 @@ def managed_concept_trainer(runner, cl_args):
         th.cuda.empty_cache()
         print("Concept trainer cleanup complete (datasets preserved)")
 
-def load_world_model(self, model_path, ema=True, num_classes=None, guidance_weight=1.0):
+def load_world_model(self, model_path, ema=True, num_classes=None, guidance_weight=1.0, H=8, W=5, C=26,
+                     horizon=32, 
+                     num_actions=6,  no_op_action=4, action_horizon=8, sampling_timesteps=100, device=None,):
         """Load the diffusion model for evaluation only."""
         print(f"Loading diffusion model from {model_path}, ema={ema}, num_classes={num_classes}")
         if not osp.exists(model_path):
             raise FileNotFoundError(f"Model path {model_path} does not exist.")
+        if device is None:
+            device = th.device("cuda" if th.cuda.is_available() else "cpu")
         ckpt = th.load(model_path, map_location="cpu")
         unet = UnetOvercooked(
-            horizon=self.args.horizon,
-            obs_dim=(self.H, self.W, self.C),
+            horizon=horizon,
+            obs_dim=(H, W, C),
             num_classes=num_classes,
-            num_actions=self.num_actions,
-            action_horizon=self.action_horizon,
-        ).to(self.device)
-        H,W,C = self.H, self.W, self.C
+            num_actions=num_actions,
+            action_horizon=action_horizon,
+        ).to(device)
         diffusion = GoalGaussianDiffusion(
             model=unet,
             channels=C * self.horizon,
             image_size=(H,W),
-            timesteps=1 if self.args.debug else 1000,
-            sampling_timesteps=100,
+            timesteps=1000,
+            sampling_timesteps=sampling_timesteps,
             loss_type="l2",
             objective="pred_v",
             beta_schedule="cosine",
             min_snr_loss_weight=True,
             guidance_weight=guidance_weight,
             auto_normalize=False,
-            num_actions=self.num_actions,
-            no_op_action=self.no_op_action
-        ).to(self.device)
+            num_actions=num_actions,
+            no_op_action=no_op_action
+        ).to(device)
         if ema:
             ema_wrap = EMA(diffusion,beta = 0.999,update_every=10)
             ema_wrap.load_state_dict(ckpt['ema'])
@@ -356,27 +353,28 @@ def load_world_model(self, model_path, ema=True, num_classes=None, guidance_weig
             diffusion.load_state_dict(ckpt['model'])
             return diffusion
         
-def load_action_proposal_model(self,ema=True):
+def load_world_model(self, model_path, ema=True, guidance_weight=1.0, H=8, W=5, C=26,
+                     horizon=32, 
+                     num_actions=6, sampling_timesteps=500, device=None,):
         """Load the action proposal model."""
-        if not osp.exists(self.args.action_proposal_model_path):
-            raise FileNotFoundError(f"Action proposal model path {self.args.action_proposal_model_path} does not exist.")
-        ckpt = th.load(self.args.action_proposal_model_path, map_location="cpu")
+        
+        ckpt = th.load(model_path, map_location="cpu")
         unet = UnetOvercookedActionProposal(
-            horizon=self.args.horizon,
-            obs_dim=(self.H, self.W, self.C),
-            num_actions=self.num_actions,
+            horizon=horizon,
+            obs_dim=(H, W, C),
+            num_actions=num_actions,
         ).to(self.device)
         diffusion = GoalGaussianDiffusion(
             model=unet,
-            channels=self.num_actions * self.horizon,
+            channels=num_actions * horizon,
             image_size=(1,1),
             timesteps=1000,
-            sampling_timesteps=500,
+            sampling_timesteps=sampling_timesteps,
             loss_type="l2",
             objective="pred_v",
             beta_schedule="cosine",
             min_snr_loss_weight=True,
-            guidance_weight=getattr(self.args, 'guidance_weight', 1.0),
+            guidance_weight=guidance_weight,
             auto_normalize=False,
         ).to(self.device)
         if ema:

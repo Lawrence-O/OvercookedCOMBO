@@ -1,8 +1,5 @@
-import sys
-
 import numpy as np
-sys.path.append("/home/law/Workspace/repos/COMBO/AVDC/flowdiffusion")
-from idm.ground_truth_idm import GroundTruthInverseDynamics
+from overcooked.agent.idm.ground_truth_idm import GroundTruthInverseDynamics
 
 class RewardCalculator:
     """
