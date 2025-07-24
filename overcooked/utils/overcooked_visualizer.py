@@ -107,7 +107,7 @@ class OvercookedVisualizer:
     FONTS_DIR = os.path.join(ASSETS_DIR, "fonts")
 
     # Image assets
-    TERRAINS_IMG = MultiFramePygameImage(
+    TERRAIN_IMG = MultiFramePygameImage(
         os.path.join(GRAPHICS_DIR, "terrain.png"),
         os.path.join(GRAPHICS_DIR, "terrain.json"),
     )

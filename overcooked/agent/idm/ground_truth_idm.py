@@ -4,6 +4,8 @@ from collections import Counter
 from overcooked_ai_py.mdp.overcooked_mdp import (
     OvercookedState, PlayerState, ObjectState, SoupState,
     Direction, Action )
+from collections import Counter
+
 
 class GroundTruthInverseDynamics:
     """
@@ -64,7 +66,6 @@ class GroundTruthInverseDynamics:
                     ing_dict = Counter()
                     ing_dict['onion'] = int(transposed_obs[p_pos_xy[0], p_pos_xy[1], 18])
                     ing_dict['tomato'] = int(transposed_obs[p_pos_xy[0], p_pos_xy[1], 19])
-                    print(f"Player {i} is holding a soup with num onions: {ing_dict['onion']}, tomatoes: {ing_dict['tomato']}")
                     p_held_obj = SoupState.get_soup((p_pos_xy[1], p_pos_xy[0]), num_onions=ing_dict['onion'], num_tomatoes=ing_dict['tomato'], finished=True)
                 elif obj_name:
                     p_held_obj = ObjectState(obj_name, (p_pos_xy[1], p_pos_xy[0]))
@@ -148,35 +149,64 @@ class GroundTruthInverseDynamics:
         This version corrects the mismatch between observation shape (H, W) and
         the MDP's expected geometry (W, H) by transposing the spatial axes first.
         """
-        return [self.invert_obs_to_state(obs_array) for obs_array in obs_array_batch]
+        return [self.invert_obs_to_state(obs_array, max_steps=max_steps) for obs_array in obs_array_batch]
     
     def _is_state_valid_for_simulation(self, state):
         """
         A helper function to check if a state is physically valid before passing
-        it to the core MDP simulator.
+        it to the core MDP simulator. This version incorporates all checks from
+        the official Overcooked-AI MDP.
         """
         # Check for the correct number of players
-        if len(state.players) != 2:
-            print(f"WARNING: Invalid state detected ({len(state.players)} players).")
+        if len(state.players) != self.base_mdp.num_players:
+            print(f"VALIDATION FAIL: Invalid number of players ({len(state.players)}, expected {self.base_mdp.num_players}).")
             return False
-            
-        # Check for illegally placed objects on empty floor space
-        for obj in state.objects.values():
-            terrain_type = self.base_mdp.get_terrain_type_at_pos(obj.position)
-            if terrain_type == ' ':
-                print(f"WARNING: Invalid state detected (object '{obj.name}' at floor space {obj.position}).")
-                return False
+
+        # Create a list of all objects in the state (held and not held)
+        all_objects_in_state = list(state.objects.values())
         
-        # Check for overlapping entities (players or objects)     
+        # Player and Held Object Checks
+        valid_player_positions = self.base_mdp.get_valid_player_positions()
+        for player in state.players:
+            # Player is on a valid tile
+            if player.position not in valid_player_positions:
+                print(f"VALIDATION FAIL: Player at illegal position {player.position}.")
+                return False
+
+            # Held objects are consistent
+            if player.held_object is not None:
+                all_objects_in_state.append(player.held_object)
+                if player.held_object.position != player.position:
+                    print(f"VALIDATION FAIL: Held object at {player.held_object.position} does not match player at {player.position}.")
+                    return False
+
+        # Non-Held Object and Terrain Checks
+        for pos_key, obj in state.objects.items():
+            # Object's internal position matches its dictionary key
+            if obj.position != pos_key:
+                print(f"VALIDATION FAIL: Object data corrupted. Key {pos_key} does not match object's internal position {obj.position}.")
+                return False
+            
+            # Non-held objects are on valid terrain (not empty space)
+            if self.base_mdp.get_terrain_type_at_pos(pos_key) == ' ':
+                print(f"VALIDATION FAIL: Object '{obj.name}' at illegal floor space {pos_key}.")
+                return False
+
+        #  No two players or non-held objects overlap
         all_pos = [p.position for p in state.players] + list(state.objects.keys())
         if len(all_pos) != len(set(all_pos)):
-            # To find the duplicate for better logging (optional but helpful)
-            from collections import Counter
             pos_counts = Counter(all_pos)
             duplicates = [pos for pos, count in pos_counts.items() if count > 1]
             print(f"VALIDATION FAIL: Overlapping entities detected at position(s): {duplicates}")
             return False
-        
+
+        # All objects have a valid internal state (e.g., soup contents are legal)
+        for obj in all_objects_in_state:
+            if not obj.is_valid():
+                print(f"VALIDATION FAIL: Object {obj} has an invalid internal state.")
+                return False
+                
+        # If all checks pass, the state is valid for simulation
         return True
     
     def _find_best_actions_core(self, states_t_batch, states_tp1_batch, distance_fn):
@@ -242,6 +272,7 @@ class GroundTruthInverseDynamics:
         return distance
     def _calculate_ego_state_distance(self, state1, state2, ego_player_idx=0):
         """Calculates distance from the perspective of a single agent."""
+        # TODO: Kinda arbitrary distance metric, but it works for now. Maybe improve later.
         distance = 0.0
         other_player_idx = 1 - ego_player_idx
 
