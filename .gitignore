@@ -5,3 +5,7 @@ data/*.hdf5
 *.jpeg
 *.gif
 *.mp4
+__pycache__
+*.gv
+*.pt
+*.hdf5
