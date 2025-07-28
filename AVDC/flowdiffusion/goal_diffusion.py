@@ -645,11 +645,6 @@ class GoalGaussianDiffusion(nn.Module):
                     history_embed=uncond_history_embed, 
                     mask=None, clip_x_start = False, rederive_pred_noise = True)
                 
-                
-                # Performance Classifier Free Guidance
-                if self.guidance_weight == 0:
-                    raise NotImplementedError("Haven't really thought this out yet, should we return the unconditional or conditional ? Math vs Practicality")
-                
                 x_start = uncond_x_start + self.guidance_weight * (cond_x_start - uncond_x_start)
                 pred_noise = uncond_pred_noise + self.guidance_weight * (cond_pred_noise - uncond_pred_noise)
 
@@ -671,112 +666,122 @@ class GoalGaussianDiffusion(nn.Module):
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
         ret = self.unnormalize(ret)
         return ret
-
+    
     @torch.no_grad()
-    def deprecated_ddim_sample(self, shape, x_cond=None, task_embed=None, action_embed=None, reward_embed=None, image_embed=None, history_embed=None, mask=None, comp_mask=None, return_all_timesteps=False, vis=None):
+    def ddim_sample_multi_concept(self, shape, x_cond=None, task_embed=None, action_embed=None, 
+                                reward_embed=None, image_embed=None, history_embed=None, 
+                                mask=None, concept_weights=None,
+                                return_all_timesteps=False):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
-
-        times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
+        times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)
         times = list(reversed(times.int().tolist()))
-        time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
-        # torch.manual_seed(0)
+        time_pairs = list(zip(times[:-1], times[1:]))
 
         img = torch.randn(shape, device=device)
         imgs = [img]
-
         x_start = None
-        if task_embed is not None and not isinstance(task_embed, list):
-            task_embed = [task_embed]
-            mask = [mask]
         
-        if task_embed is not None:
-            if vis is not None and not isinstance(vis, list):
-                vis = [vis]
-            elif vis is None:
-                vis = [None for _ in range(len(task_embed))]
-        
-        if action_embed is not None and not isinstance(action_embed, list):
-            action_embed = [action_embed]
-        
-        if reward_embed is not None and not isinstance(reward_embed, list):
-            reward_embed = [reward_embed]
-        
-        if image_embed is not None and not isinstance(image_embed, list):
-            image_embed = [image_embed]
-        
-        if history_embed is not None and not isinstance(history_embed, list):
-            history_embed = [history_embed]
-
-        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
-            # self_cond = x_start if self.self_condition else None
-            if task_embed is None and action_embed is None and reward_embed is None and image_embed is None and history_embed is None:
-                # Literally no conditioning
-                assert x_cond is not None, "x_cond must be provided when no task_embed, action_embed, reward_embed, image_embed, or history_embed is provided"
-                pred_noise, x_start, *_ = self.model_predictions(img, time, x_cond, task_embed, action_embed, reward_embed, mask, clip_x_start = False, rederive_pred_noise = True, vis = vis)
+        # Handle concept IDs and weights
+        if isinstance(task_embed, list):
+            concept_ids = task_embed
+            if concept_weights is None:
+                print("No concept weights provided, using uniform weights.")
+                concept_weights = torch.ones(len(concept_ids), device=device) / len(concept_ids)
             else:
-                assert task_embed is not None and action_embed is not None, "task_embed and action_embed must be provided when using task embedding"
-                uncond_task_embed = torch.zeros_like(task_embed[0]) if task_embed is not None else None
-                uncond_action_embed = torch.ones_like(action_embed[0]) * self.no_op_action if action_embed is not None else None
-                uncond_reward_embed = torch.zeros_like(reward_embed[0]) if reward_embed is not None else None
-                uncond_history_embed = torch.zeros_like(history_embed[0]) if history_embed is not None else None
-                uncond_image_embed = torch.zeros_like(image_embed[0]) if image_embed is not None else None      
+                concept_weights = torch.tensor(concept_weights, device=device)
+        else:
+            # Single concept case - fallback to regular ddim_sample behavior
+            concept_ids = [task_embed] if task_embed is not None else []
+            concept_weights = torch.ones(1, device=device) if task_embed is not None else torch.zeros(0, device=device)
+        print(f"Concept IDs: {concept_ids}, Weights: {concept_weights}")
 
-                pred_uncond_noise, x_uncond, *_ = self.model_predictions(
+        for time, time_next in tqdm(time_pairs, desc = 'multi-concept sampling loop time step'):
+            if concept_ids and self.guidance_weight > 0:
+                # Get unconditional predictions
+                uncond_task_embed = torch.zeros_like(concept_ids[0]) if isinstance(concept_ids[0], torch.Tensor) else 0
+                uncond_action_embed = torch.ones_like(action_embed) * self.no_op_action if action_embed is not None else None
+                uncond_reward_embed = torch.zeros_like(reward_embed) if reward_embed is not None else None
+                uncond_history_embed = torch.zeros_like(history_embed) if history_embed is not None else None
+                uncond_image_embed = torch.zeros_like(image_embed) if image_embed is not None else None
+
+                uncond_pred_noise, uncond_x_start = self.model_predictions(
                     x=img, t=time, 
                     x_cond=x_cond, 
-                    task_embed=uncond_task_embed, 
+                    task_embed=torch.full((batch,), uncond_task_embed, device=device, dtype=torch.long),
                     action_embed=uncond_action_embed, 
                     reward_embed=uncond_reward_embed,
                     image_embed=uncond_image_embed,
                     history_embed=uncond_history_embed, 
-                    mask=None, clip_x_start = False, rederive_pred_noise = True)
-                pred_noise = pred_uncond_noise
-                x_start = x_uncond
+                    mask=None, clip_x_start=False, rederive_pred_noise=True
+                )
                 
-                for i in range(len(task_embed)):
-                    cur_pred_noise, cur_x_start, *_ = self.model_predictions(
-                        x=img, t=time, 
-                        x_cond=x_cond, 
-                        task_embed=task_embed[i],
-                        action_embed=action_embed[i], 
-                        reward_embed=reward_embed[i],
-                        image_embed=image_embed[i],
-                        history_embed=history_embed[i], 
-                        mask=mask[i], clip_x_start = False, rederive_pred_noise = True, vis = vis[i])
-                    c_mask = comp_mask[i].view(-1, 1, 1, 1) if comp_mask is not None else 1
+                # Get weighted conditional predictions
+                total_guidance_noise = torch.zeros_like(uncond_pred_noise)
+                total_guidance_x_start = torch.zeros_like(uncond_x_start)
 
-                    x_start = (cur_x_start - x_uncond) * self.guidance_weight * c_mask + x_start
-                    pred_noise = (cur_pred_noise - pred_uncond_noise) * self.guidance_weight * c_mask + pred_noise
+                for i, concept_id in enumerate(concept_ids):
+                    # Create task embed for this concept
+                    if isinstance(concept_id, int):
+                        concept_task_embed = torch.full((batch,), concept_id, device=device, dtype=torch.long)
+                    else:
+                        concept_task_embed = concept_id
+                    
+                    cond_pred_noise, cond_x_start = self.model_predictions(
+                        x=img, t=time, x_cond=x_cond, 
+                        task_embed=concept_task_embed, 
+                        action_embed=action_embed, 
+                        reward_embed=reward_embed, 
+                        image_embed=image_embed, 
+                        history_embed=history_embed, 
+                        mask=mask,
+                        clip_x_start=True
+                    )
+
+                    # Weight and accumulate
+                    total_guidance_noise += concept_weights[i] * (cond_pred_noise - uncond_pred_noise)
+                    total_guidance_x_start += concept_weights[i] * (cond_x_start - uncond_x_start)
+                
+                # Apply classifier-free guidance
+                pred_noise = uncond_pred_noise + self.guidance_weight * total_guidance_noise
+                x_start = uncond_x_start + self.guidance_weight * total_guidance_x_start
+                
+            else:
+                raise ValueError("No concepts provided or guidance weight is zero. Please provide valid concept IDs and a positive guidance weight.")
+                
 
             if time_next < 0:
                 img = x_start
                 imgs.append(img)
                 continue
 
+            # DDIM sampling step
             alpha = self.alphas_cumprod[time]
             alpha_next = self.alphas_cumprod[time_next]
-
             sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
             c = (1 - alpha_next - sigma ** 2).sqrt()
-
             noise = torch.randn_like(img)
-
             img = x_start * alpha_next.sqrt() + \
                   c * pred_noise + \
                   sigma * noise
-            # img.clamp_(-1., 1.)
-
+            
             imgs.append(img)
-
+            
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
-
         ret = self.unnormalize(ret)
         return ret
+    
 #TODO: Clean up Assertions and add more checks
     @torch.no_grad()
-    def sample(self, x_cond=None, task_embed=None, action_embed=None, reward_embed=None, image_embed=None, history_embed=None, mask=None, comp_mask=None, batch_size=16, return_all_timesteps=False, vis=None):
+    def sample(self, x_cond=None, task_embed=None, action_embed=None, reward_embed=None, 
+           image_embed=None, history_embed=None, mask=None, comp_mask=None, 
+           batch_size=16, return_all_timesteps=False, vis=None,
+           concept_weights=None):
+        
         image_size, channels = self.image_size, self.channels
-        sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
+        if isinstance(task_embed, list):
+            sample_fn = self.ddim_sample_multi_concept
+        else:
+            sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         
         if x_cond is not None:
             assert x_cond.min() >= -1 and x_cond.max() <= 1, \
@@ -795,19 +800,27 @@ class GoalGaussianDiffusion(nn.Module):
                 f'action_embed values must be in range [0, {self.num_actions - 1}], got range [{action_embed.min().item()}, {action_embed.max().item()}]'
             action_embed = F.one_hot(action_embed, num_classes=self.num_actions).float()
 
-        return sample_fn(
-            shape=(batch_size, channels, image_size[0], image_size[1]), 
-            x_cond=x_cond, 
-            task_embed=task_embed, 
-            action_embed=action_embed,
-            reward_embed=reward_embed,
-            image_embed=image_embed,
-            history_embed=history_embed, 
-            mask=mask, 
-            comp_mask=comp_mask, 
-            return_all_timesteps=return_all_timesteps, 
-            vis=vis
-        )
+        # Call the appropriate sampling function
+        sample_kwargs = {
+            'shape': (batch_size, channels, image_size[0], image_size[1]),
+            'x_cond': x_cond,
+            'task_embed': task_embed,
+            'action_embed': action_embed,
+            'reward_embed': reward_embed,
+            'image_embed': image_embed,
+            'history_embed': history_embed,
+            'mask': mask,
+            'return_all_timesteps': return_all_timesteps,
+        }
+        
+        # Add multi-concept specific args if needed
+        if isinstance(task_embed, list):
+            sample_kwargs['concept_weights'] = concept_weights
+        else:
+            sample_kwargs['comp_mask'] = comp_mask
+            sample_kwargs['vis'] = vis
+        
+        return sample_fn(**sample_kwargs)
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
         b, *_, device = *x1.shape, x1.device

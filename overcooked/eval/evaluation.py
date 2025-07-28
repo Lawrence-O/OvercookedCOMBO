@@ -68,12 +68,19 @@ class BaseTester:
         self.base_dir.mkdir(parents=True, exist_ok=True)
         print(f"Experiment outputs will be saved to: {self.base_dir}")
 
-    def evaluate_in_env(self, state_action_fn, observe_fn=None, num_episodes=10, policy_name="bc_train"):
+    def evaluate_in_env(self, state_action_fn, observe_fn=None, collect_experience_fn=None, num_episodes=10, policy_name="bc_train"):
         """Test the value model by running episodes and collecting rewards.
         Supports both single-step and planning horizon action outputs.
+        
+        Args:
+            state_action_fn: Function that returns actions given observations
+            observe_fn: Optional function to update observation history
+            collect_experience_fn: Optional function to collect (obs, action) pairs for learning
+            num_episodes: Number of episodes to run
+            policy_name: Name of partner policy
         """
         all_data = []
-        with managed_environment(self.args, policy_name, self.n_envs ) as (envs, partner_agent_policy):
+        with managed_environment(self.args, policy_name, self.n_envs) as (envs, partner_agent_policy):
             for episode in tqdm(range(num_episodes), desc="Running Evaluation"):
                 # Reset Policy
                 partner_agent_policy.reset(num_envs=self.n_envs, num_agents=1)
@@ -148,12 +155,19 @@ class BaseTester:
                             for e in range(min(self.n_envs, 3)):
                                 frames[e].append(obs[e][0])
                             
-                            if steps % 4 == 0:
-                                if observe_fn is not None:
-                                    new_agent0_obs_batch = np.stack([obs[e][0] for e in range(self.n_envs)], axis=0)
-                                    observe_fn(new_agent0_obs_batch)
                             done = np.all(done)
                             steps += 1
+                            
+                            # Update observation history and collect experiences
+                            new_agent0_obs_batch = np.stack([obs[e][0] for e in range(self.n_envs)], axis=0)
+                            if observe_fn is not None:
+                                observe_fn(new_agent0_obs_batch)
+                            if collect_experience_fn is not None:
+                                collect_experience_fn(agent0_obs, step_actions[:, 0, 0])
+                            
+                            # Update agent0_obs for next iteration
+                            agent0_obs = new_agent0_obs_batch
+                            
                     else:
                         # --- Single-step fallback ---
                         step_actions[:, 0] = agent0_actions
@@ -183,14 +197,24 @@ class BaseTester:
                         actions_list.append((agent0_actions.copy(), agent1_actions.copy()))
                         for e in range(min(self.n_envs, 3)):
                             frames[e].append(obs[e][0])
+                        
+                        # Update observation history and collect experiences
+                        new_agent0_obs_batch = np.stack([obs[e][0] for e in range(self.n_envs)], axis=0)
                         if observe_fn is not None:
-                            new_agent0_obs_batch = np.stack([obs[e][0] for e in range(self.n_envs)], axis=0)
                             observe_fn(new_agent0_obs_batch)
+                        if collect_experience_fn is not None:
+                            # Handle different action shapes
+                            if isinstance(agent0_actions, np.ndarray) and agent0_actions.ndim == 2:
+                                collect_experience_fn(agent0_obs, agent0_actions[:, 0])
+                            else:
+                                collect_experience_fn(agent0_obs, agent0_actions)
+                        
                         done = np.all(done)
                         steps += 1
 
                     if steps >= self.args.max_steps:
                         break
+                
                 print(f"Episode {episode + 1}/{num_episodes} completed with total reward: {episode_reward.sum(axis=0) // self.n_envs}")
                 all_data.append({
                     "rewards": rewards_list,
@@ -202,10 +226,13 @@ class BaseTester:
                     "done": done_list,
                     "frames": frames,
                 })
+                
+                # Save video for last episode
                 if episode == num_episodes - 1:
                     video_dir = self.base_dir / "videos" / "evaluation"
                     video_dir.mkdir(parents=True, exist_ok=True)
                     self._save_episode_videos(frames, episode, video_dir)
+        
         return all_data
     def calculate_evaluation_summary(self, episode_rewards_list):
         """Calculate summary statistics from episode rewards."""
@@ -337,7 +364,7 @@ class MultiPolicyTester(BaseTester):
         self.agent = agent 
         self.policies = policies 
         self.all_evaluation_summaries = []
-        self.policy_name_to_id = {"best_r_vs_bc_train_held_out": 1, "comedi_mp0": 2, "comedi_mp1": 3, "comedi_mp2": 4, "comedi_mp3": 5, "mep1_final": 6, "mep1_init": 7, "mep1_mid": 8, "mep2_final": 9, "mep2_init": 10, "mep2_mid": 11, "mep3_final": 12, "mep3_init": 13, "mep3_mid": 14, "sp10_final": 15, "sp10_init": 16, "sp10_mid": 17, "sp1_final": 18, "sp1_init": 19, "sp1_mid": 20, "sp2_final": 21, "sp2_init": 22, "sp2_mid": 23, "sp3_final": 24, "sp3_init": 25, "sp3_mid": 26, "sp9_final": 27, "sp9_init": 28, "sp9_mid": 29}
+        self.policy_name_to_id = {"actor_best_r_vs_bc_train": 1, "bc_train": 2, "comedi_best": 3, "comedi_mp0": 4, "comedi_mp1": 5, "comedi_mp2": 6, "comedi_mp3": 7, "comedi_mp4": 8, "comedi_mp5": 9, "comedi_mp6": 10, "comedi_mp7": 11, "mep1_final": 12, "mep1_init": 13, "mep1_mid": 14, "mep2_final": 15, "mep2_init": 16, "mep2_mid": 17, "mep3_final": 18, "mep3_init": 19, "mep3_mid": 20, "mep4_final": 21, "mep4_init": 22, "mep4_mid": 23, "mep5_final": 24, "mep5_init": 25, "mep5_mid": 26, "mep6_final": 27, "mep6_init": 28, "mep6_mid": 29, "mep7_final": 30, "mep7_init": 31, "mep7_mid": 32, "mep8_final": 33, "mep8_init": 34, "mep8_mid": 35, "mep_best": 36, "sp10_final": 37, "sp10_init": 38, "sp10_mid": 39, "sp1_final": 40, "sp1_init": 41, "sp1_mid": 42, "sp2_final": 43, "sp2_init": 44, "sp2_mid": 45, "sp3_final": 46, "sp3_init": 47, "sp3_mid": 48, "sp4_final": 49, "sp4_init": 50, "sp4_mid": 51, "sp5_final": 52, "sp5_init": 53, "sp5_mid": 54, "sp6_final": 55, "sp6_init": 56, "sp6_mid": 57, "sp7_final": 58, "sp7_init": 59, "sp7_mid": 60, "sp8_final": 61, "sp8_init": 62, "sp8_mid": 63, "sp9_final": 64, "sp9_init": 65, "sp9_mid": 66, "sp_best": 67}
 
     def evaluate_agent_against_partners(self, num_episodes=10):
         """
@@ -464,54 +491,213 @@ class ConceptLearningTester(BaseTester):
     A class for testing concept learning agents in Overcooked environments.
     Inherits from BaseTester to utilize shared functionalities.
     """
-    def __init__(self, args, agent, num_concepts):
+    def __init__(self, args, agent, policies):
         super().__init__(args)
         self.agent = agent
+        self.policies = policies
         self.all_evaluation_summaries = []
-        self.buffer = deque(maxlen=self.args.buffer_size) # Initialize a replay buffer
-
-    def evaluate_agent(self, num_episodes=10):
+        self.episode_rewards_history = []  # Track rewards over episodes
+        self.policy_name_to_id = {"actor_best_r_vs_bc_train": 1, "bc_train": 2, "comedi_best": 3, "comedi_mp0": 4, "comedi_mp1": 5, "comedi_mp2": 6, "comedi_mp3": 7, "comedi_mp4": 8, "comedi_mp5": 9, "comedi_mp6": 10, "comedi_mp7": 11, "mep1_final": 12, "mep1_init": 13, "mep1_mid": 14, "mep2_final": 15, "mep2_init": 16, "mep2_mid": 17, "mep3_final": 18, "mep3_init": 19, "mep3_mid": 20, "mep4_final": 21, "mep4_init": 22, "mep4_mid": 23, "mep5_final": 24, "mep5_init": 25, "mep5_mid": 26, "mep6_final": 27, "mep6_init": 28, "mep6_mid": 29, "mep7_final": 30, "mep7_init": 31, "mep7_mid": 32, "mep8_final": 33, "mep8_init": 34, "mep8_mid": 35, "mep_best": 36, "sp10_final": 37, "sp10_init": 38, "sp10_mid": 39, "sp1_final": 40, "sp1_init": 41, "sp1_mid": 42, "sp2_final": 43, "sp2_init": 44, "sp2_mid": 45, "sp3_final": 46, "sp3_init": 47, "sp3_mid": 48, "sp4_final": 49, "sp4_init": 50, "sp4_mid": 51, "sp5_final": 52, "sp5_init": 53, "sp5_mid": 54, "sp6_final": 55, "sp6_init": 56, "sp6_mid": 57, "sp7_final": 58, "sp7_init": 59, "sp7_mid": 60, "sp8_final": 61, "sp8_init": 62, "sp8_mid": 63, "sp9_final": 64, "sp9_init": 65, "sp9_mid": 66, "sp_best": 67}
+        
+    def evaluate_agent(self, num_episodes=10, concept_learning_interval=1, policy_name="bc_train"):
         """
-        Evaluates the concept learning agent against a fixed partner policy.
+        Evaluates the agent with concept learning after each episode.
         
         Args:
-            num_episodes (int): Number of episodes to run.
+            num_episodes (int): Total number of episodes to run
+            concept_learning_interval (int): Number of episodes between concept learning
+            policy_name (str): Partner policy to evaluate against
         """
         print(f"\n--- Starting Concept Learning Evaluation for Agent: {type(self.agent).__name__} ---")
         
-        # Set up a specific directory for concept learning evaluation results
+        # Set up directory for concept learning results
         self.set_experiment_dir(experiment_name="concept_learning_evaluation")
-
-        # Define the state_action_fn for Agent 0 (self.agent)
-        def agent0_planning_action_fn(obs_batch_np, current_partner_policy_name_from_env):
-            # Get the action plan from self.agent
-            agent0_actions_plan = self.agent.get_plan(obs_batch_np)
+        
+        # Setup concept learning if not already done
+        if not hasattr(self.agent, 'optimizer') or self.agent.optimizer is None:
+            self.agent.setup_concept_learning()
+        
+        # Reset agent for fresh start
+        if hasattr(self.agent, 'reset'):
+            self.agent.reset()
+            
+        # Define action function
+        def agent0_action_fn(obs_batch_np, current_partner_policy_name):
+            # Get policy ID
+            if current_partner_policy_name not in self.policy_name_to_id:
+                raise ValueError(f"Policy name '{current_partner_policy_name}' not found in mapping.")
+            
+            partner_policy_id = self.policy_name_to_id[current_partner_policy_name]
+            policy_id_batch_np = np.full((obs_batch_np.shape[0],), partner_policy_id, dtype=np.int64)
+            
+            # Get action plan from agent
+            agent0_actions_plan = self.agent.get_plan(obs_batch_np, policy_id_batch_np)
             return agent0_actions_plan
-
-        # Run evaluation using the BaseTester's evaluate_in_env method.
-        all_episode_data = self.evaluate_in_env(
-            state_action_fn=agent0_planning_action_fn,
-            num_episodes=num_episodes,
-            policy_name="bc_train"  # Fixed partner policy
-        )
         
-        # Extract episode rewards for summary calculation
-        episode_rewards_list = [d["episode_reward"] for d in all_episode_data]
+        # Define experience collection function
+        def collect_experience(obs_batch_np, action_batch_np):
+            self.agent.add_concept_learning_experience(
+                obs_batch_np, 
+                action_batch_np
+            )
         
-        # Calculate summary statistics
-        summary = self.calculate_evaluation_summary(episode_rewards_list)
+        # Run episodes with concept learning
+        for episode_idx in range(num_episodes):
+            print(f"\n--- Episode {episode_idx + 1}/{num_episodes} ---")
+            
+            # Run single episode evaluation using base class method
+            episode_data_list = self.evaluate_in_env(
+                state_action_fn=agent0_action_fn,
+                observe_fn=self.agent.observe,
+                collect_experience_fn=collect_experience,
+                num_episodes=1,  # Run one episode at a time
+                policy_name=policy_name
+            )
+            
+            # Extract episode data (we only ran 1 episode)
+            episode_data = episode_data_list[0]
+            
+            # Extract and store episode reward
+            episode_reward = episode_data["episode_reward"]
+            agent0_reward = episode_reward[:, 0].mean()
+            agent1_reward = episode_reward[:, 1].mean()
+            team_reward = episode_reward.sum(axis=1).mean()
+            
+            self.episode_rewards_history.append({
+                'episode': episode_idx + 1,
+                'agent0_reward': agent0_reward,
+                'agent1_reward': agent1_reward,
+                'team_reward': team_reward
+            })
+            
+            print(f"Episode {episode_idx + 1} - Agent0: {agent0_reward:.2f}, Agent1: {agent1_reward:.2f}, Team: {team_reward:.2f}")
+            
+            # Perform concept learning if interval reached
+            if (episode_idx + 1) % concept_learning_interval == 0 and (episode_idx + 1) < num_episodes:
+                print(f"\n--- Performing Concept Learning after Episode {episode_idx + 1} ---")
+                if len(self.agent.concept_learning_buffer) >= self.agent.batch_size:
+                    self.agent.concept_learn()
+                else:
+                    print(f"Not enough experiences in buffer ({len(self.agent.concept_learning_buffer)}/{self.agent.batch_size}). Skipping concept learning.")
         
-        # Add partner policy name to the summary dictionary for identification in plotting/reporting
-        summary['partner_policy_name'] = "bc_train"
-        self.all_evaluation_summaries.append(summary)
-
+        # Generate plots and save results
+        self.plot_concept_learning_progress()
+        self.save_concept_learning_results()
+        
         print("\n--- Concept Learning Evaluation Complete ---")
         
-        # Generate the consolidated plot
-        self.plot_concept_learning_results()
+    
+    
+    def plot_concept_learning_progress(self):
+        """
+        Generates a linear plot showing how agent rewards change over episodes.
+        """
+        plot_dir = self.base_dir / "plots" / "concept_learning"
+        plot_dir.mkdir(parents=True, exist_ok=True)
         
-        # Save all collected summaries to a single JSON/CSV file for comprehensive analysis
-        output_path_csv = self.base_dir / "concept_learning_evaluation_summary.csv"
-        output_path_json = self.base_dir / "concept_learning_evaluation_summary.json"
-        pd.DataFrame(self.all_evaluation_summaries).to_csv(output_path_csv, index=False)
-        pd.DataFrame(self.all_evaluation_summaries).to_json
+        if not self.episode_rewards_history:
+            print("No episode rewards to plot.")
+            return
+        
+        # Convert to DataFrame for easier plotting
+        df = pd.DataFrame(self.episode_rewards_history)
+        
+        # Create the plot
+        plt.figure(figsize=(12, 8))
+        
+        # Plot lines for each reward type
+        plt.plot(df['episode'], df['agent0_reward'], 'o-', label='Agent 0 (Concept Learning)', 
+                color='skyblue', linewidth=2, markersize=8)
+        plt.plot(df['episode'], df['agent1_reward'], 's-', label='Agent 1 (Partner)', 
+                color='lightgreen', linewidth=2, markersize=8)
+        plt.plot(df['episode'], df['team_reward'], '^-', label='Team Total', 
+                color='coral', linewidth=2, markersize=8)
+        
+        # Add grid and labels
+        plt.xlabel('Episode', fontsize=12)
+        plt.ylabel('Episode Reward', fontsize=12)
+        plt.title('Agent Performance Over Episodes with Concept Learning', fontsize=14)
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        
+        # Add concept learning markers (vertical lines where learning occurred)
+        # for i in range(1, len(df)):
+        #     if i % self.args.concept_learning_interval == 0:
+        #         plt.axvline(x=i, color='red', linestyle='--', alpha=0.5, label='Concept Learning' if i == 1 else '')
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        output_path = plot_dir / "concept_learning_progress.png"
+        plt.savefig(output_path, dpi=300)
+        print(f"Concept learning progress plot saved to {output_path}")
+        plt.close()
+        
+        # Also create a subplot version with individual agent plots
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+        
+        # Agent 0 subplot
+        axes[0].plot(df['episode'], df['agent0_reward'], 'o-', color='skyblue', linewidth=2, markersize=8)
+        axes[0].set_ylabel('Agent 0 Reward', fontsize=12)
+        axes[0].set_title('Agent 0 (Concept Learning) Performance', fontsize=14)
+        axes[0].grid(True, alpha=0.3)
+        
+        # Agent 1 subplot
+        axes[1].plot(df['episode'], df['agent1_reward'], 's-', color='lightgreen', linewidth=2, markersize=8)
+        axes[1].set_ylabel('Agent 1 Reward', fontsize=12)
+        axes[1].set_title('Agent 1 (Partner) Performance', fontsize=14)
+        axes[1].grid(True, alpha=0.3)
+        
+        # Team subplot
+        axes[2].plot(df['episode'], df['team_reward'], '^-', color='coral', linewidth=2, markersize=8)
+        axes[2].set_ylabel('Team Reward', fontsize=12)
+        axes[2].set_title('Team Total Performance', fontsize=14)
+        axes[2].set_xlabel('Episode', fontsize=12)
+        axes[2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Save subplot version
+        subplot_path = plot_dir / "concept_learning_progress_subplots.png"
+        plt.savefig(subplot_path, dpi=300)
+        plt.close()
+        
+    def save_concept_learning_results(self):
+        """
+        Saves the concept learning results to CSV and JSON files.
+        """
+        df = pd.DataFrame(self.episode_rewards_history)
+        
+        # Save as CSV
+        csv_path = self.base_dir / "concept_learning_results.csv"
+        df.to_csv(csv_path, index=False)
+        
+        # Save as JSON
+        json_path = self.base_dir / "concept_learning_results.json"
+        df.to_json(json_path, orient='records', indent=2)
+        
+        # Save summary statistics
+        summary = {
+            'total_episodes': len(df),
+            'agent0_mean_reward': df['agent0_reward'].mean(),
+            'agent0_std_reward': df['agent0_reward'].std(),
+            'agent0_final_reward': df['agent0_reward'].iloc[-1],
+            'agent0_initial_reward': df['agent0_reward'].iloc[0],
+            'agent0_improvement': df['agent0_reward'].iloc[-1] - df['agent0_reward'].iloc[0],
+            'team_mean_reward': df['team_reward'].mean(),
+            'team_final_reward': df['team_reward'].iloc[-1],
+            'team_initial_reward': df['team_reward'].iloc[0],
+            'team_improvement': df['team_reward'].iloc[-1] - df['team_reward'].iloc[0]
+        }
+        
+        summary_path = self.base_dir / "concept_learning_summary.json"
+        with open(summary_path, 'w') as f:
+            import json
+            json.dump(self._make_json_serializable(summary), f, indent=2)
+        
+        print(f"Concept learning results saved to {self.base_dir}")
+        print(f"Agent 0 improvement: {summary['agent0_improvement']:.2f}")
+        print(f"Team improvement: {summary['team_improvement']:.2f}")
+        
+
+    

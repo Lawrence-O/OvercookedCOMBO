@@ -19,7 +19,7 @@ from overcooked.utils.overcooked_visualizer import OvercookedVisualizer
 from overcooked.agent.action_proposal import ActionProposalUtil
 from torch.optim import Adam
 import torch.utils.checkpoint as cp
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
 
 def _reward_calculation_worker(work_item):
@@ -31,6 +31,21 @@ def _reward_calculation_worker(work_item):
     ego_rewards, partner_rewards = local_reward_calculator.calculate_reward_batch(obs_t_batch, obs_tp1_batch)
     return np.sum(ego_rewards) + np.sum(partner_rewards)
 
+def _concept_learning_collate_fn(batch):
+    """Custom collate function for concept learning data."""
+    initial_obs = np.array([item['initial_obs'] for item in batch])
+    trajectories = np.array([item['trajectory'] for item in batch])
+    actions = np.array([item['actions'] for item in batch])
+    
+    # Pre-normalize here to avoid doing it in the training loop
+    initial_obs_norm = normalize_obs_vectorized(initial_obs, divide=True)
+    trajectories_norm = normalize_obs_vectorized(trajectories, divide=True)
+    
+    return {
+        'initial_obs': initial_obs_norm,
+        'trajectory': trajectories_norm,
+        'actions': actions
+    }
 
 
 class ConceptLearningBuffer(Dataset):
@@ -48,7 +63,12 @@ class ConceptLearningBuffer(Dataset):
         return len(self.buffer)
 
     def __getitem__(self, idx):
-        return self.buffer[idx]
+        initial_obs, trajectory, actions = self.buffer[idx]
+        return {
+            'initial_obs': initial_obs,
+            'trajectory': trajectory, 
+            'actions': actions
+        }
 
 
 class DiffusionPlannerAgent:
@@ -57,20 +77,27 @@ class DiffusionPlannerAgent:
     It integrates with the world model, action proposal model, and inverse dynamics model to simulate and evaluate plans.
     
     Args:
-        args (Namespace): Configuration parameters for the agent.
-        world_model (nn.Module): The world model that simulates the game environment.
-        action_proposal_model (nn.Module): The model that proposes action plans based on the current state.
-        num_envs (int): Number of environments to run in parallel.
-        horizon (int): The planning horizon for state sequences.
-        target_reward (float): The target reward for the agent to achieve.
-        history_horizon (int): The number of past observations to consider in planning.
-        planning_horizon (int): The number of steps to plan ahead.
-        action_horizon (int): The number of actions in each plan.
-        num_action_candidates (int): Number of candidate action plans to generate.
-        num_simulations_per_plan (int): Number of simulations to run for each candidate plan.
-        num_concepts (int): Number of concepts to learn.
-        model_embedding_dim (int): Dimensionality of the model's embedding space.
-        use_checkpoint (bool): Whether to use checkpointing for memory efficiency.
+        args: Command line arguments and configurations.
+        world_model: The world model used for simulating future states.
+        action_proposal_model: The model that proposes action plans.
+        num_envs: Number of parallel environments to run.
+        horizon: Sequence horizon for trajectories.
+        target_reward: Target reward for the planning process.
+        history_horizon: Length of the history to consider for planning.
+        planning_horizon: Length of the plan to generate.
+        action_horizon: Length of the action sequence to predict.
+        num_action_candidates: Number of candidate action plans to consider.
+        num_simulations_per_plan: Number of simulations per candidate plan.
+        automatic_replan: Whether to automatically replan if initial plans fail.
+        max_replan_attempts: Maximum number of attempts to replan if initial plans fail.
+        num_concepts: Number of concepts for concept learning.
+        model_embedding_dim: Dimensionality of the model embeddings.
+        use_checkpoint: Whether to use checkpointing for memory efficiency during training.
+        guidance_option: Type of guidance to use ("scalar" or "learnable").
+        guidance_weight: Weight for the guidance loss (if applicable).
+        cl_buffer_size: Size of the concept learning buffer.
+        num_processes: Number of processes for parallel computation.
+        device: Device to run the models on (CPU or GPU).
 
     """
     FEATURE_CHANNEL_MAP = [
@@ -87,16 +114,16 @@ class DiffusionPlannerAgent:
     CHANNEL_FEATURE_MAP = {name: i for i, name in enumerate(FEATURE_CHANNEL_MAP)}
     def __init__(self, args, world_model, action_proposal_model, num_envs, horizon=32, target_reward=150,
                  history_horizon=16, planning_horizon=32, action_horizon=8, num_action_candidates=5, num_simulations_per_plan=10,
-                 automatic_replan=True, max_replan_attempts=3,
+                 automatic_replan=True, max_replan_attempts=3, minimum_cl_steps=10,
                  num_concepts=10, model_embedding_dim=256*4, use_checkpoint=True, guidance_option="scalar", guidance_weight=1.0,
-                 cl_buffer_size=256, num_processes=None, device=None, training_steps=10, batch_size=16):
+                 cl_buffer_size=256, num_processes=None, device=None, training_steps=10, batch_size=16, train_lr=1e-4):
         
         self.args = args
         self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Agent models operating on device: {self.device}")
 
         # Models 
-        self.world_model = world_model.to(self.device).eval()
+        self.world_model = world_model.to(self.device)
         self.action_proposer = ActionProposalUtil(action_proposal_model, history_horizon=history_horizon, device=self.device)
         self.idm = GroundTruthInverseDynamics(self.args) 
         self.reward_calculator = GroundTruthRewardCalculator(self.args)
@@ -119,7 +146,7 @@ class DiffusionPlannerAgent:
         # Debugging
         self.renderer = OvercookedVisualizer()
         self.grid = None
-        self.debug = True
+        self.debug = False
 
         if self.debug:
             self.debug_dir = Path("DiffusionPlannerAgent_debug") / datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -131,19 +158,33 @@ class DiffusionPlannerAgent:
         self.num_concepts = num_concepts
         self.model_embedding_dim = model_embedding_dim
         self.use_checkpoint = use_checkpoint
-        self.dummy_id = 0
         self.guidance_option = guidance_option
-        if guidance_option == "scalar":
-            self.guidance_weight = torch.full((self.num_concepts,), guidance_weight, device=self.device)
-        elif guidance_option == "learnable":
-            self.guidance_logits = nn.Parameter(torch.full((self.num_concepts,), guidance_weight, device=self.device))
-        self.initial_cl_buffer = deque(maxlen=horizon + 1)
+        self.env_cl_buffers = [deque(maxlen=self.horizon + 1) for _ in range(self.num_envs)]
         self.concept_learning_buffer = ConceptLearningBuffer(max_size=cl_buffer_size)
         self.training_steps = training_steps
-        self.batch_size = batch_size  
+        self.batch_size = batch_size
+        self.train_lr = train_lr
+
+        self.cl_steps = 0
+        self.minimum_cl_steps = minimum_cl_steps
+
+        if guidance_option == "scalar":
+            if isinstance(guidance_weight, (list, np.ndarray)):
+                assert len(guidance_weight) == self.num_concepts, f"Expected {self.num_concepts} weights, got {len(guidance_weight)}"
+                self.guidance_weight = torch.tensor(guidance_weight, device=self.device, dtype=torch.float32)
+                self.guidance_weight = self.guidance_weight / self.guidance_weight.sum()
+            else:
+                # Uniform distribution
+                self.guidance_weight = torch.ones(self.num_concepts, device=self.device) / self.num_concepts
+        elif guidance_option == "learnable":
+            # Initialize with small random values
+            self.guidance_logits = nn.Parameter(torch.randn(self.num_concepts, device=self.device) * 0.1)  
         
         # Internal dimensions
         self.H, self.W, self.C = (8, 5, 26)
+        self.dummy_id = 0
+        self.no_op_action = 4
+        self.num_actions = 6
 
     def reset(self, env_indices=None):
         """Resets the history buffers for specified (or all) environments."""
@@ -153,16 +194,40 @@ class DiffusionPlannerAgent:
             self.history_buffers[i].clear()
         print(f"Reset history for environments: {env_indices}")
     
-    def add_concept_learning_experience(self, obs : np.ndarray, action: np.ndarray):
-        """Adds a single trajectory experience to the concept learning buffer."""
-        self.initial_cl_buffer.append((obs, action))
-        if len(self.initial_cl_buffer) == self.horizon + 1:
-            initial_obs = self.initial_cl_buffer.popleft()[0]
-            obs_trajectory = np.array([x[0] for x in self.initial_cl_buffer])
-            actions = np.array([x[1] for x in self.initial_cl_buffer])
-            self.concept_learning_buffer.add_experience(initial_obs, obs_trajectory, actions)
+    def add_concept_learning_experience(self, obs_batch: np.ndarray, action_batch: np.ndarray):
+        """
+        Adds trajectory experiences from all environments to the concept learning buffer.
+        Uses a sliding window approach for more efficient data collection.
+        
+        Args:
+            obs_batch: Observations from all environments [num_envs, H, W, C]
+            action_batch: Actions from all environments [num_envs,]
+        """
+        assert obs_batch.shape[0] == self.num_envs, f"Expected {self.num_envs} envs, got {obs_batch.shape[0]}"
+        
+        # Process each environment's trajectory buffer
+        for env_idx in range(self.num_envs):
+            obs = obs_batch[env_idx]
+            action = action_batch[env_idx]
+            
+            self.env_cl_buffers[env_idx].append((obs, action))
+            
+            # Use sliding window: once we have enough steps, extract trajectories
+            if len(self.env_cl_buffers[env_idx]) >= self.horizon + 1:
+                # Extract the trajectory
+                trajectory_data = list(self.env_cl_buffers[env_idx])
+                initial_obs = trajectory_data[0][0]
+                obs_trajectory = np.array([x[0] for x in trajectory_data[1:]])  # Next horizon observations
+                actions = np.array([x[1] for x in trajectory_data[:-1]])  # Actions that led to those observations
+                
+                self.concept_learning_buffer.add_experience(initial_obs, obs_trajectory, actions)
+                self.env_cl_buffers[env_idx].popleft()  
+        
+        # # Log less frequently
+        # if len(self.concept_learning_buffer) % 100 == 0:
+        print(f"Concept learning buffer size: {len(self.concept_learning_buffer)}")
     
-    def sample_concept_learning_batch(self, batch_size=32):
+    def _sample_concept_learning_batch(self, batch_size=32):
         """
         Samples a batch of concept learning experiences.
         Returns a tuple of (initial_obs, obs_trajectory, actions).
@@ -186,9 +251,6 @@ class DiffusionPlannerAgent:
         
         for i, obs in enumerate(obs_batch_np):
             self.history_buffers[i].append(obs)
-        
-        if self.debug:
-            print(f"History buffers updated for batch size {self.num_envs}. Current history lengths: {[len(h) for h in self.history_buffers]}")
     
     @torch.no_grad()
     def get_plan(self, obs_batch_np: np.ndarray, policy_id_batch_np: np.ndarray) -> np.ndarray:
@@ -199,10 +261,18 @@ class DiffusionPlannerAgent:
         batch_size = obs_batch_np.shape[0]
         assert batch_size == self.num_envs, "Input batch size must match the number of environments."
 
+        self.world_model.eval()
+
         # Initialization for the planning loop
         final_trajectories = np.zeros((batch_size, self.horizon, self.H, self.W, self.C), dtype=np.int32)
         plan_is_finalized = np.zeros(batch_size, dtype=bool)
         indices_to_plan_for = np.arange(batch_size)
+
+        if self.debug and self.grid is None:
+            grid_obs = obs_batch_np[0].astype(np.float32) / 255.0
+            grid_obs = np.transpose(grid_obs, (1, 0, 2))
+            self.grid = self.renderer.extract_grid_from_obs(grid_obs)
+
 
         # Main Replanning Loop
         for attempt in range(self.max_replan_attempts):
@@ -279,6 +349,49 @@ class DiffusionPlannerAgent:
         
         policy_id_th = torch.from_numpy(policy_id_batch_np).to(self.device, dtype=torch.int64)
         sim_policy_id = repeat(policy_id_th, 'b -> (b n m)', n=num_plans, m=num_sims)
+
+        # if self.debug and len(self.concept_learning_buffer) > self.batch_size:
+        #     with torch.enable_grad():
+        #         self.concept_learn()
+        #     self.world_model.eval()
+
+        if self.cl_steps > self.minimum_cl_steps:
+            concept_ids = [c_id for c_id in range(1, self.num_concepts + 1)]
+            if self.guidance_option == "learnable":
+                concept_weights = F.softmax(self.guidance_logits, dim=-1)
+            else:
+                # Will use uniform weights
+                concept_weights = None
+            
+            print(f"Using concept weights: {concept_weights} for {self.num_concepts} concepts.")
+            simulated_trajectories_th = self.world_model.sample(
+                x_cond=sim_obs_cond,
+                task_embed=concept_ids,
+                action_embed=sim_action_embed,
+                batch_size=total_simulations,
+                concept_weights=concept_weights,
+            )
+
+            if self.debug:
+                print_trajs = rearrange(simulated_trajectories_th, 'b (f c) h w -> b f w h c', 
+                                              c=self.C, f=self.horizon)
+                for i in range(total_simulations):
+                    video_path = self.debug_dir / "simulated_trajectories" /f'simulated_trajectories_attempt_batch_{i}_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.mp4'
+                    video_path.parent.mkdir(parents=True, exist_ok=True)
+                    self.renderer.render_trajectory_video(
+                        print_trajs[i].cpu().numpy(),
+                        self.grid,
+                        output_dir=str(self.debug_dir),
+                        video_path=str(video_path),
+                        normalize=True,
+                        fps=1
+                    )
+                    channel_path = self.debug_dir / "simulated_trajectories" / f'simulated_trajectory_channels_{i}_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.png'
+                    self.renderer.visualize_all_channels(
+                        print_trajs[i, 0].cpu().numpy(), 
+                        output_dir=channel_path,
+                    )
+
 
         # Run All Simulations in a Single Batched GPU Call 
         simulated_trajectories_th = self.world_model.sample(
@@ -382,97 +495,118 @@ class DiffusionPlannerAgent:
         """
         print("Setting up agent for concept learning...")
         
-        # --- Embedding and Guidance Setup ---
-        # The agent receives the full embedding matrix to work with
-        W = torch.randn(self.num_concepts, self.model_embedding_dim, device=self.device)
+        # Initialize the embedding layer for concepts
+        W = torch.randn(self.num_concepts + 1, self.model_embedding_dim, device=self.device)
         new_embedding = torch.nn.Embedding.from_pretrained(W, freeze=False).to(self.device)
         
         # Replace embedding layers
-        goal_gaussian_model = self.accelerator.unwrap_model(self.world_model)
-        goal_gaussian_model.model.unet.label_emb = new_embedding
+        self.world_model.model.unet.label_emb = new_embedding
 
-        # --- Parameter Freezing ---
-        # Freeze all parameters first
-        for param in goal_gaussian_model.parameters():
+        # Freeze all parameters
+        for param in self.world_model.parameters():
             param.requires_grad = False
+        
         # Then, unfreeze only the new embedding layer
-        goal_gaussian_model.model.unet.label_emb.weight.requires_grad = True
+        self.world_model.model.unet.label_emb.weight.requires_grad = True
 
         # --- Optimizer Setup ---
         params_to_optimize = [p for p in self.world_model.parameters() if p.requires_grad]
-        expected_params = len(list(goal_gaussian_model.model.unet.label_emb.parameters()))
+        expected_params = len(list(self.world_model.model.unet.label_emb.parameters()))
 
         assert len(params_to_optimize) == expected_params, \
             f"Expected {expected_params} trainable parameters, but found {len(params_to_optimize)}"
         
-        self.optimizer = Adam(params_to_optimize, lr=self.args.train_lr)
-        self.world_model_accel, self.optimizer, = self.accelerator.prepare(self.world_model, self.optimizer)
-        self.world_model_accel.train()
-        
+        self.optimizer = Adam(params_to_optimize, lr=self.train_lr)
         print(f"Concept learning setup complete with {self.num_concepts} concepts and embedding dim {self.model_embedding_dim}.")
     
+    @torch.enable_grad()
     def concept_learn(self):
         """ Runs the concept learning training loop."""
         if self.optimizer is None:
             raise RuntimeError("Concept learning not set up. Call setup_concept_learning() first.")
+        
         print("Starting concept learning training loop...")
         self.world_model.train()
-        with tqdm(total=self.training_steps, desc="Concept Learning Training Steps") as pbar:
-            for step in range(self.training_steps):
-                # Sample a batch of concept learning experiences
-                initial_obs, obs_trajectories_np, actions = self.sample_concept_learning_batch(self.batch_size)
 
-                initial_obs = normalize_obs_vectorized(initial_obs, divide=True)
-                obs_trajectories_np = normalize_obs_vectorized(obs_trajectories_np, divide=True)
-
-                # Perform a single training step
-                loss = self.learn_concept_one_step(obs_trajectories_np, initial_obs, actions)
-                
-                pbar.update(1)
-                pbar.set_postfix({'loss': f"{loss:.4f}."})
+        if len(self.concept_learning_buffer) < self.batch_size:
+            print(f"Not enough samples in the concept learning buffer. Required: {self.batch_size}, Available: {len(self.concept_learning_buffer)}")
+            return
         
-        self.save_agent_state(self.debug_dir / f'concept_learning_state_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pth')
+        dataloader = DataLoader(
+            self.concept_learning_buffer,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=_concept_learning_collate_fn 
+        )
+
+        num_epochs = max(1, self.training_steps // len(dataloader))
+        total_steps = 0
+
+        with tqdm(total=self.training_steps, desc="Concept Learning") as pbar:
+            for epoch in range(num_epochs):
+                for batch_idx, batch in enumerate(dataloader):
+                    if total_steps >= self.training_steps:
+                        break
+                    
+                    # Extract batch data
+                    initial_obs = batch['initial_obs']
+                    obs_trajectories = batch['trajectory']
+                    actions = batch['actions']
+                    
+                    # Training step
+                    loss = self._learn_concept_one_step(obs_trajectories, initial_obs, actions)
+                    
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'epoch': epoch + 1,
+                        'loss': f"{loss:.4f}",
+                        'batch': f"{batch_idx + 1}/{len(dataloader)}"
+                    })
+                    
+                    total_steps += 1
+                    self.cl_steps += 1
+        
+        self.world_model.eval()
+        # self.save_agent_state(self.debug_dir / f'concept_learning_state_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pth')
                 
 
-    def learn_concept_one_step(self, obs_trajectories_np, initial_conditions_np, actions_np):
+    def _learn_concept_one_step(self, obs_trajectories_np, initial_conditions_np, actions_np):
         """
         Performs a single training step to learn a concept from a batch of experience.
-        
-        Args:
-            obs_trajectories_np (np.ndarray): Shape [B, T, H, W, C].
-            initial_conditions_np (np.ndarray): Shape [B, H, W, C].
-            new_concept_id (int): The class ID for the concept being learned.
-            dummy_id (int): The class ID for the unconditional (dummy) case.
-
-        Returns:
-            float: The loss for this training step.
         """
         # Convert data to PyTorch tensors
         x = torch.from_numpy(obs_trajectories_np).to(self.device, dtype=torch.float32)
         x_cond = torch.from_numpy(initial_conditions_np).to(self.device, dtype=torch.float32)
-        action_embed = torch.from_numpy(actions_np).to(self.device, dtype=torch.int64)
-        
-        total_loss = 0.0
-        with self.accelerator.autocast():
-            loss = self._calculate_concept_loss(x, x_cond, action_embed)
-            total_loss += loss.item()
-            
-            self.accelerator.backward(loss)
+        action_embed = F.one_hot(torch.from_numpy(actions_np[:, :self.action_horizon]), num_classes=self.num_actions).to(self.device, dtype=torch.float32)
 
-        self.optimizer.step()
+        loss = self._calculate_concept_loss(x, x_cond, action_embed)
+        if not loss.requires_grad:
+            # Additional debugging
+            print("WARNING: Loss does not require gradients!")
+            # Check if any intermediate tensors have gradients
+            for name, param in self.world_model.named_parameters():
+                if param.requires_grad:
+                    print(f"  {name}: requires_grad={param.requires_grad}, grad_fn={param.grad_fn}")
+
         self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([p for p in self.world_model.parameters() if p.requires_grad], max_norm=1.0)
+        self.optimizer.step()
         
-        return total_loss
+        return loss.item()
     
     def _chkpt_forward(self, x, t, x_cond, policy_id, actions):
         return self.world_model.p_losses(
-            x_start=x, t=t, x_cond=x_cond, task_embed=policy_id, action_embed=actions, 
-            reward_embed=None, image_embed=None,history_embed=None,
+            x_start=x, t=t, x_cond=x_cond, task_embed=policy_id, action_embed=actions,
         )
 
     def _calculate_concept_loss(self, x, x_cond, actions):
         """Internal loss calculation logic for concept learning."""
         batch_size = x.shape[0]
+        self.world_model.train()
 
         # Reshape for diffusion model
         x = rearrange(x, "b f h w c -> b (f c) h w")
@@ -480,12 +614,20 @@ class DiffusionPlannerAgent:
         
         t = torch.randint(0, self.world_model.num_timesteps, (batch_size,), device=self.device).long()
         
-        # Calculate unconditional loss (conditioned on dummy_id)
-        uncond_loss = self.world_model.p_losses(
-            x, t, x_cond=x_cond, 
-            task_embed=torch.full((batch_size,), self.dummy_id, device=self.device, dtype=torch.long), 
-            action_embed=actions
-        )
+        # Calculate unconditional loss
+        uncond_id = torch.full((batch_size,), self.dummy_id, device=self.device, dtype=torch.long)
+        uncond_actions = torch.ones_like(actions, device=self.device, dtype=torch.float32) * self.no_op_action
+        if self.use_checkpoint:
+            uncond_loss = cp.checkpoint(
+                self._chkpt_forward, x, t, x_cond, uncond_id, uncond_actions,
+                use_reentrant=False
+            )
+        else:
+            uncond_loss = self.world_model.p_losses(
+                x, t, x_cond=x_cond, 
+                task_embed=uncond_id, 
+                action_embed=uncond_actions
+            )
 
         if self.guidance_option == "learnable":
             guidance_weights = F.softmax(self.guidance_logits, dim=-1)
@@ -495,12 +637,19 @@ class DiffusionPlannerAgent:
         concept_ids = [c_id for c_id in range(1, self.num_concepts + 1)]
         weighted_cond_loss = 0.0
         for i, concept_id in enumerate(concept_ids):
-            assert concept_id != self.dummy_id, "Dummy ID should not be in the concept IDs"
             cond_id = torch.full((batch_size,), concept_id, device=self.device, dtype=torch.long)
-            cond_loss = cp.checkpoint(
-                self._chkpt_forward, x, t, x_cond, cond_id, actions,
-                use_reentrant=False if self.use_checkpoint else True
-            )
+            if self.use_checkpoint:
+                cond_loss = cp.checkpoint(
+                    self._chkpt_forward, x, t, x_cond, cond_id, actions,
+                    use_reentrant=False
+                )
+            else:
+                cond_loss = self.world_model.p_losses(
+                    x, t, x_cond=x_cond, 
+                    task_embed=cond_id, 
+                    action_embed=actions
+                )
+            
             weighted_cond_loss += guidance_weights[i] * cond_loss
 
         total_loss = uncond_loss + weighted_cond_loss
@@ -525,15 +674,98 @@ class DiffusionPlannerAgent:
         Args:
             save_path (str): Path to save the agent state.
         """
+        # Prepare guidance weights/logits
+        if self.guidance_option == "learnable":
+            guidance_data = {
+                'type': 'learnable',
+                'logits': self.guidance_logits.detach().cpu().numpy()
+            }
+        else:
+            guidance_data = {
+                'type': 'scalar',
+                'weights': self.guidance_weight.detach().cpu().numpy() if isinstance(self.guidance_weight, torch.Tensor) else self.guidance_weight
+            }
+        
+        # Convert concept learning buffer to serializable format
+        cl_buffer_data = []
+        for initial_obs, trajectory, actions in self.concept_learning_buffer.buffer:
+            cl_buffer_data.append({
+                'initial_obs': initial_obs,
+                'trajectory': trajectory,
+                'actions': actions
+            })
+        
         state = {
+            # Model states
             'world_model': self.world_model.state_dict(),
             'action_proposer': self.action_proposer.state_dict(),
             'optimizer': self.optimizer.state_dict() if self.optimizer else None,
+            
+            # Agent configuration
+            'num_concepts': self.num_concepts,
+            'guidance_option': self.guidance_option,
+            'guidance_data': guidance_data,
+            
+            # Buffers
             'history_buffers': [list(buf) for buf in self.history_buffers],
-            'concept_learning_buffer': self.concept_learning_buffer.buffer,
-            'guidance_weight': self.guidance_weight.cpu().numpy()
+            'concept_learning_buffer': cl_buffer_data,
+            
+            # Training state
+            'training_steps_completed': getattr(self, 'training_steps_completed', 0),
+            
+            # Metadata
+            'save_timestamp': datetime.datetime.now().isoformat(),
+            'device': str(self.device)
         }
+        
+        # Create parent directory if it doesn't exist
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        
         torch.save(state, save_path)
         print(f"Agent state saved to {save_path}")
+    def load_agent_state(self, load_path):
+        """
+        Loads a previously saved agent state.
+        
+        Args:
+            load_path (str): Path to load the agent state from.
+        """
+        print(f"Loading agent state from {load_path}")
+        state = torch.load(load_path, map_location=self.device)
+        
+        # Load model states
+        self.world_model.load_state_dict(state['world_model'])
+        self.action_proposer.load_state_dict(state['action_proposer'])
+        
+        # Load optimizer if it exists
+        if state['optimizer'] is not None and self.optimizer is not None:
+            self.optimizer.load_state_dict(state['optimizer'])
+        
+        # Load guidance weights/logits
+        guidance_data = state['guidance_data']
+        if guidance_data['type'] == 'learnable':
+            self.guidance_logits = nn.Parameter(
+                torch.tensor(guidance_data['logits'], device=self.device, dtype=torch.float32)
+            )
+        else:
+            self.guidance_weight = torch.tensor(
+                guidance_data['weights'], device=self.device, dtype=torch.float32
+            )
+        
+        # Restore buffers
+        self.history_buffers = [deque(buf, maxlen=len(buf)) for buf in state['history_buffers']]
+        
+        # Restore concept learning buffer
+        self.concept_learning_buffer.buffer.clear()
+        for item in state['concept_learning_buffer']:
+            self.concept_learning_buffer.add_experience(
+                item['initial_obs'], 
+                item['trajectory'], 
+                item['actions']
+            )
+        
+        print(f"Agent state loaded successfully from {load_path}")
+        print(f"Loaded {len(self.concept_learning_buffer)} concept learning experiences")
     
 
