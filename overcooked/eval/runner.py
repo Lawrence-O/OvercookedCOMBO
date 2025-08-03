@@ -11,13 +11,13 @@ def main():
     args = parse_args(args, parser)
     args.episode_length = 400
     args.old_dynamics = True
-    args.n_envs = 6
+    args.n_envs = 2
     args.population_yaml_path = "/home/law/Workspace/repos/COMBO/Overcooked_Population_Data/custom/sp_vs_best_r_sp_config.yml"
     
     args.action_proposal_model_path = "/mnt/linux_space/action_proposal_upgraded_run_1/modl-100.pt"
     args.diffusion_model_path = "/mnt/linux_space/upgraded_expert_run_1/modl-25.pt"
 
-    world_model = load_world_model(args, args.diffusion_model_path, num_classes=68, sampling_timesteps=25)
+    world_model = load_world_model(args, args.diffusion_model_path, num_classes=68, sampling_timesteps=25, guidance_weight=1.0)
     action_proposal_model = load_action_proposal_model(args, args.action_proposal_model_path, sampling_timesteps=10)
 
     
@@ -45,10 +45,12 @@ def main():
                   num_action_candidates=4,
                   num_simulations_per_plan=2,
                   num_concepts=2,
+                  guidance_option="learnable",
                   num_processes=16,
                   minimum_cl_steps=-1,
-                    training_steps=25,
-                  cl_buffer_size=10000,
+                  train_lr=1e-2,
+                    training_steps=250, # Increassed from 50 to 25
+                  cl_buffer_size=512*4,
                   batch_size=16)
     tester = ConceptLearningTester(args, agent, policies=["bc_train"])
     tester.evaluate_agent(num_episodes=5)

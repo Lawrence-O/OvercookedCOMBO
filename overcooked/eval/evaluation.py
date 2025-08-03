@@ -496,7 +496,8 @@ class ConceptLearningTester(BaseTester):
         self.agent = agent
         self.policies = policies
         self.all_evaluation_summaries = []
-        self.episode_rewards_history = []  # Track rewards over episodes
+        self.guidance_weights_history = []
+        self.episode_rewards_history = []
         self.policy_name_to_id = {"actor_best_r_vs_bc_train": 1, "bc_train": 2, "comedi_best": 3, "comedi_mp0": 4, "comedi_mp1": 5, "comedi_mp2": 6, "comedi_mp3": 7, "comedi_mp4": 8, "comedi_mp5": 9, "comedi_mp6": 10, "comedi_mp7": 11, "mep1_final": 12, "mep1_init": 13, "mep1_mid": 14, "mep2_final": 15, "mep2_init": 16, "mep2_mid": 17, "mep3_final": 18, "mep3_init": 19, "mep3_mid": 20, "mep4_final": 21, "mep4_init": 22, "mep4_mid": 23, "mep5_final": 24, "mep5_init": 25, "mep5_mid": 26, "mep6_final": 27, "mep6_init": 28, "mep6_mid": 29, "mep7_final": 30, "mep7_init": 31, "mep7_mid": 32, "mep8_final": 33, "mep8_init": 34, "mep8_mid": 35, "mep_best": 36, "sp10_final": 37, "sp10_init": 38, "sp10_mid": 39, "sp1_final": 40, "sp1_init": 41, "sp1_mid": 42, "sp2_final": 43, "sp2_init": 44, "sp2_mid": 45, "sp3_final": 46, "sp3_init": 47, "sp3_mid": 48, "sp4_final": 49, "sp4_init": 50, "sp4_mid": 51, "sp5_final": 52, "sp5_init": 53, "sp5_mid": 54, "sp6_final": 55, "sp6_init": 56, "sp6_mid": 57, "sp7_final": 58, "sp7_init": 59, "sp7_mid": 60, "sp8_final": 61, "sp8_init": 62, "sp8_mid": 63, "sp9_final": 64, "sp9_init": 65, "sp9_mid": 66, "sp_best": 67}
         
     def evaluate_agent(self, num_episodes=10, concept_learning_interval=1, policy_name="bc_train"):
@@ -545,32 +546,40 @@ class ConceptLearningTester(BaseTester):
         for episode_idx in range(num_episodes):
             print(f"\n--- Episode {episode_idx + 1}/{num_episodes} ---")
             
-            # Run single episode evaluation using base class method
+            # Set current episode for tracking
+            self.agent.current_episode = episode_idx + 1
+            
+            # Run single episode evaluation
             episode_data_list = self.evaluate_in_env(
                 state_action_fn=agent0_action_fn,
                 observe_fn=self.agent.observe,
                 collect_experience_fn=collect_experience,
-                num_episodes=1,  # Run one episode at a time
+                num_episodes=1,
                 policy_name=policy_name
             )
             
-            # Extract episode data (we only ran 1 episode)
+            # Extract episode data
             episode_data = episode_data_list[0]
-            
-            # Extract and store episode reward
             episode_reward = episode_data["episode_reward"]
-            agent0_reward = episode_reward[:, 0].mean()
-            agent1_reward = episode_reward[:, 1].mean()
-            team_reward = episode_reward.sum(axis=1).mean()
+            
+            # Calculate mean and std across environments
+            agent0_rewards = episode_reward[:, 0]
+            agent1_rewards = episode_reward[:, 1]
+            team_rewards = episode_reward.sum(axis=1)
             
             self.episode_rewards_history.append({
                 'episode': episode_idx + 1,
-                'agent0_reward': agent0_reward,
-                'agent1_reward': agent1_reward,
-                'team_reward': team_reward
+                'agent0_reward': agent0_rewards.mean(),
+                'agent0_std': agent0_rewards.std(),
+                'agent1_reward': agent1_rewards.mean(),
+                'agent1_std': agent1_rewards.std(),
+                'team_reward': team_rewards.mean(),
+                'team_std': team_rewards.std()
             })
             
-            print(f"Episode {episode_idx + 1} - Agent0: {agent0_reward:.2f}, Agent1: {agent1_reward:.2f}, Team: {team_reward:.2f}")
+            print(f"Episode {episode_idx + 1} - Agent0: {agent0_rewards.mean():.2f}±{agent0_rewards.std():.2f}, "
+                f"Agent1: {agent1_rewards.mean():.2f}±{agent1_rewards.std():.2f}, "
+                f"Team: {team_rewards.mean():.2f}±{team_rewards.std():.2f}")
             
             # Perform concept learning if interval reached
             if (episode_idx + 1) % concept_learning_interval == 0 and (episode_idx + 1) < num_episodes:
@@ -578,19 +587,18 @@ class ConceptLearningTester(BaseTester):
                 if len(self.agent.concept_learning_buffer) >= self.agent.batch_size:
                     self.agent.concept_learn()
                 else:
-                    print(f"Not enough experiences in buffer ({len(self.agent.concept_learning_buffer)}/{self.agent.batch_size}). Skipping concept learning.")
+                    print(f"Not enough experiences in buffer. Skipping concept learning.")
         
         # Generate plots and save results
         self.plot_concept_learning_progress()
+        self.plot_guidance_weights_evolution()
         self.save_concept_learning_results()
-        
         print("\n--- Concept Learning Evaluation Complete ---")
         
     
-    
     def plot_concept_learning_progress(self):
         """
-        Generates a linear plot showing how agent rewards change over episodes.
+        Generates a linear plot showing how agent rewards change over episodes with std error bars.
         """
         plot_dir = self.base_dir / "plots" / "concept_learning"
         plot_dir.mkdir(parents=True, exist_ok=True)
@@ -599,57 +607,71 @@ class ConceptLearningTester(BaseTester):
             print("No episode rewards to plot.")
             return
         
-        # Convert to DataFrame for easier plotting
+        # Convert to DataFrame
         df = pd.DataFrame(self.episode_rewards_history)
         
-        # Create the plot
+        # Create the main plot with error bars
         plt.figure(figsize=(12, 8))
         
-        # Plot lines for each reward type
-        plt.plot(df['episode'], df['agent0_reward'], 'o-', label='Agent 0 (Concept Learning)', 
-                color='skyblue', linewidth=2, markersize=8)
-        plt.plot(df['episode'], df['agent1_reward'], 's-', label='Agent 1 (Partner)', 
-                color='lightgreen', linewidth=2, markersize=8)
-        plt.plot(df['episode'], df['team_reward'], '^-', label='Team Total', 
-                color='coral', linewidth=2, markersize=8)
+        # Plot lines with shaded std regions
+        episodes = df['episode'].values
         
-        # Add grid and labels
+        # Agent 0
+        agent0_mean = df['agent0_reward'].values
+        agent0_std = df['agent0_std'].values
+        plt.plot(episodes, agent0_mean, 'o-', label='Agent 0 (Concept Learning)', 
+                color='skyblue', linewidth=2, markersize=8)
+        plt.fill_between(episodes, agent0_mean - agent0_std, agent0_mean + agent0_std, 
+                        alpha=0.3, color='skyblue')
+        
+        # Agent 1
+        agent1_mean = df['agent1_reward'].values
+        agent1_std = df['agent1_std'].values
+        plt.plot(episodes, agent1_mean, 's-', label='Agent 1 (Partner)', 
+                color='lightgreen', linewidth=2, markersize=8)
+        plt.fill_between(episodes, agent1_mean - agent1_std, agent1_mean + agent1_std, 
+                        alpha=0.3, color='lightgreen')
+        
+        # Team
+        team_mean = df['team_reward'].values
+        team_std = df['team_std'].values
+        plt.plot(episodes, team_mean, '^-', label='Team Total', 
+                color='coral', linewidth=2, markersize=8)
+        plt.fill_between(episodes, team_mean - team_std, team_mean + team_std, 
+                        alpha=0.3, color='coral')
+        
         plt.xlabel('Episode', fontsize=12)
         plt.ylabel('Episode Reward', fontsize=12)
-        plt.title('Agent Performance Over Episodes with Concept Learning', fontsize=14)
+        plt.title('Agent Performance Over Episodes with Concept Learning (±1 std)', fontsize=14)
         plt.legend(fontsize=10)
         plt.grid(True, alpha=0.3)
-        
-        # Add concept learning markers (vertical lines where learning occurred)
-        # for i in range(1, len(df)):
-        #     if i % self.args.concept_learning_interval == 0:
-        #         plt.axvline(x=i, color='red', linestyle='--', alpha=0.5, label='Concept Learning' if i == 1 else '')
-        
         plt.tight_layout()
         
-        # Save the plot
         output_path = plot_dir / "concept_learning_progress.png"
         plt.savefig(output_path, dpi=300)
-        print(f"Concept learning progress plot saved to {output_path}")
+        print(f"Concept learning progress plot with std saved to {output_path}")
         plt.close()
         
-        # Also create a subplot version with individual agent plots
+        # Create individual subplots with error bars
         fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
         
         # Agent 0 subplot
-        axes[0].plot(df['episode'], df['agent0_reward'], 'o-', color='skyblue', linewidth=2, markersize=8)
+        axes[0].errorbar(episodes, agent0_mean, yerr=agent0_std, fmt='o-', 
+                        color='skyblue', linewidth=2, markersize=8, capsize=5)
         axes[0].set_ylabel('Agent 0 Reward', fontsize=12)
         axes[0].set_title('Agent 0 (Concept Learning) Performance', fontsize=14)
         axes[0].grid(True, alpha=0.3)
         
         # Agent 1 subplot
-        axes[1].plot(df['episode'], df['agent1_reward'], 's-', color='lightgreen', linewidth=2, markersize=8)
+        axes[1].errorbar(episodes, agent1_mean, yerr=agent1_std, fmt='s-', 
+                        color='lightgreen', linewidth=2, markersize=8, capsize=5)
         axes[1].set_ylabel('Agent 1 Reward', fontsize=12)
         axes[1].set_title('Agent 1 (Partner) Performance', fontsize=14)
         axes[1].grid(True, alpha=0.3)
         
         # Team subplot
-        axes[2].plot(df['episode'], df['team_reward'], '^-', color='coral', linewidth=2, markersize=8)
+        axes[2].errorbar(episodes, team_mean, yerr=team_std, fmt='^-', 
+                        color='coral', linewidth=2, markersize=8, capsize=5)
         axes[2].set_ylabel('Team Reward', fontsize=12)
         axes[2].set_title('Team Total Performance', fontsize=14)
         axes[2].set_xlabel('Episode', fontsize=12)
@@ -657,7 +679,6 @@ class ConceptLearningTester(BaseTester):
         
         plt.tight_layout()
         
-        # Save subplot version
         subplot_path = plot_dir / "concept_learning_progress_subplots.png"
         plt.savefig(subplot_path, dpi=300)
         plt.close()
@@ -680,15 +701,25 @@ class ConceptLearningTester(BaseTester):
         summary = {
             'total_episodes': len(df),
             'agent0_mean_reward': df['agent0_reward'].mean(),
-            'agent0_std_reward': df['agent0_reward'].std(),
+            'agent0_std_reward': df['agent0_std'].mean(),  # Average of stds
             'agent0_final_reward': df['agent0_reward'].iloc[-1],
+            'agent0_final_std': df['agent0_std'].iloc[-1],
             'agent0_initial_reward': df['agent0_reward'].iloc[0],
+            'agent0_initial_std': df['agent0_std'].iloc[0],
             'agent0_improvement': df['agent0_reward'].iloc[-1] - df['agent0_reward'].iloc[0],
             'team_mean_reward': df['team_reward'].mean(),
             'team_final_reward': df['team_reward'].iloc[-1],
             'team_initial_reward': df['team_reward'].iloc[0],
             'team_improvement': df['team_reward'].iloc[-1] - df['team_reward'].iloc[0]
         }
+        
+        # Add guidance weights info if available
+        if hasattr(self.agent, 'guidance_weights_history') and self.agent.guidance_weights_history:
+            final_weights = self.agent.guidance_weights_history[-1]['weights']
+            initial_weights = self.agent.guidance_weights_history[0]['weights']
+            summary['final_guidance_weights'] = final_weights.tolist()
+            summary['initial_guidance_weights'] = initial_weights.tolist()
+            summary['guidance_weights_change'] = (final_weights - initial_weights).tolist()
         
         summary_path = self.base_dir / "concept_learning_summary.json"
         with open(summary_path, 'w') as f:
@@ -698,6 +729,109 @@ class ConceptLearningTester(BaseTester):
         print(f"Concept learning results saved to {self.base_dir}")
         print(f"Agent 0 improvement: {summary['agent0_improvement']:.2f}")
         print(f"Team improvement: {summary['team_improvement']:.2f}")
+        
+        if 'final_guidance_weights' in summary:
+            print(f"Final guidance weights: {summary['final_guidance_weights']}")
+    def plot_guidance_weights_evolution(self):
+        """
+        Plots how guidance weights change over training steps.
+        """
+        plot_dir = self.base_dir / "plots" / "concept_learning"
+        plot_dir.mkdir(parents=True, exist_ok=True)
+        
+        if not hasattr(self.agent, 'guidance_weights_history') or not self.agent.guidance_weights_history:
+            print("No guidance weights history to plot.")
+            return
+        
+        # Extract data
+        steps = [item['step'] for item in self.agent.guidance_weights_history]
+        weights = np.array([item['weights'] for item in self.agent.guidance_weights_history])
+        episodes = [item['episode'] for item in self.agent.guidance_weights_history]
+        
+        num_concepts = weights.shape[1]
+        
+        # Create the plot
+        plt.figure(figsize=(14, 8))
+        
+        # Plot each concept weight
+        colors = plt.cm.get_cmap('tab10')(np.linspace(0, 1, num_concepts))
+        for i in range(num_concepts):
+            plt.plot(steps, weights[:, i], '-', label=f'Concept {i+1}', 
+                    color=colors[i], linewidth=2, alpha=0.8)
+        
+        # Add vertical lines for episode boundaries
+        unique_episodes = np.unique(episodes)
+        for ep in unique_episodes[1:]:
+            # Find first step of each episode
+            ep_start_idx = next(idx for idx, e in enumerate(episodes) if e == ep)
+            if ep_start_idx > 0:
+                plt.axvline(x=steps[ep_start_idx-1], color='gray', linestyle='--', alpha=0.5)
+                plt.text(steps[ep_start_idx-1], plt.ylim()[1]*0.95, f'Ep {ep}', 
+                        rotation=90, verticalalignment='top', fontsize=8)
+        
+        plt.xlabel('Training Step', fontsize=12)
+        plt.ylabel('Guidance Weight', fontsize=12)
+        plt.title('Evolution of Concept Guidance Weights During Training', fontsize=14)
+        plt.legend(loc='best', fontsize=10)
+        plt.grid(True, alpha=0.3)
+        plt.ylim(-0.05, 1.05)
+        plt.tight_layout()
+        
+        output_path = plot_dir / "guidance_weights_evolution.png"
+        plt.savefig(output_path, dpi=300)
+        print(f"Guidance weights evolution plot saved to {output_path}")
+        plt.close()
+        
+        # Create a second plot showing weights at each episode
+        plt.figure(figsize=(12, 8))
+        
+        # Get weights at the end of each episode
+        episode_end_weights = []
+        episode_numbers = []
+        
+        for ep in unique_episodes:
+            # Find last step of each episode
+            ep_steps = [(idx, s) for idx, (s, e) in enumerate(zip(steps, episodes)) if e == ep]
+            if ep_steps:
+                last_idx = ep_steps[-1][0]
+                episode_end_weights.append(weights[last_idx])
+                episode_numbers.append(ep)
+        
+        if episode_end_weights:
+            episode_end_weights = np.array(episode_end_weights)
+            
+            # Bar plot of weights at each episode
+            x = np.arange(len(episode_numbers))
+            width = 0.8 / num_concepts
+            
+            for i in range(num_concepts):
+                offset = (i - num_concepts/2) * width + width/2
+                plt.bar(x + offset, episode_end_weights[:, i], width, 
+                    label=f'Concept {i+1}', color=colors[i], alpha=0.8)
+            
+            plt.xlabel('Episode', fontsize=12)
+            plt.ylabel('Guidance Weight', fontsize=12)
+            plt.title('Concept Guidance Weights at End of Each Episode', fontsize=14)
+            plt.xticks(x, episode_numbers)
+            plt.legend(loc='best', fontsize=10)
+            plt.grid(True, alpha=0.3, axis='y')
+            plt.ylim(0, 1.05)
+            plt.tight_layout()
+            
+            bar_output_path = plot_dir / "guidance_weights_by_episode.png"
+            plt.savefig(bar_output_path, dpi=300)
+            print(f"Guidance weights by episode plot saved to {bar_output_path}")
+            plt.close()
+        
+        # Save weights history as CSV for further analysis
+        weights_df = pd.DataFrame({
+            'step': steps,
+            'episode': episodes,
+            **{f'concept_{i+1}_weight': weights[:, i] for i in range(num_concepts)}
+        })
+        weights_csv_path = plot_dir / "guidance_weights_history.csv"
+        weights_df.to_csv(weights_csv_path, index=False)
+        print(f"Guidance weights history saved to {weights_csv_path}")
         
 
     

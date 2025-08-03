@@ -167,6 +167,8 @@ class DiffusionPlannerAgent:
 
         self.cl_steps = 0
         self.minimum_cl_steps = minimum_cl_steps
+        self.episode_rewards_history = []
+        self.guidance_weights_history = []
 
         if guidance_option == "scalar":
             if isinstance(guidance_weight, (list, np.ndarray)):
@@ -178,7 +180,7 @@ class DiffusionPlannerAgent:
                 self.guidance_weight = torch.ones(self.num_concepts, device=self.device) / self.num_concepts
         elif guidance_option == "learnable":
             # Initialize with small random values
-            self.guidance_logits = nn.Parameter(torch.randn(self.num_concepts, device=self.device) * 0.1)  
+            self.guidance_logits = nn.Parameter(0.1*torch.randn(self.num_concepts, device=self.device), requires_grad=True)  
         
         # Internal dimensions
         self.H, self.W, self.C = (8, 5, 26)
@@ -224,8 +226,8 @@ class DiffusionPlannerAgent:
                 self.env_cl_buffers[env_idx].popleft()  
         
         # # Log less frequently
-        # if len(self.concept_learning_buffer) % 100 == 0:
-        print(f"Concept learning buffer size: {len(self.concept_learning_buffer)}")
+        if len(self.concept_learning_buffer) % 100 == 0 and self.debug:
+            print(f"Concept learning buffer size: {len(self.concept_learning_buffer)}")
     
     def _sample_concept_learning_batch(self, batch_size=32):
         """
@@ -350,10 +352,10 @@ class DiffusionPlannerAgent:
         policy_id_th = torch.from_numpy(policy_id_batch_np).to(self.device, dtype=torch.int64)
         sim_policy_id = repeat(policy_id_th, 'b -> (b n m)', n=num_plans, m=num_sims)
 
-        # if self.debug and len(self.concept_learning_buffer) > self.batch_size:
-        #     with torch.enable_grad():
-        #         self.concept_learn()
-        #     self.world_model.eval()
+        if self.debug and len(self.concept_learning_buffer) > 0.5*256:
+            with torch.enable_grad():
+                self.concept_learn()
+            self.world_model.eval()
 
         if self.cl_steps > self.minimum_cl_steps:
             concept_ids = [c_id for c_id in range(1, self.num_concepts + 1)]
@@ -372,25 +374,25 @@ class DiffusionPlannerAgent:
                 concept_weights=concept_weights,
             )
 
-            if self.debug:
-                print_trajs = rearrange(simulated_trajectories_th, 'b (f c) h w -> b f w h c', 
-                                              c=self.C, f=self.horizon)
-                for i in range(total_simulations):
-                    video_path = self.debug_dir / "simulated_trajectories" /f'simulated_trajectories_attempt_batch_{i}_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.mp4'
-                    video_path.parent.mkdir(parents=True, exist_ok=True)
-                    self.renderer.render_trajectory_video(
-                        print_trajs[i].cpu().numpy(),
-                        self.grid,
-                        output_dir=str(self.debug_dir),
-                        video_path=str(video_path),
-                        normalize=True,
-                        fps=1
-                    )
-                    channel_path = self.debug_dir / "simulated_trajectories" / f'simulated_trajectory_channels_{i}_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.png'
-                    self.renderer.visualize_all_channels(
-                        print_trajs[i, 0].cpu().numpy(), 
-                        output_dir=channel_path,
-                    )
+            # if self.debug:
+            #     print_trajs = rearrange(simulated_trajectories_th, 'b (f c) h w -> b f w h c', 
+            #                                   c=self.C, f=self.horizon)
+            #     for i in range(total_simulations):
+            #         video_path = self.debug_dir / "simulated_trajectories" /f'simulated_trajectories_attempt_batch_{i}_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.mp4'
+            #         video_path.parent.mkdir(parents=True, exist_ok=True)
+            #         self.renderer.render_trajectory_video(
+            #             print_trajs[i].cpu().numpy(),
+            #             self.grid,
+            #             output_dir=str(self.debug_dir),
+            #             video_path=str(video_path),
+            #             normalize=True,
+            #             fps=1
+            #         )
+            #         channel_path = self.debug_dir / "simulated_trajectories" / f'simulated_trajectory_channels_{i}_{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.png'
+            #         self.renderer.visualize_all_channels(
+            #             print_trajs[i, 0].cpu().numpy(), 
+            #             output_dir=channel_path,
+            #         )
 
 
         # Run All Simulations in a Single Batched GPU Call 
@@ -423,14 +425,14 @@ class DiffusionPlannerAgent:
 
         best_trajectories_np = trajectories_np[global_best_indices]
         
-        if self.debug:
-            for i in range(batch_size * self.num_action_candidates * self.num_simulations_per_plan):
-                print(f"  Score: {trajectory_rewards[i]:.2f} for plan {i // self.num_simulations_per_plan} in env {i // (self.num_action_candidates * self.num_simulations_per_plan)}")
-            for i in range(batch_size):
-                if needs_replan_mask[i]:
-                    print(f"Env {i}: NEEDS REPLAN. No simulation had a non-negative reward.")
-                else:
-                    print(f"Env {i}: Selected best trajectory with max score: {max_scores[i]:.2f}")
+        # if self.debug:
+        #     for i in range(batch_size * self.num_action_candidates * self.num_simulations_per_plan):
+        #         print(f"  Score: {trajectory_rewards[i]:.2f} for plan {i // self.num_simulations_per_plan} in env {i // (self.num_action_candidates * self.num_simulations_per_plan)}")
+        #     for i in range(batch_size):
+        #         if needs_replan_mask[i]:
+        #             print(f"Env {i}: NEEDS REPLAN. No simulation had a non-negative reward.")
+        #         else:
+        #             print(f"Env {i}: Selected best trajectory with max score: {max_scores[i]:.2f}")
 
         return best_trajectories_np, needs_replan_mask
     
@@ -513,6 +515,11 @@ class DiffusionPlannerAgent:
         params_to_optimize = [p for p in self.world_model.parameters() if p.requires_grad]
         expected_params = len(list(self.world_model.model.unet.label_emb.parameters()))
 
+        if self.guidance_option == "learnable":
+            self.guidance_logits.requires_grad = True
+            params_to_optimize.append(self.guidance_logits)
+            expected_params += 1
+
         assert len(params_to_optimize) == expected_params, \
             f"Expected {expected_params} trainable parameters, but found {len(params_to_optimize)}"
         
@@ -558,6 +565,18 @@ class DiffusionPlannerAgent:
                     
                     # Training step
                     loss = self._learn_concept_one_step(obs_trajectories, initial_obs, actions)
+
+                    if self.guidance_option == "learnable":
+                        with torch.no_grad():
+                            current_weights = F.softmax(self.guidance_logits, dim=-1).cpu().numpy()
+                            self.guidance_weights_history.append({
+                                'step': total_steps,
+                                'weights': current_weights.copy(),
+                                'episode': getattr(self, 'current_episode', 0)
+                            })
+                            if self.debug:
+                                weight_str = ", ".join([f"{w:.3f}" for w in current_weights])
+                                pbar.write(f"Step {total_steps}: Guidance weights = [{weight_str}]")
                     
                     pbar.update(1)
                     pbar.set_postfix({
@@ -583,18 +602,57 @@ class DiffusionPlannerAgent:
         action_embed = F.one_hot(torch.from_numpy(actions_np[:, :self.action_horizon]), num_classes=self.num_actions).to(self.device, dtype=torch.float32)
 
         loss = self._calculate_concept_loss(x, x_cond, action_embed)
-        if not loss.requires_grad:
-            # Additional debugging
-            print("WARNING: Loss does not require gradients!")
-            # Check if any intermediate tensors have gradients
-            for name, param in self.world_model.named_parameters():
-                if param.requires_grad:
-                    print(f"  {name}: requires_grad={param.requires_grad}, grad_fn={param.grad_fn}")
+    
 
         self.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_([p for p in self.world_model.parameters() if p.requires_grad], max_norm=1.0)
+
+        # Get all parameters that need gradient clipping
+        params_to_clip = [p for p in self.world_model.parameters() if p.requires_grad]
+        if self.guidance_option == "learnable":
+            params_to_clip.append(self.guidance_logits)
+        
+        torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=1.0)
         self.optimizer.step()
+
+        # Log guidance weights after update
+        if self.guidance_option == "learnable":
+            with torch.no_grad():
+                updated_weights = F.softmax(self.guidance_logits, dim=-1)
+                print(f"Guidance weights after update: {updated_weights.cpu().numpy()}")
+                print(f"Guidance logits after update: {self.guidance_logits.cpu().numpy()}")
+                
+                # Compute and print cosine similarity between concepts
+                all_concept_embeddings = self.world_model.model.unet.label_emb.weight[1:]  # Skip dummy concept
+                normed_embeddings = F.normalize(all_concept_embeddings, p=2, dim=1)
+                similarity_matrix = torch.matmul(normed_embeddings, normed_embeddings.t())
+                
+                # Print similarity matrix in a formatted way
+                print("\n=== Cosine Similarity Between Concepts ===")
+                print("    ", end="")
+                for j in range(self.num_concepts):
+                    print(f"  C{j+1}  ", end="")
+                print()
+                
+                for i in range(self.num_concepts):
+                    print(f"C{i+1}: ", end="")
+                    for j in range(self.num_concepts):
+                        sim = similarity_matrix[i, j].item()
+                        print(f"{sim:6.3f}", end="")
+                    print()
+                print("=========================================\n")
+                
+                # Print the most similar concept pairs (excluding self-similarity)
+                print("Top concept pairs by similarity:")
+                sim_values = []
+                for i in range(self.num_concepts):
+                    for j in range(i+1, self.num_concepts):
+                        sim_values.append((similarity_matrix[i, j].item(), i+1, j+1))
+                
+                sim_values.sort(reverse=True)
+                for sim, c1, c2 in sim_values[:3]:  # Top 3 most similar pairs
+                    print(f"  Concepts {c1} & {c2}: {sim:.3f}")
+                print()
         
         return loss.item()
     
